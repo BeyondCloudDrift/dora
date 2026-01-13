@@ -2,43 +2,67 @@
 
 use std::env::current_dir;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
+use tokio::sync::Mutex;
 
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use dora_download::download_file;
 use dora_node_api::dora_core::config::NodeId;
 use dora_node_api::dora_core::descriptor::source_is_url;
 use dora_node_api::merged::{MergeExternalSend, MergedEvent};
-use dora_node_api::{DataflowId, DoraNode, EventStream};
+use dora_node_api::{DataflowId, DoraNode, EventStream, TryRecvError, init_tracing};
 use dora_operator_api_python::{DelayedCleanup, NodeCleanupHandle, PyEvent, pydict_to_metadata};
 use dora_ros2_bridge_python::Ros2Subscription;
 use eyre::{Context, ContextCompat};
+
 use futures::{Stream, StreamExt};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use pyo3_special_method_derive::{Dict, Dir, Repr, Str};
+use tokio::runtime::{Builder, Runtime};
+use tracing::{Level, span};
+static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
+    Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .context("Failed to create Tokio runtime")
+        .unwrap()
+});
 
 /// Consume a Python `logging.LogRecord` and emit a Rust `tracing::Event` instead.
 #[pyfunction]
-fn host_log<'py>(record: Bound<'py, PyAny>, node_id: String, dataflow_id: String) -> PyResult<()> {
-    let level = record.getattr("levelno")?;
+fn host_log<'py>(record: Bound<'py, PyAny>) -> PyResult<()> {
+    let level = record.getattr("levelno")?.extract::<u8>()?;
     let message = record.getattr("getMessage")?.call0()?.to_string();
     let pathname = record.getattr("pathname")?.to_string();
     let lineno = record.getattr("lineno")?.to_string();
     let target = record.getattr("name")?.to_string();
-    if level.ge(40u8)? {
-        tracing::event!(tracing::Level::ERROR, file=pathname, line=lineno, %target, %message, %node_id, %dataflow_id);
-    } else if level.ge(30u8)? {
-        tracing::event!(tracing::Level::WARN, file=pathname, line=lineno, %target, %message, %node_id, %dataflow_id);
-    } else if level.ge(20u8)? {
-        tracing::event!(tracing::Level::INFO, file=pathname, line=lineno, %target, %message, %node_id, %dataflow_id);
-    } else if level.ge(10u8)? {
-        tracing::event!(tracing::Level::DEBUG, file=pathname, line=lineno, %target, %message, %node_id, %dataflow_id);
-    } else {
-        tracing::event!(tracing::Level::TRACE, file=pathname, line=lineno, %target, %message, %node_id, %dataflow_id);
-    }
 
+    RUNTIME.spawn(async move {
+    if level.ge(&40u8) {
+        let span = span!(Level::ERROR, "dora.python.log.error", file=pathname, line=lineno, %target, %message);
+        let _enter = span.enter();
+        tracing::event!(tracing::Level::ERROR, file=pathname, line=lineno, %target, %message);
+    } else if level.ge(&30u8) {
+        let span = span!(Level::ERROR, "dora.python.log.warn", file=pathname, line=lineno, %target, %message);
+        let _enter = span.enter();
+        tracing::event!(tracing::Level::WARN, file=pathname, line=lineno, %target, %message);
+    } else if level.ge(&20u8){
+        let span = span!(Level::INFO, "dora.python.log.info", file=pathname, line=lineno, %target, %message);
+        let _enter = span.enter();
+        tracing::event!(tracing::Level::INFO, file=pathname, line=lineno, %target, %message);
+    } else if level.ge(&10u8) {
+        let span = span!(Level::DEBUG, "dora.python.log.debug", file=pathname, line=lineno, %target, %message);
+        let _enter = span.enter();
+        tracing::event!(tracing::Level::DEBUG, file=pathname, line=lineno, %target, %message);
+    } else {
+        let span = span!(Level::TRACE, "dora.python.log.trace", file=pathname, line=lineno, %target, %message);
+        let _enter = span.enter();
+        tracing::event!(tracing::Level::TRACE, file=pathname, line=lineno, %target, %message);
+    }
+    });
     Ok(())
 }
 
@@ -48,13 +72,12 @@ fn host_log<'py>(record: Bound<'py, PyAny>, node_id: String, dataflow_id: String
 ///   is not exported in `logging.__all__`, as it is not intended to be called directly.
 /// - A new class `logging.HostHandler` provides a `logging.Handler` that delivers all records to `host_log`.
 /// - `logging.basicConfig` is changed to use `logging.HostHandler` by default.
+///
 /// Since any call like `logging.warn(...)` sets up logging via `logging.basicConfig`, all log messages are now
 /// delivered to `crate::host_log`, which will send them to `tracing::event!`.
-pub fn setup_logging(py: Python, node_id: NodeId, dataflow_id: DataflowId) -> PyResult<()> {
+pub fn setup_logging(py: Python) -> PyResult<()> {
     let logging = py.import("logging")?;
     logging.setattr("host_log", wrap_pyfunction!(host_log, &logging)?)?;
-    logging.setattr("node_id", node_id.to_string())?;
-    logging.setattr("dataflow_id", dataflow_id.to_string())?;
     py.run(
         cr#"
 class HostHandler(Handler):
@@ -62,7 +85,7 @@ class HostHandler(Handler):
 		super().__init__(level=level)
 	
 	def emit(self, record):
-		host_log(record, node_id, dataflow_id)
+		host_log(record)
 
 oldBasicConfig = basicConfig
 
@@ -118,6 +141,14 @@ impl Node {
         } else {
             DoraNode::init_from_env().context("Could not initiate node from environment variable. For dynamic node, please add a node id in the initialization function.")?
         };
+        let id = node.id().clone();
+        let dataflow_id = node.dataflow_id().clone();
+        RUNTIME.spawn(async move {
+            let _guard = init_tracing(&id, &dataflow_id).unwrap();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        });
 
         let dataflow_id = *node.dataflow_id();
         let node_id = node.id().clone();
@@ -129,12 +160,12 @@ impl Node {
 
         Python::with_gil(|py| {
             // Extend the `logging` module to interact with tracing
-            setup_logging(py, node_id.clone(), dataflow_id)
+            setup_logging(py)
         })?;
 
         Ok(Node {
             events: Events {
-                inner: EventsInner::Dora(events),
+                inner: Arc::new(Mutex::new(EventsInner::Dora(events))),
                 _cleanup_handle: cleanup_handle,
             },
             dataflow_id,
@@ -166,7 +197,7 @@ impl Node {
     /// :rtype: dict
     #[pyo3(signature = (timeout=None))]
     #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self, py: Python, timeout: Option<f32>) -> PyResult<Option<Py<PyDict>>> {
+    pub fn next(&self, py: Python, timeout: Option<f32>) -> PyResult<Option<Py<PyDict>>> {
         let event = py.allow_threads(|| self.events.recv(timeout.map(Duration::from_secs_f32)));
         if let Some(event) = event {
             let dict = event
@@ -178,8 +209,18 @@ impl Node {
         }
     }
 
+    /// `.drain()` gives you all available inputs that the node has received.
+    /// It does not block until the next event becomes available.
+    ///
+    /// ```python
+    /// events = node.drain()
+    /// for event in events:
+    ///     print(event)
+    /// ```
+    ///
+    /// :rtype: list[dict]
     #[allow(clippy::should_implement_trait)]
-    pub fn drain(&mut self, py: Python) -> PyResult<Vec<Py<PyDict>>> {
+    pub fn drain(&self, py: Python) -> PyResult<Vec<Py<PyDict>>> {
         let events = self
             .events
             .drain()
@@ -193,6 +234,34 @@ impl Node {
             })
             .collect();
         Ok(events)
+    }
+
+    /// `.try_recv()` gives you the next input in the queue that the node has received.
+    /// It does not block until the next event becomes available.
+    ///
+    /// ```python
+    /// event = events.try_recv()
+    ///     print(event)
+    /// ```
+    ///
+    /// :rtype: dict
+    #[allow(clippy::should_implement_trait)]
+    pub fn try_recv(&mut self, py: Python) -> Option<Py<PyDict>> {
+        match self.events.try_recv() {
+            Ok(event) => match event.to_py_dict(py) {
+                Ok(dict) => Some(dict),
+                Err(_) => None,
+            },
+            Err(_) => None,
+        }
+    }
+
+    /// Check if there are any buffered events in the event stream.
+    ///
+    /// :rtype: bool
+    #[allow(clippy::should_implement_trait)]
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
     }
 
     /// `.recv_async()` gives you the next input that the node has received asynchronously.
@@ -214,7 +283,7 @@ impl Node {
     /// :rtype: dict
     #[pyo3(signature = (timeout=None))]
     #[allow(clippy::should_implement_trait)]
-    pub async fn recv_async(&mut self, timeout: Option<f32>) -> PyResult<Option<Py<PyDict>>> {
+    pub async fn recv_async(&self, timeout: Option<f32>) -> PyResult<Option<Py<PyDict>>> {
         let event = self
             .events
             .recv_async_timeout(timeout.map(Duration::from_secs_f32))
@@ -225,6 +294,7 @@ impl Node {
                 let dict = event
                     .to_py_dict(py)
                     .context("Could not convert event into a dict")?;
+
                 Ok(Some(dict))
             })
         } else {
@@ -245,7 +315,7 @@ impl Node {
     /// Default behaviour is to timeout after 2 seconds.
     ///
     /// :rtype: dict
-    pub fn __next__(&mut self, py: Python) -> PyResult<Option<Py<PyDict>>> {
+    pub fn __next__(&self, py: Python) -> PyResult<Option<Py<PyDict>>> {
         self.next(py, None)
     }
 
@@ -285,7 +355,7 @@ impl Node {
     /// :rtype: None
     #[pyo3(signature = (output_id, data, metadata=None))]
     pub fn send_output(
-        &mut self,
+        &self,
         output_id: String,
         data: PyObject,
         metadata: Option<Bound<'_, PyDict>>,
@@ -317,7 +387,7 @@ impl Node {
     /// This method returns the parsed dataflow YAML file.
     ///
     /// :rtype: dict
-    pub fn dataflow_descriptor(&mut self, py: Python) -> eyre::Result<PyObject> {
+    pub fn dataflow_descriptor(&self, py: Python) -> eyre::Result<PyObject> {
         Ok(
             pythonize::pythonize(py, &self.node.get_mut().dataflow_descriptor()?)
                 .map(|x| x.unbind())?,
@@ -327,7 +397,7 @@ impl Node {
     /// Returns the node configuration.
     ///
     /// :rtype: dict
-    pub fn node_config(&mut self, py: Python) -> eyre::Result<PyObject> {
+    pub fn node_config(&self, py: Python) -> eyre::Result<PyObject> {
         Ok(pythonize::pythonize(py, &self.node.get_mut().node_config()).map(|x| x.unbind())?)
     }
 
@@ -343,10 +413,7 @@ impl Node {
     ///
     /// :type subscription: dora.Ros2Subscription
     /// :rtype: None
-    pub fn merge_external_events(
-        &mut self,
-        subscription: &mut Ros2Subscription,
-    ) -> eyre::Result<()> {
+    pub fn merge_external_events(&self, subscription: &mut Ros2Subscription) -> eyre::Result<()> {
         let subscription = subscription.into_stream()?;
         let stream = futures::stream::poll_fn(move |cx| {
             let s = subscription.as_stream().map(|item| {
@@ -365,12 +432,13 @@ impl Node {
         });
 
         // take out the event stream and temporarily replace it with a dummy
+        let mut inner = self.events.inner.blocking_lock();
         let events = std::mem::replace(
-            &mut self.events.inner,
+            &mut *inner,
             EventsInner::Merged(Box::new(futures::stream::empty())),
         );
         // update self.events with the merged stream
-        self.events.inner = EventsInner::Merged(events.merge_external_send(Box::pin(stream)));
+        *inner = EventsInner::Merged(events.merge_external_send(Box::pin(stream)));
 
         Ok(())
     }
@@ -385,13 +453,14 @@ fn err_to_pyany(err: eyre::Report, gil: Python<'_>) -> Py<PyAny> {
 }
 
 struct Events {
-    inner: EventsInner,
+    inner: Arc<Mutex<EventsInner>>,
     _cleanup_handle: NodeCleanupHandle,
 }
 
 impl Events {
-    fn recv(&mut self, timeout: Option<Duration>) -> Option<PyEvent> {
-        let event = match &mut self.inner {
+    fn recv(&self, timeout: Option<Duration>) -> Option<PyEvent> {
+        let mut inner = self.inner.blocking_lock();
+        let event = match &mut *inner {
             EventsInner::Dora(events) => match timeout {
                 Some(timeout) => events.recv_timeout(timeout).map(MergedEvent::Dora),
                 None => events.recv().map(MergedEvent::Dora),
@@ -401,8 +470,20 @@ impl Events {
         event.map(|event| PyEvent { event })
     }
 
-    async fn recv_async_timeout(&mut self, timeout: Option<Duration>) -> Option<PyEvent> {
-        let event = match &mut self.inner {
+    fn try_recv(&self) -> Result<PyEvent, TryRecvError> {
+        let mut inner = self.inner.blocking_lock();
+        let event = match &mut *inner {
+            EventsInner::Dora(events) => events.try_recv().map(MergedEvent::Dora),
+            EventsInner::Merged(_events) => {
+                todo!("try_recv on external event stream is not yet implemented!")
+            }
+        };
+        event.map(|event| PyEvent { event })
+    }
+
+    async fn recv_async_timeout(&self, timeout: Option<Duration>) -> Option<PyEvent> {
+        let mut inner = self.inner.lock().await;
+        let event = match &mut *inner {
             EventsInner::Dora(events) => match timeout {
                 Some(timeout) => events
                     .recv_async_timeout(timeout)
@@ -415,8 +496,9 @@ impl Events {
         event.map(|event| PyEvent { event })
     }
 
-    fn drain(&mut self) -> Option<Vec<PyEvent>> {
-        match &mut self.inner {
+    fn drain(&self) -> Option<Vec<PyEvent>> {
+        let mut inner = self.inner.blocking_lock();
+        match &mut *inner {
             EventsInner::Dora(events) => match events.drain() {
                 Some(items) => {
                     return Some(
@@ -433,6 +515,16 @@ impl Events {
                 todo!("Draining external event is not yet implemented!")
             }
         };
+    }
+
+    fn is_empty(&self) -> bool {
+        let inner = self.inner.blocking_lock();
+        match &*inner {
+            EventsInner::Dora(events) => events.is_empty(),
+            EventsInner::Merged(_events) => {
+                todo!("is_empty on external event stream is not yet implemented!")
+            }
+        }
     }
 }
 
