@@ -203,9 +203,7 @@ impl Message {
                     fn from(uuid: crate::ros2_client::unique_identifier_msgs::UUID) -> Self {
                         use crate::ros2_client::unique_identifier_msgs::UUID;
                         let UUID {uuid} = uuid;
-                        let mut buf = [0u8; 16];
-                        uuid.as_simple().encode_lower(&mut buf);
-                        Self { uuid: buf }
+                        Self { uuid: *uuid.as_bytes() }
                     }
                 }
             },
@@ -359,7 +357,7 @@ impl Message {
         let publisher_name = format_ident!("Publisher__{package_name}__{}", self.name);
         let cxx_publisher_name = format!("Publisher_{}", self.name);
         let create_publisher = format_ident!("new__Publisher__{package_name}__{}", self.name);
-        let cxx_create_publisher = format!("create_publisher");
+        let cxx_create_publisher = "create_publisher".to_string();
 
         let struct_raw_name = format_ident!("{package_name}__{}", self.name);
         let struct_raw_name_str = struct_raw_name.to_string();

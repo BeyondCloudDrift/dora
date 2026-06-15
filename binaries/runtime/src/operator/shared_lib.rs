@@ -40,7 +40,7 @@ pub fn run(
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        rt.block_on(download_file(source, target_path))
+        rt.block_on(download_file(source, target_path, None))
             .wrap_err("failed to download shared library operator")?
     } else {
         adjust_shared_library_path(Path::new(source))?
@@ -52,7 +52,19 @@ pub fn run(
     };
 
     let closure = AssertUnwindSafe(|| {
-        let bindings = Bindings::init(&library).context("failed to init operator")?;
+        let bindings = match Bindings::init(&library) {
+            Ok(b) => b,
+            Err(err) => {
+                let err = err.wrap_err(format!(
+                    "failed to init operator bindings from `{}`. \
+                        On Windows, ensure that the shared library exports the required symbols \
+                        (dora_init_operator, dora_drop_operator, dora_on_event).",
+                    path.display()
+                ));
+                let _ = init_done.send(Err(eyre!("{err:?}")));
+                return Err(err);
+            }
+        };
 
         let operator = SharedLibraryOperator {
             incoming_events,
@@ -156,7 +168,7 @@ impl SharedLibraryOperator<'_> {
             };
 
             let span = span!(tracing::Level::TRACE, "on_event", input_id = field::Empty);
-            let _ = span.enter();
+            let _enter = span.enter();
             // Add metadata context if we have a tracer and
             // incoming input has some metadata.
             #[cfg(feature = "telemetry")]
@@ -166,21 +178,25 @@ impl SharedLibraryOperator<'_> {
                 ..
             } = &mut event
             {
-                use dora_tracing::telemetry::{deserialize_context, serialize_context};
-                use tracing_opentelemetry::OpenTelemetrySpanExt;
                 span.record("input_id", input_id.as_str());
 
-                let otel = metadata.open_telemetry_context();
-                let cx = deserialize_context(&otel);
-                span.set_parent(cx)
-                    .context("failed to set parent span")
-                    .unwrap_or_default();
-                let cx = span.context();
-                let string_cx = serialize_context(&cx);
-                metadata.parameters.insert(
-                    "open_telemetry_context".to_string(),
-                    Parameter::String(string_cx),
-                );
+                #[cfg(feature = "telemetry")]
+                {
+                    use dora_tracing::telemetry::{deserialize_context, serialize_context};
+                    use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+                    let otel = metadata.open_telemetry_context();
+                    let cx = deserialize_context(&otel);
+                    span.set_parent(cx)
+                        .context("failed to set parent span")
+                        .unwrap_or_default();
+                    let cx = span.context();
+                    let string_cx = serialize_context(&cx);
+                    metadata.parameters.insert(
+                        "open_telemetry_context".to_string(),
+                        Parameter::String(string_cx),
+                    );
+                }
             }
 
             let mut operator_event = match event {
@@ -219,7 +235,7 @@ impl SharedLibraryOperator<'_> {
                     error: None,
                 },
                 Event::Reload { .. } => {
-                    // Reloading shared lib operator is not supported. See: https://github.com/dora-rs/dora/pull/239#discussion_r1154313139
+                    // Reloading shared lib operator is not supported. See: https://github.com/dora-rs/adora/pull/239#discussion_r1154313139
                     continue;
                 }
                 Event::Error(err) => dora_operator_api_types::RawEvent {

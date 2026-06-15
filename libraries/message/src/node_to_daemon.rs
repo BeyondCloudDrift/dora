@@ -1,6 +1,4 @@
-pub use crate::common::{
-    DataMessage, DropToken, LogLevel, LogMessage, SharedMemoryId, Timestamped,
-};
+pub use crate::common::{DataMessage, LogLevel, LogMessage, SharedMemoryId, Timestamped};
 use crate::{
     DataflowId, current_crate_version,
     id::{DataId, NodeId},
@@ -8,6 +6,7 @@ use crate::{
     versions_compatible,
 };
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum DaemonRequest {
     Register(NodeRegisterRequest),
@@ -17,18 +16,14 @@ pub enum DaemonRequest {
         metadata: Metadata,
         data: Option<DataMessage>,
     },
+    OutputSent {
+        output_id: DataId,
+        metadata: Metadata,
+    },
     CloseOutputs(Vec<DataId>),
-    /// Signals that the node is finished sending outputs and that it received all
-    /// required drop tokens.
+    /// Signals that the node is finished sending outputs.
     OutputsDone,
-    NextEvent {
-        drop_tokens: Vec<DropToken>,
-    },
-    ReportDropTokens {
-        drop_tokens: Vec<DropToken>,
-    },
-    SubscribeDrop,
-    NextFinishedDropTokens,
+    NextEvent,
     EventStreamDropped,
     NodeConfig {
         node_id: NodeId,
@@ -40,15 +35,13 @@ impl DaemonRequest {
         #[allow(clippy::match_like_matches_macro)]
         match self {
             DaemonRequest::SendMessage { .. }
-            | DaemonRequest::NodeConfig { .. }
-            | DaemonRequest::ReportDropTokens { .. } => false,
+            | DaemonRequest::OutputSent { .. }
+            | DaemonRequest::NodeConfig { .. } => false,
             DaemonRequest::Register(NodeRegisterRequest { .. })
             | DaemonRequest::Subscribe
             | DaemonRequest::CloseOutputs(_)
             | DaemonRequest::OutputsDone
-            | DaemonRequest::NextEvent { .. }
-            | DaemonRequest::SubscribeDrop
-            | DaemonRequest::NextFinishedDropTokens
+            | DaemonRequest::NextEvent
             | DaemonRequest::EventStreamDropped => true,
         }
     }
@@ -61,11 +54,9 @@ impl DaemonRequest {
             | DaemonRequest::Subscribe
             | DaemonRequest::CloseOutputs(_)
             | DaemonRequest::OutputsDone
-            | DaemonRequest::NextEvent { .. }
-            | DaemonRequest::SubscribeDrop
-            | DaemonRequest::NextFinishedDropTokens
-            | DaemonRequest::ReportDropTokens { .. }
+            | DaemonRequest::NextEvent
             | DaemonRequest::SendMessage { .. }
+            | DaemonRequest::OutputSent { .. }
             | DaemonRequest::EventStreamDropped => false,
         }
     }
@@ -101,33 +92,6 @@ impl NodeRegisterRequest {
             ))
         }
     }
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct DropEvent {
-    pub tokens: Vec<DropToken>,
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub enum InputData {
-    SharedMemory(SharedMemoryInput),
-    Vec(Vec<u8>),
-}
-
-impl InputData {
-    pub fn drop_token(&self) -> Option<DropToken> {
-        match self {
-            InputData::SharedMemory(data) => Some(data.drop_token),
-            InputData::Vec(_) => None,
-        }
-    }
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct SharedMemoryInput {
-    pub shared_memory_id: SharedMemoryId,
-    pub len: usize,
-    pub drop_token: DropToken,
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]

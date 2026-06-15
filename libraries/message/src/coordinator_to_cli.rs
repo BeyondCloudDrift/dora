@@ -1,17 +1,26 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    net::IpAddr,
-};
+use std::{collections::BTreeMap, net::IpAddr};
 
 use uuid::Uuid;
 
 pub use crate::common::{LogLevel, LogMessage, NodeError, NodeErrorCause, NodeExitStatus};
-use crate::{BuildId, common::DaemonId, descriptor::Descriptor, id::NodeId};
+use crate::{
+    BuildId,
+    common::DaemonId,
+    descriptor::Descriptor,
+    id::{DataId, NodeId},
+};
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub enum ControlRequestReply {
     Error(String),
     CoordinatorStopped,
+    /// Response to [`ControlRequest::Hello`][crate::cli_to_coordinator::ControlRequest::Hello].
+    /// Carries the coordinator's own dora crate version so the CLI can
+    /// display it on version mismatches and in debug output
+    /// (dora-rs/adora#151).
+    HelloOk {
+        dora_version: semver::Version,
+    },
     DataflowBuildTriggered {
         build_id: BuildId,
     },
@@ -32,7 +41,24 @@ pub enum ControlRequestReply {
         uuid: Uuid,
         result: DataflowResult,
     },
+    DataflowRestarted {
+        old_uuid: Uuid,
+        new_uuid: Uuid,
+    },
     DataflowList(DataflowList),
+    /// Response to [`ControlRequest::Clean`][crate::cli_to_coordinator::ControlRequest::Clean].
+    ///
+    /// `cleaned` lists dataflows the coordinator successfully removed
+    /// from both in-memory state and the persisted store (with the
+    /// cascade-delete of associated `dora param` rows). `failed` lists
+    /// dataflows that were eligible but whose persisted-store delete
+    /// errored: their in-memory entries are preserved so a later
+    /// `dora clean` can retry. The CLI needs both lists to tell
+    /// "nothing eligible" apart from "all candidates failed to clean".
+    CleanResult {
+        cleaned: DataflowList,
+        failed: Vec<CleanFailure>,
+    },
     DataflowInfo {
         uuid: Uuid,
         name: Option<String>,
@@ -40,13 +66,59 @@ pub enum ControlRequestReply {
     },
     DestroyOk,
     DaemonConnected(bool),
-    ConnectedDaemons(BTreeSet<DaemonId>),
+    ConnectedDaemons(Vec<DaemonInfo>),
     Logs(Vec<u8>),
     CliAndDefaultDaemonIps {
         default_daemon: Option<IpAddr>,
         cli: Option<IpAddr>,
     },
     NodeInfoList(Vec<NodeInfo>),
+    TopicSubscribed {
+        subscription_id: Uuid,
+    },
+    TraceList(Vec<TraceSummary>),
+    TraceSpans(Vec<TraceSpan>),
+    NodeRestarted {
+        dataflow_id: Uuid,
+        node_id: NodeId,
+    },
+    NodeStopped {
+        dataflow_id: Uuid,
+        node_id: NodeId,
+    },
+    TopicPublished,
+    // --- Dynamic Topology ---
+    NodeAdded {
+        dataflow_id: Uuid,
+        node_id: NodeId,
+    },
+    NodeRemoved {
+        dataflow_id: Uuid,
+        node_id: NodeId,
+    },
+    MappingAdded {
+        dataflow_id: Uuid,
+        source_node: NodeId,
+        source_output: DataId,
+        target_node: NodeId,
+        target_input: DataId,
+    },
+    MappingRemoved {
+        dataflow_id: Uuid,
+        source_node: NodeId,
+        source_output: DataId,
+        target_node: NodeId,
+        target_input: DataId,
+    },
+    ParamList {
+        params: Vec<(String, serde_json::Value)>,
+    },
+    ParamValue {
+        key: String,
+        value: serde_json::Value,
+    },
+    ParamSet,
+    ParamDeleted,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -56,6 +128,9 @@ pub struct NodeInfo {
     pub node_id: NodeId,
     pub daemon_id: DaemonId,
     pub metrics: Option<NodeMetricsInfo>,
+    /// Per-dataflow cross-daemon network I/O counters (shared across nodes in same dataflow)
+    #[serde(default)]
+    pub network: Option<crate::daemon_to_coordinator::NetworkMetrics>,
 }
 
 /// Resource metrics for a node (from daemon)
@@ -71,6 +146,50 @@ pub struct NodeMetricsInfo {
     pub disk_read_mb_s: Option<f64>,
     /// Disk write MB/s (if available)
     pub disk_write_mb_s: Option<f64>,
+    /// Number of times this node has been restarted
+    #[serde(default)]
+    pub restart_count: u32,
+    /// Input IDs that have timed out (circuit breaker open)
+    #[serde(default)]
+    pub broken_inputs: Vec<String>,
+    /// Current health status
+    #[serde(default)]
+    pub status: crate::daemon_to_coordinator::NodeStatus,
+    /// Number of pending messages in the node's input queue
+    #[serde(default)]
+    pub pending_messages: u64,
+}
+
+/// Health information about a connected daemon.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct DaemonInfo {
+    pub daemon_id: DaemonId,
+    pub last_heartbeat_ago_ms: u64,
+    /// Fault tolerance stats from the daemon (if available).
+    #[serde(default)]
+    pub ft_stats: Option<crate::daemon_to_coordinator::FaultToleranceSnapshot>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct TraceSummary {
+    pub trace_id: String,
+    pub root_span_name: String,
+    pub span_count: usize,
+    pub start_time: u64,
+    pub total_duration_us: u64,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct TraceSpan {
+    pub trace_id: String,
+    pub span_id: u64,
+    pub parent_span_id: Option<u64>,
+    pub name: String,
+    pub target: String,
+    pub level: String,
+    pub start_time: u64,
+    pub duration_us: u64,
+    pub fields: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -111,6 +230,18 @@ impl DataflowList {
 pub struct DataflowListEntry {
     pub id: DataflowIdAndName,
     pub status: DataflowStatus,
+}
+
+/// A dataflow that `dora clean` failed to remove from the persisted
+/// store. Reported alongside the successful list so the CLI can show
+/// the user what didn't get cleaned and exit non-zero.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct CleanFailure {
+    pub id: DataflowIdAndName,
+    /// Human-readable error from the persisted store (e.g. an
+    /// underlying redb / I/O failure). The in-memory entry is
+    /// preserved so a later `dora clean` can retry.
+    pub error: String,
 }
 
 #[derive(Debug, Clone, Copy, serde::Deserialize, serde::Serialize, PartialEq, Eq)]

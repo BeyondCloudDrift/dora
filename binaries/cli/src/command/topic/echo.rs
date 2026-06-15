@@ -3,22 +3,15 @@ use std::{ptr::NonNull, sync::Arc, time::SystemTime};
 use arrow::{buffer::OffsetBuffer, datatypes::Field};
 use clap::Args;
 use colored::Colorize;
-use dora_core::topics::{open_zenoh_session, zenoh_output_publish_topic};
 use dora_message::{
     common::Timestamped,
     daemon_to_daemon::InterDaemonEvent,
-    id::{DataId, NodeId},
     metadata::{ArrowTypeInfo, BufferOffset, Parameter},
 };
-use eyre::{Context, eyre};
-use tokio::{runtime::Builder, task::JoinSet};
-use uuid::Uuid;
+use eyre::eyre;
 
 use crate::{
-    command::{
-        Executable, default_tracing,
-        topic::selector::{TopicIdentifier, TopicSelector},
-    },
+    command::{Executable, default_tracing, topic::selector::TopicSelector},
     common::CoordinatorOptions,
     formatting::OutputFormat,
 };
@@ -27,6 +20,13 @@ use crate::{
 ///
 /// If no `DATA` is provided, all outputs from the selected dataflow will be
 /// echoed.
+///
+/// Topic inspection requires debug mode on the dataflow:
+///
+/// ```yaml
+/// _unstable_debug:
+///   enable_debug_inspection: true
+/// ```
 ///
 /// Examples:
 ///
@@ -39,13 +39,6 @@ use crate::{
 /// Emit JSON lines:
 ///   dora topic echo -d my-dataflow robot1/pose --format json
 ///
-/// Note: The dataflow descriptor must include the following snippet so that
-/// runtime messages can be inspected:
-///
-/// ```yaml
-/// _unstable_debug:
-///   publish_all_messages_to_zenoh: true
-/// ```
 #[derive(Debug, Args)]
 #[clap(verbatim_doc_comment)]
 pub struct Echo {
@@ -56,6 +49,16 @@ pub struct Echo {
     #[clap(long, value_name = "FORMAT", default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
 
+    /// Exit after this many messages (default: stream until interrupted).
+    /// Must be at least 1.
+    #[clap(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+    pub count: Option<u64>,
+
+    /// Exit after this many seconds (default: stream until interrupted).
+    /// Must be at least 1.
+    #[clap(long, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..))]
+    pub duration: Option<u64>,
+
     #[clap(flatten)]
     coordinator: CoordinatorOptions,
 }
@@ -64,7 +67,13 @@ impl Executable for Echo {
     fn execute(self) -> eyre::Result<()> {
         default_tracing()?;
 
-        inspect(self.coordinator, self.selector, self.format)
+        inspect(
+            self.coordinator,
+            self.selector,
+            self.format,
+            self.count,
+            self.duration,
+        )
     }
 }
 
@@ -72,109 +81,89 @@ fn inspect(
     coordinator: CoordinatorOptions,
     selector: TopicSelector,
     format: OutputFormat,
+    count: Option<u64>,
+    duration: Option<u64>,
 ) -> eyre::Result<()> {
-    let mut session = coordinator.connect()?;
-    let (dataflow_id, topics) = selector.resolve(session.as_mut())?;
+    let session = coordinator.connect()?;
+    let (dataflow_id, topics) = selector.resolve(&session)?;
 
-    let rt = Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("tokio runtime failed")?;
-    rt.block_on(async move {
-        let zenoh_session = open_zenoh_session(Some(coordinator.coordinator_addr))
-            .await
-            .context("failed to open zenoh session")?;
+    let ws_topics: Vec<_> = topics
+        .iter()
+        .map(|t| (t.node_id.clone(), t.data_id.clone()))
+        .collect();
 
-        let mut join_set = JoinSet::new();
-        for TopicIdentifier { node_id, data_id } in topics {
-            join_set.spawn(log_to_terminal(
-                zenoh_session.clone(),
-                dataflow_id,
-                node_id,
-                data_id,
-                format,
-            ));
-        }
-        while let Some(res) = join_set.join_next().await {
-            match res {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    eprintln!("Error while inspecting output: {e}");
-                }
-                Err(e) => {
-                    eprintln!("Join error: {e}");
-                }
-            }
-        }
+    let (_subscription_id, data_rx) = session.subscribe_topics(dataflow_id, ws_topics)?;
 
-        Result::<_, eyre::Error>::Ok(())
-    })
-}
-
-fn buffer_into_arrow_array(
-    raw_buffer: &arrow::buffer::Buffer,
-    type_info: &ArrowTypeInfo,
-) -> eyre::Result<arrow::array::ArrayData> {
-    if raw_buffer.is_empty() {
-        return Ok(arrow::array::ArrayData::new_empty(&type_info.data_type));
-    }
-
-    let mut buffers = Vec::new();
-    for BufferOffset { offset, len } in &type_info.buffer_offsets {
-        buffers.push(raw_buffer.slice_with_length(*offset, *len));
-    }
-
-    let mut child_data = Vec::new();
-    for child_type_info in &type_info.child_data {
-        child_data.push(buffer_into_arrow_array(raw_buffer, child_type_info)?)
-    }
-
-    arrow::array::ArrayData::try_new(
-        type_info.data_type.clone(),
-        type_info.len,
-        type_info
-            .validity
-            .clone()
-            .map(arrow::buffer::Buffer::from_vec),
-        type_info.offset,
-        buffers,
-        child_data,
-    )
-    .context("Error creating Arrow array")
-}
-
-async fn log_to_terminal(
-    zenoh_session: zenoh::Session,
-    dataflow_id: Uuid,
-    node_id: NodeId,
-    output_id: DataId,
-    format: OutputFormat,
-) -> eyre::Result<()> {
-    let subscribe_topic = zenoh_output_publish_topic(dataflow_id, &node_id, &output_id);
-    let output_name = format!("{node_id}/{output_id}");
-    let subscriber = zenoh_session
-        .declare_subscriber(subscribe_topic)
-        .await
-        .map_err(|e| eyre!(e))
-        .wrap_err_with(|| format!("failed to subscribe to {output_name}"))?;
-
-    let output_name = match format {
-        OutputFormat::Table => output_name.green().to_string(),
-        OutputFormat::Json => serde_json::to_string(&output_name).unwrap(),
-    };
+    // If no data arrives within this timeout, hint that debug mode may be needed.
+    const HINT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    let mut hint_shown = false;
     let mut buf = Vec::with_capacity(1024);
-    while let Ok(sample) = subscriber.recv_async().await {
-        let event = match Timestamped::deserialize_inter_daemon_event(&sample.payload().to_bytes())
+    let mut emitted: u64 = 0;
+    let deadline = duration.map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s));
+    loop {
+        // Stop conditions: --count reached or --duration elapsed.
+        if let Some(max) = count
+            && emitted >= max
         {
-            Ok(event) => event,
-            Err(_) => {
-                eprintln!("Received invalid event");
+            break;
+        }
+        let recv_timeout = match deadline {
+            Some(d) => {
+                let remaining = d.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                remaining.min(HINT_TIMEOUT)
+            }
+            None => HINT_TIMEOUT,
+        };
+        let result = match data_rx.recv_timeout(recv_timeout) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(d) = deadline
+                    && std::time::Instant::now() >= d
+                {
+                    break;
+                }
+                if !hint_shown {
+                    eprintln!(
+                        "{}: no topic data received during the wait window. Ensure `_unstable_debug.enable_debug_inspection: true` is enabled on the dataflow.",
+                        "hint".yellow().bold(),
+                    );
+                    hint_shown = true;
+                }
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        buf.clear();
+        let payload = match result {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("Error receiving topic data: {e}");
                 continue;
             }
         };
+
+        let event = match Timestamped::deserialize_inter_daemon_event(&payload) {
+            Ok(event) => event,
+            Err(e) => {
+                eprintln!("Received invalid event ({} bytes): {e}", payload.len());
+                continue;
+            }
+        };
+
         match event.inner {
-            InterDaemonEvent::Output { metadata, data, .. } => {
+            InterDaemonEvent::Output {
+                metadata,
+                data,
+                node_id,
+                output_id,
+                ..
+            } => {
                 use std::fmt::Write;
+
+                let output_name = format!("{node_id}/{output_id}");
 
                 let timestamp = SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
@@ -190,7 +179,7 @@ async fn log_to_terminal(
                     let array = match buffer_into_arrow_array(&buffer, &metadata.type_info) {
                         Ok(array) => array,
                         Err(e) => {
-                            eprintln!("invalid data: {e}");
+                            eprintln!("invalid data on {output_name}: {e}");
                             continue;
                         }
                     };
@@ -229,6 +218,7 @@ async fn log_to_terminal(
                             Parameter::Float(value) => serde_json::to_string(value).unwrap(),
                             Parameter::ListFloat(value) => serde_json::to_string(value).unwrap(),
                             Parameter::ListString(value) => serde_json::to_string(value).unwrap(),
+                            Parameter::Timestamp(dt) => serde_json::to_string(dt).unwrap(),
                         };
                         write!(output, "{}:{value}", serde_json::Value::String(k.clone()),)
                             .unwrap();
@@ -239,9 +229,14 @@ async fn log_to_terminal(
                     None
                 };
 
+                let display_name = match format {
+                    OutputFormat::Table => output_name.green().to_string(),
+                    OutputFormat::Json => serde_json::to_string(&output_name).unwrap(),
+                };
+
                 match format {
                     OutputFormat::Table => {
-                        let mut output = format!("{output_name}\t");
+                        let mut output = format!("{display_name}\t");
                         if let Some(s) = data_str {
                             write!(output, " {}={s}", "data".bold()).unwrap();
                         }
@@ -254,21 +249,140 @@ async fn log_to_terminal(
                         println!(
                             r#"{{"timestamp":{},"name":{},"data":{},"metadata":{}}}"#,
                             timestamp,
-                            output_name,
+                            display_name,
                             data_str.unwrap_or("null"),
                             metadata_str.as_deref().unwrap_or("null")
                         );
                     }
                 }
-
-                buf.clear();
+                emitted += 1;
             }
-            InterDaemonEvent::OutputClosed { .. } => {
+            InterDaemonEvent::OutputClosed {
+                node_id, output_id, ..
+            } => {
                 eprintln!("Output {node_id}/{output_id} closed");
-                break;
             }
         }
     }
 
     Ok(())
+}
+
+fn buffer_into_arrow_array(
+    raw_buffer: &arrow::buffer::Buffer,
+    type_info: &ArrowTypeInfo,
+) -> eyre::Result<arrow::array::ArrayData> {
+    // A zero-footprint array (e.g. `NullArray::new(n)`) serializes to an empty
+    // payload but still carries a meaningful `type_info.len`. Reconstructing via
+    // `ArrayData::new_empty` would discard that length and silently truncate the
+    // array to 0; the general path below honors it (dora-rs/dora#2083).
+    let mut buffers = Vec::new();
+    for BufferOffset { offset, len } in &type_info.buffer_offsets {
+        if *len == 0 {
+            // Slicing a zero-length buffer out of an empty payload can yield an
+            // under-aligned pointer that `try_new` rejects; use a freshly
+            // aligned empty buffer instead (dora-rs/dora#2083).
+            buffers.push(arrow::buffer::MutableBuffer::new(0).into());
+            continue;
+        }
+        // `type_info` is peer-controlled, so validate the offset before slicing.
+        // `checked_add` guards against an `offset`/`len` that would overflow
+        // `usize` and bypass the bounds check; both prevent a panic inside
+        // `slice_with_length` on a malformed event (dora-rs/dora#2083).
+        let end = offset
+            .checked_add(*len)
+            .ok_or_else(|| eyre!("buffer offset overflow: offset={offset}, len={len}"))?;
+        if end > raw_buffer.len() {
+            return Err(eyre!(
+                "buffer offset out of bounds: offset={offset}, len={len}, buffer_len={}",
+                raw_buffer.len()
+            ));
+        }
+        buffers.push(raw_buffer.slice_with_length(*offset, *len));
+    }
+
+    let mut child_data = Vec::new();
+    for child_type_info in &type_info.child_data {
+        child_data.push(buffer_into_arrow_array(raw_buffer, child_type_info)?)
+    }
+
+    arrow::array::ArrayData::try_new(
+        type_info.data_type.clone(),
+        type_info.len,
+        type_info
+            .validity
+            .clone()
+            .map(arrow::buffer::Buffer::from_vec),
+        type_info.offset,
+        buffers,
+        child_data,
+    )
+    .map_err(|e| eyre!("Error creating Arrow array: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Array, NullArray};
+
+    fn type_info(
+        data_type: arrow::datatypes::DataType,
+        buffer_offsets: Vec<BufferOffset>,
+    ) -> ArrowTypeInfo {
+        ArrowTypeInfo {
+            data_type,
+            len: 0,
+            null_count: 0,
+            validity: None,
+            offset: 0,
+            buffer_offsets,
+            child_data: vec![],
+            field_names: None,
+            schema_hash: None,
+        }
+    }
+
+    #[test]
+    fn empty_payload_preserves_nullarray_length() {
+        // dora-rs/dora#2083: a `NullArray::new(n)` has an empty footprint but a
+        // non-zero length that must survive `dora topic echo`'s decode.
+        let mut info = type_info(arrow::datatypes::DataType::Null, vec![]);
+        info.len = 5;
+        let decoded =
+            buffer_into_arrow_array(&arrow::buffer::Buffer::from(Vec::<u8>::new()), &info).unwrap();
+        assert_eq!(decoded.len(), 5);
+        assert_eq!(decoded.data_type(), &arrow::datatypes::DataType::Null);
+        assert_eq!(NullArray::from(decoded).len(), 5);
+    }
+
+    #[test]
+    fn malformed_offset_is_rejected_not_panicked() {
+        // dora-rs/dora#2083: `type_info` is peer-controlled. An empty payload
+        // with `offset = usize::MAX` would overflow `offset + len` and bypass the
+        // bounds check, panicking inside `slice_with_length`. It must surface as
+        // an error instead.
+        let info = type_info(
+            arrow::datatypes::DataType::UInt8,
+            vec![BufferOffset {
+                offset: usize::MAX,
+                len: 1,
+            }],
+        );
+        let err = buffer_into_arrow_array(&arrow::buffer::Buffer::from(Vec::<u8>::new()), &info)
+            .unwrap_err();
+        assert!(err.to_string().contains("overflow"), "got: {err}");
+    }
+
+    #[test]
+    fn out_of_bounds_offset_is_rejected() {
+        // A non-overflowing but out-of-range offset must also be reported, not
+        // panic in `slice_with_length`.
+        let info = type_info(
+            arrow::datatypes::DataType::UInt8,
+            vec![BufferOffset { offset: 0, len: 8 }],
+        );
+        let err =
+            buffer_into_arrow_array(&arrow::buffer::Buffer::from(vec![0u8; 4]), &info).unwrap_err();
+        assert!(err.to_string().contains("out of bounds"), "got: {err}");
+    }
 }

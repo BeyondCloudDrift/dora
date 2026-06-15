@@ -43,16 +43,16 @@ impl GitManager {
             .filter(|p| p.git_source.repo == repo)
             .map(|p| &p.git_source.commit_hash);
 
-        if let Some(using) = self.clones_in_use.get(&clone_dir) {
-            if !using.is_empty() {
-                // The directory is currently in use by another dataflow. Rebuilding
-                // while a dataflow is running could lead to unintended behavior.
-                eyre::bail!(
-                    "the build directory is still in use by the following \
+        if let Some(using) = self.clones_in_use.get(&clone_dir)
+            && !using.is_empty()
+        {
+            // The directory is currently in use by another dataflow. Rebuilding
+            // while a dataflow is running could lead to unintended behavior.
+            eyre::bail!(
+                "the build directory is still in use by the following \
                     dataflows, please stop them before rebuilding: {}",
-                    using.iter().join(", ")
-                )
-            }
+                using.iter().join(", ")
+            )
         }
 
         let reuse = if self.clone_dir_ready(session_id, &clone_dir) {
@@ -111,13 +111,6 @@ impl GitManager {
         Ok(GitFolder { reuse })
     }
 
-    pub fn in_use(&self, dir: &Path) -> bool {
-        self.clones_in_use
-            .get(dir)
-            .map(|ids| !ids.is_empty())
-            .unwrap_or(false)
-    }
-
     pub fn clone_dir_ready(&self, session_id: SessionId, dir: &Path) -> bool {
         self.prepared_builds
             .get(&session_id)
@@ -139,7 +132,10 @@ impl GitManager {
         repo_url: &Url,
         commit_hash: &String,
     ) -> eyre::Result<PathBuf> {
-        let mut path = base_dir.join(repo_url.host_str().context("git URL has no hostname")?);
+        // file:// URLs (local mirrors, air-gapped setups, tests) have no
+        // hostname — group their clones under a "localhost" directory
+        let host = repo_url.host_str().unwrap_or("localhost");
+        let mut path = base_dir.join(host);
         path.extend(repo_url.path_segments().context("no path in git URL")?);
         let path = path.join(commit_hash);
         Ok(dunce::simplified(&path).to_owned())
@@ -355,6 +351,12 @@ async fn fetch_changes(
 }
 
 fn checkout_tree(repository: &git2::Repository, commit_hash: &str) -> eyre::Result<()> {
+    // Reject arbitrary rev-spec expressions; only allow hex commit hashes and branch/tag names.
+    if commit_hash.contains("..") || commit_hash.contains(':') || commit_hash.contains('^') {
+        eyre::bail!(
+            "invalid commit reference '{commit_hash}': rev-spec expressions are not allowed"
+        );
+    }
     let (object, reference) = repository
         .revparse_ext(commit_hash)
         .context("failed to parse ref")?;

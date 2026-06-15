@@ -7,15 +7,11 @@ use uuid::Uuid;
 
 use crate::{
     command::{Executable, default_tracing},
-    common::CoordinatorOptions,
+    common::{CoordinatorOptions, expect_reply, send_control_request},
     formatting::OutputFormat,
+    ws_client::WsSession,
 };
-use communication_layer_request_reply::TcpRequestReplyConnection;
-use dora_message::{
-    cli_to_coordinator::ControlRequest,
-    coordinator_to_cli::{ControlRequestReply, NodeInfo},
-};
-use eyre::{Context, bail};
+use dora_message::{cli_to_coordinator::ControlRequest, coordinator_to_cli::NodeInfo};
 
 /// List all currently running nodes and their status.
 ///
@@ -37,8 +33,12 @@ pub struct List {
     pub dataflow: Option<String>,
 
     /// Output format
-    #[clap(long, value_name = "FORMAT", default_value_t = OutputFormat::Table)]
+    #[clap(long, short = 'f', value_name = "FORMAT", default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
+
+    /// Only print node IDs, one per line
+    #[clap(long, short = 'q', conflicts_with = "format")]
+    pub quiet: bool,
 
     #[clap(flatten)]
     coordinator: CoordinatorOptions,
@@ -48,8 +48,8 @@ impl Executable for List {
     fn execute(self) -> eyre::Result<()> {
         default_tracing()?;
 
-        let mut session = self.coordinator.connect()?;
-        list(session.as_mut(), self.dataflow, self.format)
+        let session = self.coordinator.connect()?;
+        list(&session, self.dataflow, self.format, self.quiet)
     }
 }
 
@@ -60,28 +60,20 @@ struct OutputEntry {
     pid: String,
     cpu: String,
     memory: String,
+    restarts: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     dataflow: Option<String>,
 }
 
 fn list(
-    session: &mut TcpRequestReplyConnection,
+    session: &WsSession,
     dataflow_filter: Option<String>,
     format: OutputFormat,
+    quiet: bool,
 ) -> eyre::Result<()> {
     // Request node information from coordinator
-    let reply_raw = session
-        .request(&serde_json::to_vec(&ControlRequest::GetNodeInfo).unwrap())
-        .wrap_err("failed to send GetNodeInfo request")?;
-
-    let reply: ControlRequestReply =
-        serde_json::from_slice(&reply_raw).wrap_err("failed to parse reply")?;
-
-    let node_infos = match reply {
-        ControlRequestReply::NodeInfoList(infos) => infos,
-        ControlRequestReply::Error(err) => bail!("{err}"),
-        other => bail!("unexpected reply: {other:?}"),
-    };
+    let reply = send_control_request(session, &ControlRequest::GetNodeInfo)?;
+    let node_infos = expect_reply!(reply, NodeInfoList(infos))?;
 
     // Filter by dataflow if specified
     let filtered_nodes: Vec<NodeInfo> = if let Some(ref filter) = dataflow_filter {
@@ -107,17 +99,18 @@ fn list(
     let entries: Vec<OutputEntry> = filtered_nodes
         .into_iter()
         .map(|node| {
-            let (status, pid, cpu, memory) = if let Some(metrics) = node.metrics {
+            let (status, pid, cpu, memory, restarts) = if let Some(metrics) = &node.metrics {
                 (
-                    "Running".to_string(),
+                    metrics.status.to_string(),
                     metrics.pid.to_string(),
                     format!("{:.1}%", metrics.cpu_usage),
                     format!("{:.0} MB", metrics.memory_mb),
+                    metrics.restart_count.to_string(),
                 )
             } else {
-                // Node exists but no metrics available (might be starting or error state)
                 (
                     "Unknown".to_string(),
+                    "-".to_string(),
                     "-".to_string(),
                     "-".to_string(),
                     "-".to_string(),
@@ -130,6 +123,7 @@ fn list(
                 pid,
                 cpu,
                 memory,
+                restarts,
                 dataflow: if dataflow_filter.is_none() {
                     Some(
                         node.dataflow_name
@@ -142,15 +136,22 @@ fn list(
         })
         .collect();
 
+    if quiet {
+        for entry in &entries {
+            println!("{}", entry.node);
+        }
+        return Ok(());
+    }
+
     match format {
         OutputFormat::Table => {
             let mut tw = TabWriter::new(std::io::stdout().lock());
 
             // Write header
             if dataflow_filter.is_none() {
-                tw.write_all(b"NODE\tSTATUS\tPID\tCPU\tMEMORY\tDATAFLOW\n")?;
+                tw.write_all(b"NODE\tSTATUS\tPID\tCPU\tMEMORY\tRESTARTS\tDATAFLOW\n")?;
             } else {
-                tw.write_all(b"NODE\tSTATUS\tPID\tCPU\tMEMORY\n")?;
+                tw.write_all(b"NODE\tSTATUS\tPID\tCPU\tMEMORY\tRESTARTS\n")?;
             }
 
             // Write entries
@@ -158,16 +159,27 @@ fn list(
                 if let Some(ref dataflow) = entry.dataflow {
                     tw.write_all(
                         format!(
-                            "{}\t{}\t{}\t{}\t{}\t{}\n",
-                            entry.node, entry.status, entry.pid, entry.cpu, entry.memory, dataflow
+                            "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                            entry.node,
+                            entry.status,
+                            entry.pid,
+                            entry.cpu,
+                            entry.memory,
+                            entry.restarts,
+                            dataflow
                         )
                         .as_bytes(),
                     )?;
                 } else {
                     tw.write_all(
                         format!(
-                            "{}\t{}\t{}\t{}\t{}\n",
-                            entry.node, entry.status, entry.pid, entry.cpu, entry.memory
+                            "{}\t{}\t{}\t{}\t{}\t{}\n",
+                            entry.node,
+                            entry.status,
+                            entry.pid,
+                            entry.cpu,
+                            entry.memory,
+                            entry.restarts
                         )
                         .as_bytes(),
                     )?;

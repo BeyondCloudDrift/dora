@@ -1,225 +1,49 @@
-
 #!/usr/bin/env sh
+# Install the Dora CLI binary from GitHub Releases.
+# Usage: curl -fsSL https://github.com/dora-rs/dora/releases/latest/download/dora-cli-installer.sh | sh
 
 set -eu
 
-if [ -n "${GITHUB_ACTIONS-}" ]; then
-  set -x
-fi
+REPO="dora-rs/dora"
+DEST="$HOME/.dora/bin"
 
-# Check pipefail support in a subshell, ignore if unsupported
-# shellcheck disable=SC3040
-(set -o pipefail 2> /dev/null) && set -o pipefail
+# Resolve latest tag
+tag=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" | grep '"tag_name"' | cut -d'"' -f4)
 
-help() {
-  cat <<'EOF'
-Install a binary released on GitHub
-
-USAGE:
-    install.sh [options]
-
-FLAGS:
-    -h, --help      Display this message
-    -f, --force     Force overwriting an existing binary
-
-OPTIONS:
-    --repo REPO     Github Repository to install the binary from  [default: dora-rs]
-    --bin BIN       Name of the binary to install  [default: dora]
-    --tag TAG       Tag (version) of the bin to install, defaults to latest release
-    --to LOCATION   Where to install the binary [default: ~/.dora/bin]
-    --target TARGET
-EOF
-}
-
-
-say() {
-  echo "install: $*" >&2
-}
-
-err() {
-  if [ -n "${td-}" ]; then
-    rm -rf "$td"
-  fi
-
-  say "error: $*"
-  exit 1
-}
-
-need() {
-  if ! command -v "$1" > /dev/null 2>&1; then
-    err "need $1 (command not found)"
-  fi
-}
-
-
-
-download() {
-  url="$1"
-  output="$2"
-
-  if command -v curl > /dev/null; then
-    curl --proto =https --tlsv1.2 -sSfL "$url" "-o$output"
-  else
-    wget --https-only --secure-protocol=TLSv1_2 --quiet "$url" "-O$output"
-  fi
-}
-
-force=false
-while test $# -gt 0; do
-  case $1 in
-    --help | -h)
-      help
-      exit 0
-      ;;
-    --repo)
-      repo=$2
-      shift
-      ;;
-    --bin)
-      bin=$2
-      shift
-      ;;
-    --tag)
-      tag=$2
-      shift
-      ;;
-    --target)
-      target=$2
-      shift
-      ;;
-    --to)
-      dest=$2
-      shift
-      ;;
-    *)
-      say "error: unrecognized argument '$1'. Usage:"
-      help
-      exit 1
-      ;;
-  esac
-  shift
-done
-
-if [ -z "${repo-}" ]; then
-  repo="dora-rs"
-fi
-
-if [ -z "${bin-}" ]; then
-  bin="dora"
-fi
-
-url=https://github.com/$repo/$bin
-releases=$url/releases
-
-command -v curl > /dev/null 2>&1 ||
-  command -v wget > /dev/null 2>&1 ||
-  err "need wget or curl (command not found)"
-
-need mkdir
-need mktemp
-
-if [ -z "${tag-}" ]; then
-  need grep
-  need cut
-fi
-
-if [ -z "${target-}" ]; then
-  need cut
-fi
-
-if [ -z "${dest-}" ]; then
-  dest="$HOME/.dora/bin"
-fi
-
-
-if [ -z "${tag-}" ]; then
-  tag=$(
-    download https://api.github.com/repos/$repo/$bin/releases/latest - |
-    grep tag_name |
-    cut -d'"' -f4
-  )
-fi
-
-
-if [ -z "${target-}" ]; then
-  # bash compiled with MINGW (e.g. git-bash, used in github windows runners),
-  # unhelpfully includes a version suffix in `uname -s` output, so handle that.
-  # e.g. MINGW64_NT-10-0.19044
-  kernel=$(uname -s | cut -d- -f1)
-  uname_target="$(uname -m)-$kernel"
-
-  case $uname_target in
-    aarch64-Linux) target=aarch64-unknown-linux-musl;;
-    arm64-Darwin) target=aarch64-apple-darwin;;
-    armv7l-Linux) target=armv7-unknown-linux-musleabihf;;
-    x86_64-Darwin) target=x86_64-apple-darwin;;
-    x86_64-Linux) target=x86_64-unknown-linux-gnu;;
-    *)
-      # shellcheck disable=SC2016
-      err 'Could not determine target from output of `uname -m`-`uname -s`, please use `--target`:' "$uname_target"
-    ;;
-  esac
-fi
-
-case $target in
-  *) extension=zip; need unzip;;
+# Detect target triple
+case "$(uname -m)-$(uname -s)" in
+  aarch64-Linux)  target=aarch64-unknown-linux-gnu ;;
+  arm64-Darwin)   target=aarch64-apple-darwin ;;
+  x86_64-Darwin)  target=x86_64-apple-darwin ;;
+  x86_64-Linux)   target=x86_64-unknown-linux-gnu ;;
+  *) echo "Unsupported platform: $(uname -m)-$(uname -s)" >&2; exit 1 ;;
 esac
 
-archive="$releases/download/$tag/$bin-$tag-$target.$extension"
-say "Repository:  $url"
-say "Bin:         $bin"
-say "Tag:         $tag"
-say "Target:      $target"
-say "Destination: $dest"
-say "Archive:     $archive"
+archive="https://github.com/$REPO/releases/download/$tag/dora-$target.tar.gz"
+echo "Installing dora $tag ($target) to $DEST"
 
-td=$(mktemp -d || mktemp -d -t tmp)
+# Download, extract, install
+mkdir -p "$DEST"
+curl -fsSL "$archive" | tar -xz -C "$DEST" dora
+chmod 755 "$DEST/dora"
 
-if [ "$extension" = "zip" ]; then
-  download "$archive" "$td/$bin.zip"
-  unzip -d "$td" "$td/$bin.zip"
-else
-  download "$archive" - | tar -C "$td" -xz
-fi
+# Add to PATH if not already there
+add_to_rc() {
+  rc="$1"
+  if [ -f "$rc" ] && grep -q "$DEST" "$rc"; then
+    return
+  fi
+  echo "export PATH=\"\$PATH:$DEST\"" >> "$rc"
+  echo "Added $DEST to PATH in $rc (restart your shell or run: source $rc)"
+}
 
-echo "Placing dora-rs cli in $dest"
+case "${SHELL:-}" in
+  */bash) add_to_rc "$HOME/.bashrc" ;;
+  */zsh)  add_to_rc "$HOME/.zshrc" ;;
+  *)
+    echo "Add this to your shell profile:"
+    echo "  export PATH=\"\$PATH:$DEST\""
+    ;;
+esac
 
-if [ -e "$dest/$bin" ] && [ "$force" = false ]; then
-  echo " Replacing \`$dest/$bin\` with downloaded version"
-  cp "$td/$bin" "$dest/$bin"
-  chmod 755 "$dest/$bin"
-else
-  mkdir -p "$dest"
-  cp "$td/$bin" "$dest/$bin"
-  chmod 755 "$dest/$bin"
-  echo ""
-fi
-
-if [ "$SHELL" = "/bin/bash" ]; then
-    if ! grep -q "$dest" ~/.bashrc; then
-        echo "Adding $dest to PATH in ~/.bashrc"
-        echo "export PATH=\$PATH:$dest" >> ~/.bashrc
-        echo "Path added to ~/.bashrc."
-        echo "Please reload with:"
-        echo "  source ~/.bashrc"
-    else
-        echo "$dest is already in the PATH in ~/.bashrc"
-    fi
-elif [ "$SHELL" = "/bin/zsh" ]; then
-    if ! grep -q "$dest" ~/.zshrc; then
-        echo "Adding $dest to PATH in ~/.zshrc"
-        echo "export PATH=\$PATH:$dest" >> ~/.zshrc
-        echo "Path added to ~/.zshrc."
-        echo "Please reload with:"
-        echo "  source ~/.zshrc"
-    else
-        echo "$dest is already in the PATH in ~/.zshrc"
-    fi
-else
-    echo "Unsupported shell: $SHELL"
-    echo "Please add the following to your shell's configuration file manually:"
-    echo "    export PATH=\$PATH:$dest"
-fi
-
-
-rm -rf "$td"
+echo "Done! Run 'dora --version' to verify."

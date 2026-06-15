@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::common::resolve_dataflow_identifier_interactive;
-use communication_layer_request_reply::TcpRequestReplyConnection;
+use crate::ws_client::WsSession;
 use dora_core::{config::InputMapping, descriptor::Descriptor};
 use dora_message::{
     DataflowId,
@@ -24,12 +24,9 @@ pub struct DataflowSelector {
 }
 
 impl DataflowSelector {
-    pub fn resolve(
-        &self,
-        session: &mut TcpRequestReplyConnection,
-    ) -> eyre::Result<(Uuid, Descriptor)> {
+    pub fn resolve(&self, session: &WsSession) -> eyre::Result<(Uuid, Descriptor)> {
         let dataflow_id =
-            resolve_dataflow_identifier_interactive(&mut *session, self.dataflow.as_deref())?;
+            resolve_dataflow_identifier_interactive(session, self.dataflow.as_deref())?;
         let reply_raw = session
             .request(
                 &serde_json::to_vec(&ControlRequest::Info {
@@ -72,21 +69,9 @@ impl fmt::Display for TopicIdentifier {
 impl TopicSelector {
     pub fn resolve(
         &self,
-        session: &mut TcpRequestReplyConnection,
+        session: &WsSession,
     ) -> eyre::Result<(DataflowId, BTreeSet<TopicIdentifier>)> {
         let (dataflow_id, dataflow_descriptor) = self.dataflow.resolve(session)?;
-        if !dataflow_descriptor.debug.publish_all_messages_to_zenoh {
-            bail!(
-                "Dataflow `{dataflow_id}` does not have `publish_all_messages_to_zenoh` enabled. You should enable it in order to inspect data.\n\
-                \n\
-                Tip: Add the following snipppet to your dataflow descriptor:\n\
-                \n\
-                ```\n\
-                _unstable_debug:\n  publish_all_messages_to_zenoh: true\n\
-                ```
-                "
-            );
-        }
 
         let node_map = dataflow_descriptor
             .nodes
@@ -112,9 +97,18 @@ impl TopicSelector {
             }
             match s.parse() {
                 Ok(InputMapping::User(user)) => {
-                    let node = *node_map
-                        .get(&user.source)
-                        .with_context(|| format!("Unknown node: `{}`", user.source))?;
+                    let node = *node_map.get(&user.source).with_context(|| {
+                        format!(
+                            "unknown node `{}`\n\n  \
+                             hint: available nodes: {}",
+                            user.source,
+                            node_map
+                                .keys()
+                                .map(|k| k.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    })?;
                     if user.output.is_empty() {
                         data.extend(node.outputs.iter().map(|output| TopicIdentifier {
                             node_id: user.source.clone(),
@@ -127,9 +121,15 @@ impl TopicSelector {
                         });
                     } else {
                         bail!(
-                            "Node `{}` does not have output `{}`",
+                            "node `{}` does not have output `{}`\n\n  \
+                             hint: available outputs: {}",
                             user.source,
-                            user.output
+                            user.output,
+                            node.outputs
+                                .iter()
+                                .map(|o| o.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
                         );
                     }
                 }
@@ -138,6 +138,13 @@ impl TopicSelector {
                 }
                 Err(e) => bail!("Invalid output id `{s}`: {e}"),
             }
+        }
+
+        if data.is_empty() {
+            bail!(
+                "no outputs found in this dataflow\n\n  \
+                 hint: ensure nodes in the dataflow declare `outputs` in their YAML definition"
+            );
         }
 
         Ok((dataflow_id, data))

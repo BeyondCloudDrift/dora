@@ -1,5 +1,4 @@
 use colored::Colorize;
-use command::Executable;
 use std::{
     net::{IpAddr, Ipv4Addr},
     path::PathBuf,
@@ -11,18 +10,30 @@ mod formatting;
 pub mod output;
 pub mod session;
 mod template;
+mod ws_client;
+pub use ws_client::WsSession;
 
-pub use command::build;
-pub use command::{run, run_func};
+pub use command::{BuildConfig, build};
+pub use command::{Executable, Run as RunCommand, run};
 
+/// Default address for *connecting* to a coordinator (client side).
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
-const LISTEN_WILDCARD: IpAddr = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
+/// Default address for the coordinator to *listen* on (server side).
+const LISTEN_DEFAULT: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 
 #[derive(Debug, clap::Parser)]
-#[clap(version)]
+#[clap(version = get_version_info())]
 pub struct Args {
     #[clap(subcommand)]
     command: command::Command,
+}
+
+fn get_version_info() -> clap::builder::Str {
+    build_version_string().into()
+}
+
+fn build_version_string() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
 }
 
 #[derive(Debug, clap::Args)]
@@ -60,38 +71,4 @@ pub fn lib_main(args: Args) {
         eprintln!("{err:?}");
         std::process::exit(1);
     }
-}
-
-#[cfg(feature = "python")]
-use clap::Parser;
-#[cfg(feature = "python")]
-use pyo3::{
-    Bound, PyResult, Python, pyfunction, pymodule,
-    types::{PyModule, PyModuleMethods},
-    wrap_pyfunction,
-};
-
-#[cfg(feature = "python")]
-#[pyfunction]
-fn py_main(_py: Python) -> PyResult<()> {
-    pyo3::prepare_freethreaded_python();
-    // Skip first argument as it is a python call.
-    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
-
-    match Args::try_parse_from(args) {
-        Ok(args) => lib_main(args),
-        Err(err) => {
-            eprintln!("{err}");
-        }
-    }
-    Ok(())
-}
-
-/// A Python module implemented in Rust.
-#[cfg(feature = "python")]
-#[pymodule]
-fn dora_cli(_py: Python, m: Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(py_main, &m)?)?;
-    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
-    Ok(())
 }

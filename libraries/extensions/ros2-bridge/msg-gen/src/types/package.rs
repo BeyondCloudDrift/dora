@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, path::PathBuf};
+use std::path::PathBuf;
 
 use proc_macro2::Span;
 use quote::{ToTokens, format_ident, quote};
@@ -10,7 +10,7 @@ use crate::types::{Action, Message, Service};
 pub struct Package {
     pub name: String,
     pub path: PathBuf,
-    pub dependencies: Vec<Package>,
+    pub dependencies: Vec<Self>,
     pub messages: Vec<Message>,
     pub services: Vec<Service>,
     pub actions: Vec<Action>,
@@ -28,29 +28,8 @@ impl Package {
         }
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.messages.is_empty() && self.services.is_empty() && self.actions.is_empty()
-    }
-
-    pub fn message_structs(&self, gen_cxx_bridge: bool) -> (impl ToTokens, impl ToTokens) {
-        if self.messages.is_empty() {
-            // empty msg
-            (quote! {}, quote! {})
-        } else {
-            let items = self
-                .messages
-                .iter()
-                .map(|v| v.struct_token_stream(&self.name, gen_cxx_bridge));
-            let defs = items.clone().map(|(def, _)| def);
-            let impls = items.clone().map(|(_, im)| im);
-            let def_tokens = quote! {
-                #(#defs)*
-            };
-            let impl_tokens = quote! {
-                #(#impls)*
-            };
-            (def_tokens, impl_tokens)
-        }
     }
 
     fn message_aliases(&self, package_name: &Ident) -> impl ToTokens {

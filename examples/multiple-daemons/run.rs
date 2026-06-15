@@ -2,18 +2,16 @@ use dora_cli::session::DataflowSession;
 use dora_coordinator::{ControlEvent, Event};
 use dora_core::{
     descriptor::{DescriptorExt, read_as_descriptor},
-    topics::{DORA_COORDINATOR_PORT_CONTROL_DEFAULT, DORA_COORDINATOR_PORT_DEFAULT},
+    topics::DORA_COORDINATOR_PORT_WS_DEFAULT,
 };
 use dora_message::{
     cli_to_coordinator::ControlRequest,
-    common::DaemonId,
-    coordinator_to_cli::{ControlRequestReply, DataflowIdAndName},
+    coordinator_to_cli::{ControlRequestReply, DaemonInfo, DataflowIdAndName},
 };
 use dora_tracing::TracingBuilder;
 use eyre::{Context, bail};
 
 use std::{
-    collections::BTreeSet,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::Path,
     time::Duration,
@@ -44,30 +42,28 @@ async fn main() -> eyre::Result<()> {
     let (coordinator_events_tx, coordinator_events_rx) = mpsc::channel(1);
     let coordinator_bind = SocketAddr::new(
         IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
-        DORA_COORDINATOR_PORT_DEFAULT,
+        DORA_COORDINATOR_PORT_WS_DEFAULT,
     );
-    let coordinator_control_bind = SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
-        DORA_COORDINATOR_PORT_CONTROL_DEFAULT,
-    );
+    let store: std::sync::Arc<dyn dora_coordinator::CoordinatorStore> =
+        std::sync::Arc::new(dora_coordinator::InMemoryStore::new());
     let (coordinator_port, coordinator) = dora_coordinator::start(
         coordinator_bind,
-        coordinator_control_bind,
         ReceiverStream::new(coordinator_events_rx),
+        store,
+        None,
     )
     .await?;
 
     tracing::info!("coordinator running on {coordinator_port}");
 
     let coordinator_addr = Ipv4Addr::LOCALHOST;
-    let daemon_a = run_daemon(coordinator_addr.to_string(), "A");
-    let daemon_b = run_daemon(coordinator_addr.to_string(), "B");
+    // Distinct ports: two daemons on one host can't share a local listener.
+    let mut daemon_a = run_daemon(coordinator_addr.to_string(), "A", 9843)?;
+    let mut daemon_b = run_daemon(coordinator_addr.to_string(), "B", 9844)?;
 
     tracing::info!("Spawning coordinator and daemons");
     let mut tasks = JoinSet::new();
     tasks.spawn(coordinator);
-    tasks.spawn(daemon_b);
-    tasks.spawn(daemon_a);
 
     tracing::info!("waiting until daemons are connected to coordinator");
     let mut retries = 0;
@@ -75,10 +71,10 @@ async fn main() -> eyre::Result<()> {
         let connected_machines = connected_machines(&coordinator_events_tx).await?;
         if connected_machines
             .iter()
-            .any(|id| id.matches_machine_id("A"))
+            .any(|d| d.daemon_id.matches_machine_id("A"))
             && connected_machines
                 .iter()
-                .any(|id| id.matches_machine_id("B"))
+                .any(|d| d.daemon_id.matches_machine_id("B"))
         {
             break;
         } else if retries > 20 {
@@ -115,6 +111,16 @@ async fn main() -> eyre::Result<()> {
     tracing::info!("dataflow `{uuid}` finished, destroying coordinator");
     destroy(&coordinator_events_tx).await?;
 
+    // The daemons are intentionally NOT in the JoinSet above: a daemon does not
+    // promptly exit when its coordinator goes away (it retry-reconnects with
+    // backoff; see dora-rs/dora#1996), so awaiting them would hang. On a normal
+    // shutdown they exit on their own once the coordinator broadcasts Destroy.
+    // This kill is a best-effort net for the `cargo run` wrappers (it does not
+    // reap the daemon grandchild; that's covered by graceful exit / #1996).
+    tracing::info!("stopping daemons");
+    let _ = daemon_a.kill().await;
+    let _ = daemon_b.kill().await;
+
     tracing::info!("joining tasks");
     while let Some(res) = tasks.join_next().await {
         res.unwrap()?;
@@ -147,7 +153,7 @@ async fn start_dataflow(
     let (reply_sender, reply) = oneshot::channel();
     coordinator_events_tx
         .send(Event::Control(ControlEvent::IncomingRequest {
-            request: ControlRequest::Start {
+            request: Box::new(ControlRequest::Start {
                 build_id: dataflow_session.build_id,
                 session_id: dataflow_session.session_id,
                 dataflow: dataflow_descriptor,
@@ -155,7 +161,7 @@ async fn start_dataflow(
                 name: None,
                 uv: false,
                 write_events_to: None,
-            },
+            }),
             reply_sender,
         }))
         .await?;
@@ -169,7 +175,7 @@ async fn start_dataflow(
     let (reply_sender, reply) = oneshot::channel();
     coordinator_events_tx
         .send(Event::Control(ControlEvent::IncomingRequest {
-            request: ControlRequest::WaitForSpawn { dataflow_id: uuid },
+            request: Box::new(ControlRequest::WaitForSpawn { dataflow_id: uuid }),
             reply_sender,
         }))
         .await?;
@@ -184,11 +190,11 @@ async fn start_dataflow(
 
 async fn connected_machines(
     coordinator_events_tx: &Sender<Event>,
-) -> eyre::Result<BTreeSet<DaemonId>> {
+) -> eyre::Result<Vec<DaemonInfo>> {
     let (reply_sender, reply) = oneshot::channel();
     coordinator_events_tx
         .send(Event::Control(ControlEvent::IncomingRequest {
-            request: ControlRequest::ConnectedMachines,
+            request: Box::new(ControlRequest::ConnectedMachines),
             reply_sender,
         }))
         .await?;
@@ -207,7 +213,7 @@ async fn running_dataflows(
     let (reply_sender, reply) = oneshot::channel();
     coordinator_events_tx
         .send(Event::Control(ControlEvent::IncomingRequest {
-            request: ControlRequest::List,
+            request: Box::new(ControlRequest::List),
             reply_sender,
         }))
         .await?;
@@ -224,7 +230,7 @@ async fn destroy(coordinator_events_tx: &Sender<Event>) -> eyre::Result<()> {
     let (reply_sender, reply) = oneshot::channel();
     coordinator_events_tx
         .send(Event::Control(ControlEvent::IncomingRequest {
-            request: ControlRequest::Destroy,
+            request: Box::new(ControlRequest::Destroy),
             reply_sender,
         }))
         .await?;
@@ -249,7 +255,11 @@ async fn build_dataflow(dataflow: &Path) -> eyre::Result<()> {
     Ok(())
 }
 
-async fn run_daemon(coordinator: String, machine_id: &str) -> eyre::Result<()> {
+fn run_daemon(
+    coordinator: String,
+    machine_id: &str,
+    local_listen_port: u16,
+) -> eyre::Result<tokio::process::Child> {
     let cargo = std::env::var("CARGO").unwrap();
     let mut cmd = tokio::process::Command::new(&cargo);
     cmd.arg("run");
@@ -262,9 +272,8 @@ async fn run_daemon(coordinator: String, machine_id: &str) -> eyre::Result<()> {
         .arg("--coordinator-addr")
         .arg(coordinator)
         .arg("--local-listen-port")
-        .arg("9843"); // random port
-    if !cmd.status().await?.success() {
-        bail!("failed to run dataflow");
-    };
-    Ok(())
+        .arg(local_listen_port.to_string());
+    // Best-effort cleanup if we exit before the explicit kill below.
+    cmd.kill_on_drop(true);
+    cmd.spawn().wrap_err("failed to spawn daemon")
 }

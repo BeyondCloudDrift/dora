@@ -4,7 +4,7 @@ use std::{borrow::Cow, collections::BTreeMap};
 use aligned_vec::{AVec, ConstAlign};
 use chrono::{DateTime, Utc};
 use eyre::Context as _;
-use serde::{Deserialize, Deserializer};
+use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::{BuildId, DataflowId, daemon_to_daemon::InterDaemonEvent, id::NodeId};
@@ -50,29 +50,16 @@ impl From<LogMessageHelper> for LogMessage {
         LogMessage {
             build_id: helper.build_id.or(fields
                 .and_then(|f| f.get("build_id").cloned())
-                .map(|id| BuildId(Uuid::parse_str(&id).unwrap()))),
+                .and_then(|id| Uuid::parse_str(&id).ok().map(BuildId))),
             dataflow_id: helper.dataflow_id.or(fields
                 .and_then(|f| f.get("dataflow_id").cloned())
-                .map(|id| DataflowId::from(Uuid::parse_str(&id).unwrap()))),
-            node_id: helper.node_id.or(fields
-                .and_then(|f| f.get("node_id").cloned())
-                .map(|id| NodeId(id))),
-            daemon_id: helper
-                .daemon_id
-                .or(fields.and_then(|f| f.get("daemon_id").cloned()).map(|id| {
-                    let parts: Vec<&str> = id.splitn(2, '-').collect();
-                    if parts.len() == 2 {
-                        DaemonId {
-                            machine_id: Some(parts[0].to_string()),
-                            uuid: Uuid::parse_str(parts[1]).unwrap(),
-                        }
-                    } else {
-                        DaemonId {
-                            machine_id: None,
-                            uuid: Uuid::parse_str(&parts[0]).unwrap(),
-                        }
-                    }
-                })),
+                .and_then(|id| Uuid::parse_str(&id).ok())),
+            node_id: helper
+                .node_id
+                .or(fields.and_then(|f| f.get("node_id").cloned()).map(NodeId)),
+            daemon_id: helper.daemon_id.or(fields
+                .and_then(|f| f.get("daemon_id").cloned())
+                .and_then(|id| DaemonId::from_display_str(&id))),
             level: helper.level,
             target: helper
                 .target
@@ -101,6 +88,21 @@ pub enum LogLevelOrStdout {
     Stdout,
     #[serde(untagged)]
     LogLevel(LogLevel),
+}
+
+impl LogLevelOrStdout {
+    /// Returns true if a message at this level passes the given minimum level filter.
+    ///
+    /// Ordering: Stdout < Error < Warn < Info < Debug < Trace.
+    /// A message passes if its level is "at or above" (i.e. <=) the minimum.
+    pub fn passes(&self, min: &LogLevelOrStdout) -> bool {
+        match (self, min) {
+            (LogLevelOrStdout::Stdout, LogLevelOrStdout::Stdout) => true,
+            (LogLevelOrStdout::Stdout, _) => false,
+            (LogLevelOrStdout::LogLevel(_), LogLevelOrStdout::Stdout) => true,
+            (LogLevelOrStdout::LogLevel(msg), LogLevelOrStdout::LogLevel(max)) => msg <= max,
+        }
+    }
 }
 
 impl From<LogLevel> for LogLevelOrStdout {
@@ -236,8 +238,8 @@ impl<T> Timestamped<T>
 where
     T: serde::Serialize,
 {
-    pub fn serialize(&self) -> Vec<u8> {
-        bincode::serialize(self).unwrap()
+    pub fn serialize(&self) -> eyre::Result<Vec<u8>> {
+        bincode::serialize(self).wrap_err("failed to serialize timestamped message")
     }
 }
 
@@ -252,20 +254,6 @@ pub type SharedMemoryId = String;
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub enum DataMessage {
     Vec(AVec<u8, ConstAlign<128>>),
-    SharedMemory {
-        shared_memory_id: String,
-        len: usize,
-        drop_token: DropToken,
-    },
-}
-
-impl DataMessage {
-    pub fn drop_token(&self) -> Option<DropToken> {
-        match self {
-            DataMessage::Vec(_) => None,
-            DataMessage::SharedMemory { drop_token, .. } => Some(*drop_token),
-        }
-    }
 }
 
 impl fmt::Debug for DataMessage {
@@ -275,28 +263,7 @@ impl fmt::Debug for DataMessage {
                 .debug_struct("Vec")
                 .field("len", &v.len())
                 .finish_non_exhaustive(),
-            Self::SharedMemory {
-                shared_memory_id,
-                len,
-                drop_token,
-            } => f
-                .debug_struct("SharedMemory")
-                .field("shared_memory_id", shared_memory_id)
-                .field("len", len)
-                .field("drop_token", drop_token)
-                .finish(),
         }
-    }
-}
-
-#[derive(
-    Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
-)]
-pub struct DropToken(Uuid);
-
-impl DropToken {
-    pub fn generate() -> Self {
-        Self(Uuid::new_v7(uuid::Timestamp::now(uuid::NoContext)))
     }
 }
 
@@ -310,8 +277,24 @@ impl DaemonId {
     pub fn new(machine_id: Option<String>) -> Self {
         DaemonId {
             machine_id,
-            uuid: Uuid::new_v4(),
+            uuid: Uuid::now_v7(),
         }
+    }
+
+    /// Load a persisted daemon ID from `<working_dir>/.daemon-id`, or create and persist a new one.
+    pub fn load_or_create(
+        working_dir: &std::path::Path,
+        machine_id: Option<String>,
+    ) -> std::io::Result<Self> {
+        let path = working_dir.join(".daemon-id");
+        if let Ok(contents) = std::fs::read_to_string(&path)
+            && let Ok(uuid) = contents.trim().parse::<Uuid>()
+        {
+            return Ok(DaemonId { machine_id, uuid });
+        }
+        let id = Self::new(machine_id);
+        std::fs::write(&path, id.uuid.to_string())?;
+        Ok(id)
     }
 
     pub fn matches_machine_id(&self, machine_id: &str) -> bool {
@@ -323,6 +306,38 @@ impl DaemonId {
 
     pub fn machine_id(&self) -> Option<&str> {
         self.machine_id.as_deref()
+    }
+
+    /// Reverse of [`Display`](std::fmt::Display): parse `"{machine_id}-{uuid}"`, or a bare
+    /// `"{uuid}"` when there is no machine id.
+    ///
+    /// Both the machine id (hostnames) and the canonical UUID contain `-`, so
+    /// splitting on a hyphen drops or corrupts a hyphenated machine id. Split
+    /// off the fixed-width 36-char canonical UUID suffix instead
+    /// (dora-rs/dora#2027).
+    ///
+    /// Expects exact `Display` output (no surrounding whitespace). The
+    /// machine-id path requires the canonical 36-char UUID suffix that
+    /// `Display` emits; the bare path accepts any form `Uuid::parse_str`
+    /// recognizes (canonical / simple / urn / braced).
+    pub fn from_display_str(s: &str) -> Option<Self> {
+        // No machine id: the whole string is the UUID.
+        if let Ok(uuid) = Uuid::parse_str(s) {
+            return Some(DaemonId {
+                machine_id: None,
+                uuid,
+            });
+        }
+        // `Display` writes the UUID via `{}` (canonical 36-char hyphenated
+        // form), preceded by `"{machine_id}-"`.
+        const UUID_LEN: usize = 36;
+        let split = s.len().checked_sub(UUID_LEN)?;
+        let uuid = Uuid::parse_str(s.get(split..)?).ok()?;
+        let machine_id = s.get(..split)?.strip_suffix('-')?;
+        Some(DaemonId {
+            machine_id: Some(machine_id.to_string()),
+            uuid,
+        })
     }
 }
 
@@ -339,6 +354,33 @@ impl std::fmt::Display for DaemonId {
 pub struct GitSource {
     pub repo: String,
     pub commit_hash: String,
+    /// Subdirectory of the repository the node lives in (monorepo support).
+    /// Build, env preparation, and spawn are rooted at `<clone>/<subdir>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subdir: Option<String>,
+    /// Hub provenance marker. Set when this git source was desugared from a
+    /// `hub:` reference — it tells the daemon to use confined path
+    /// resolution (no ambient `$PATH` fallback) for the node, and feeds the
+    /// lockfile and `dora hub` commands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hub: Option<HubProvenance>,
+}
+
+/// Identity of the hub package a git source was resolved from.
+#[derive(Debug, serde::Deserialize, serde::Serialize, Clone, PartialEq, Eq)]
+pub struct HubProvenance {
+    /// Index key (`namespace/name`).
+    pub name: String,
+    /// Resolved version.
+    pub version: String,
+    /// Digest of the index entry's manifest at lock time. The commit hash pins
+    /// the *source tree*, but the entrypoint, build command, and typed contract
+    /// (inputs/outputs/types) all live in the (mutable) index entry — so a
+    /// rewritten entry could change any of them for an already-pinned version.
+    /// `--locked` hard-errors if this digest no longer matches. `Option` for
+    /// back-compat with lockfiles written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_digest: Option<String>,
 }
 
 // Test roundtrip serialization of LogMessage
@@ -364,5 +406,127 @@ mod tests {
         let serialized = serde_yaml::to_string(&log_message).unwrap();
         let deserialized: LogMessageHelper = serde_yaml::from_str(&serialized).unwrap();
         assert_eq!(log_message, LogMessage::from(deserialized));
+    }
+
+    #[test]
+    fn stdout_passes_stdout_filter() {
+        let stdout = LogLevelOrStdout::Stdout;
+        assert!(stdout.passes(&LogLevelOrStdout::Stdout));
+    }
+
+    /// #2027: `DaemonId` must survive a `Display` -> `from_display_str` round
+    /// trip even when the machine id contains `-` (hostnames do). The old
+    /// `splitn(2, '-')` parse split on the first hyphen, which corrupted the
+    /// UUID (itself hyphenated) and silently dropped the daemon id.
+    #[test]
+    fn daemon_id_display_roundtrips_through_parse() {
+        let uuid = Uuid::new_v4();
+        for machine in [None, Some("host"), Some("my-host"), Some("a-b-c-d")] {
+            let id = DaemonId {
+                machine_id: machine.map(str::to_string),
+                uuid,
+            };
+            let parsed = DaemonId::from_display_str(&id.to_string())
+                .unwrap_or_else(|| panic!("failed to parse {id}"));
+            assert_eq!(parsed, id, "round-trip failed for machine_id={machine:?}");
+        }
+    }
+
+    /// A bare (machine-id-less) daemon id round-trips, and garbage does not
+    /// parse to a bogus id.
+    #[test]
+    fn daemon_id_parse_edge_cases() {
+        let uuid = Uuid::new_v4();
+        let bare = DaemonId {
+            machine_id: None,
+            uuid,
+        };
+        assert_eq!(DaemonId::from_display_str(&bare.to_string()), Some(bare));
+        assert_eq!(DaemonId::from_display_str("not-a-daemon-id"), None);
+        assert_eq!(DaemonId::from_display_str(""), None);
+    }
+
+    #[test]
+    fn stdout_fails_non_stdout_filters() {
+        let stdout = LogLevelOrStdout::Stdout;
+        assert!(!stdout.passes(&LogLevelOrStdout::LogLevel(LogLevel::Info)));
+        assert!(!stdout.passes(&LogLevelOrStdout::LogLevel(LogLevel::Warn)));
+        assert!(!stdout.passes(&LogLevelOrStdout::LogLevel(LogLevel::Error)));
+    }
+
+    #[test]
+    fn any_log_level_passes_stdout_filter() {
+        let stdout_filter = LogLevelOrStdout::Stdout;
+        for level in [
+            LogLevel::Error,
+            LogLevel::Warn,
+            LogLevel::Info,
+            LogLevel::Debug,
+            LogLevel::Trace,
+        ] {
+            assert!(
+                LogLevelOrStdout::LogLevel(level).passes(&stdout_filter),
+                "{level:?} should pass stdout filter"
+            );
+        }
+    }
+
+    #[test]
+    fn error_passes_less_verbose_filters() {
+        let error = LogLevelOrStdout::LogLevel(LogLevel::Error);
+        assert!(error.passes(&LogLevelOrStdout::LogLevel(LogLevel::Error)));
+        assert!(error.passes(&LogLevelOrStdout::LogLevel(LogLevel::Warn)));
+        assert!(error.passes(&LogLevelOrStdout::LogLevel(LogLevel::Info)));
+    }
+
+    #[test]
+    fn debug_fails_info_filter() {
+        let debug = LogLevelOrStdout::LogLevel(LogLevel::Debug);
+        assert!(!debug.passes(&LogLevelOrStdout::LogLevel(LogLevel::Info)));
+    }
+
+    #[test]
+    fn same_level_passes_itself() {
+        for level in [
+            LogLevel::Error,
+            LogLevel::Warn,
+            LogLevel::Info,
+            LogLevel::Debug,
+            LogLevel::Trace,
+        ] {
+            let l = LogLevelOrStdout::LogLevel(level);
+            assert!(l.passes(&l), "{level:?} should pass itself");
+        }
+    }
+
+    #[test]
+    fn trace_passes_trace_fails_debug() {
+        let trace = LogLevelOrStdout::LogLevel(LogLevel::Trace);
+        assert!(trace.passes(&LogLevelOrStdout::LogLevel(LogLevel::Trace)));
+        assert!(!trace.passes(&LogLevelOrStdout::LogLevel(LogLevel::Debug)));
+    }
+
+    #[test]
+    fn daemon_id_uses_v7_uuid() {
+        let id = DaemonId::new(None);
+        // v7 UUIDs have version nibble = 7
+        assert_eq!(id.uuid.get_version_num(), 7);
+    }
+
+    #[test]
+    fn daemon_id_load_or_create_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let id1 = DaemonId::load_or_create(dir.path(), Some("m1".into())).unwrap();
+        let id2 = DaemonId::load_or_create(dir.path(), Some("m1".into())).unwrap();
+        assert_eq!(id1.uuid, id2.uuid);
+    }
+
+    #[test]
+    fn daemon_id_load_or_create_different_dirs() {
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        let id1 = DaemonId::load_or_create(dir1.path(), None).unwrap();
+        let id2 = DaemonId::load_or_create(dir2.path(), None).unwrap();
+        assert_ne!(id1.uuid, id2.uuid);
     }
 }

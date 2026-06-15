@@ -4,6 +4,7 @@ use std::{
 };
 
 use arrow::pyarrow::ToPyArrow;
+use chrono::{DateTime, Utc};
 use dora_node_api::{
     DoraNode, Event, EventStream, Metadata, MetadataParameters, Parameter, StopCause,
     merged::{MergeExternalSend, MergedEvent},
@@ -13,23 +14,40 @@ use futures::{Stream, StreamExt};
 use futures_concurrency::stream::Merge as _;
 use pyo3::{
     prelude::*,
-    types::{IntoPyDict, PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple},
+    sync::PyOnceLock,
+    types::{IntoPyDict, PyBool, PyDict, PyFloat, PyInt, PyList, PyModule, PyString, PyTuple},
 };
+use std::time::UNIX_EPOCH;
+
+/// Cached Python `datetime` module to avoid repeated `PyModule::import` on the hot path.
+static DATETIME_MODULE: PyOnceLock<Py<PyModule>> = PyOnceLock::new();
+
+pub fn datetime_module<'py>(py: Python<'py>) -> PyResult<&'py Bound<'py, PyModule>> {
+    Ok(DATETIME_MODULE
+        .get_or_try_init(py, || PyModule::import(py, "datetime").map(|m| m.unbind()))?
+        .bind(py))
+}
 
 /// Dora Event
 pub struct PyEvent {
-    pub event: MergedEvent<PyObject>,
+    pub event: MergedEvent<Py<PyAny>>,
 }
 
 /// Keeps the dora node alive until all event objects have been dropped.
 #[derive(Clone)]
-#[pyclass]
+#[pyclass(skip_from_py_object)]
 pub struct NodeCleanupHandle {
     pub _handles: Arc<CleanupHandle<DoraNode>>,
 }
 
 /// Owned type with delayed cleanup (using `handle` method).
 pub struct DelayedCleanup<T>(Arc<Mutex<T>>);
+
+impl<T> Clone for DelayedCleanup<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
 
 impl<T> DelayedCleanup<T> {
     pub fn new(value: T) -> Self {
@@ -40,7 +58,7 @@ impl<T> DelayedCleanup<T> {
         CleanupHandle(self.0.clone())
     }
 
-    pub fn get_mut(&self) -> std::sync::MutexGuard<T> {
+    pub fn get_mut(&self) -> std::sync::MutexGuard<'_, T> {
         self.0.try_lock().expect("failed to lock DelayedCleanup")
     }
 }
@@ -144,20 +162,34 @@ impl PyEvent {
             .unbind())
     }
 
-    fn ty(event: &Event) -> &str {
+    fn ty(event: &Event) -> &'static str {
         match event {
             Event::Stop(_) => "STOP",
             Event::Input { .. } => "INPUT",
             Event::InputClosed { .. } => "INPUT_CLOSED",
+            Event::InputRecovered { .. } => "INPUT_RECOVERED",
+            Event::NodeRestarted { .. } => "NODE_RESTARTED",
+            Event::Reload { .. } => "RELOAD",
+            Event::ParamUpdate { .. } => "PARAM_UPDATE",
+            Event::ParamDeleted { .. } => "PARAM_DELETED",
+            Event::NodeFailed { .. } => "NODE_FAILED",
             Event::Error(_) => "ERROR",
+            // `Event` is `#[non_exhaustive]`; surface genuinely new variants
+            // as UNKNOWN rather than failing to build on future dora upgrades.
             _other => "UNKNOWN",
         }
     }
 
     fn id(event: &Event) -> Option<&str> {
         match event {
-            Event::Input { id, .. } => Some(id),
-            Event::InputClosed { id } => Some(id),
+            Event::Input { id, .. } => Some(id.as_ref()),
+            Event::InputClosed { id } => Some(id.as_ref()),
+            Event::InputRecovered { id } => Some(id.as_ref()),
+            Event::NodeRestarted { id } => Some(id.as_ref()),
+            Event::Reload { operator_id } => operator_id.as_ref().map(|id| id.as_ref()),
+            Event::ParamUpdate { key, .. } => Some(key.as_str()),
+            Event::ParamDeleted { key } => Some(key.as_str()),
+            Event::NodeFailed { source_node_id, .. } => Some(source_node_id.as_ref()),
             Event::Stop(cause) => match cause {
                 StopCause::Manual => Some("MANUAL"),
                 StopCause::AllInputsClosed => Some("ALL_INPUTS_CLOSED"),
@@ -167,19 +199,45 @@ impl PyEvent {
         }
     }
 
-    /// Returns the payload of an input event as an arrow array (if any).
-    fn value(&self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+    /// Returns the payload of an event as a Python object (if any).
+    ///
+    /// - `Input`: the Arrow array payload.
+    /// - `ParamUpdate`: the new parameter value, converted from JSON.
+    fn value(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         match &self.event {
             MergedEvent::Dora(Event::Input { data, .. }) => {
-                // TODO: Does this call leak data?&
-                let array_data = data.to_data().to_pyarrow(py)?;
+                // Ownership transfer: to_data() clones buffer Arcs, to_pyarrow()
+                // creates an FFI_ArrowArray with a release callback. PyArrow's
+                // _import_from_c takes ownership and calls release when the Python
+                // object is GC'd, which drops the cloned Arcs. No leak.
+                let array_data = data.to_data().to_pyarrow(py)?.unbind();
                 Ok(Some(array_data))
+            }
+            MergedEvent::Dora(Event::ParamUpdate { value, .. }) => {
+                // `pythonize` converts serde_json::Value recursively into native
+                // Python types (None, bool, int, float, str, list, dict).
+                let obj = pythonize::pythonize(py, value)
+                    .context("failed to convert ParamUpdate value to Python")?
+                    .unbind();
+                Ok(Some(obj))
+            }
+            MergedEvent::Dora(Event::NodeFailed {
+                affected_input_ids,
+                error,
+                source_node_id,
+            }) => {
+                let dict = pyo3::types::PyDict::new(py);
+                dict.set_item("source_node_id", source_node_id.as_ref())?;
+                dict.set_item("error", error.as_str())?;
+                let ids: Vec<&str> = affected_input_ids.iter().map(|id| id.as_ref()).collect();
+                dict.set_item("affected_input_ids", ids)?;
+                Ok(Some(dict.unbind().into()))
             }
             _ => Ok(None),
         }
     }
 
-    fn metadata(event: &Event, py: Python<'_>) -> Result<Option<PyObject>> {
+    fn metadata(event: &Event, py: Python<'_>) -> Result<Option<Py<PyAny>>> {
         match event {
             Event::Input { metadata, .. } => Ok(Some(
                 metadata_to_pydict(metadata, py)
@@ -215,6 +273,13 @@ pub fn pydict_to_metadata(dict: Option<Bound<'_, PyDict>>) -> Result<MetadataPar
             } else if value.is_instance_of::<PyString>() {
                 parameters.insert(key, Parameter::String(value.extract()?))
             } else if (value.is_instance_of::<PyTuple>() || value.is_instance_of::<PyList>())
+                && value.len()? == 0
+            {
+                // Empty list/tuple: no element type to infer. Preserve
+                // list-ness with an empty list (round-trips to `[]`) instead of
+                // coercing to the string "[]" (dora-rs/dora#2027).
+                parameters.insert(key, Parameter::ListString(vec![]))
+            } else if (value.is_instance_of::<PyTuple>() || value.is_instance_of::<PyList>())
                 && value.len()? > 0
                 && value.get_item(0)?.is_exact_instance_of::<PyInt>()
             {
@@ -233,8 +298,41 @@ pub fn pydict_to_metadata(dict: Option<Bound<'_, PyDict>>) -> Result<MetadataPar
                 let list: Vec<String> = value.extract()?;
                 parameters.insert(key, Parameter::ListString(list))
             } else {
-                println!("could not convert type {value}");
-                parameters.insert(key, Parameter::String(value.str()?.to_string()))
+                // Check if it's a datetime.datetime object
+                let dt_module =
+                    datetime_module(value.py()).context("Failed to import datetime module")?;
+                let datetime_class = dt_module.getattr("datetime")?;
+
+                if value.is_instance(datetime_class.as_ref())? {
+                    // Extract timestamp using timestamp() method
+                    let timestamp_float: f64 = value
+                        .call_method0("timestamp")?
+                        .extract()
+                        .context("Failed to extract timestamp from datetime")?;
+
+                    // Convert to chrono::DateTime<Utc>
+                    // timestamp() returns seconds since epoch as float
+                    // Convert to SystemTime first, then to DateTime<Utc>
+                    let system_time = if timestamp_float >= 0.0 {
+                        let duration = std::time::Duration::try_from_secs_f64(timestamp_float)
+                            .context("Failed to convert timestamp to Duration")?;
+                        UNIX_EPOCH + duration
+                    } else {
+                        let duration = std::time::Duration::try_from_secs_f64(-timestamp_float)
+                            .context("Failed to convert timestamp to Duration")?;
+                        UNIX_EPOCH.checked_sub(duration).unwrap_or(UNIX_EPOCH)
+                    };
+
+                    let dt = DateTime::<Utc>::from(system_time);
+
+                    parameters.insert(key, Parameter::Timestamp(dt))
+                } else {
+                    tracing::warn!(
+                        "unsupported metadata value type for key `{key}`; \
+                         coercing to its string representation: {value}"
+                    );
+                    parameters.insert(key, Parameter::String(value.str()?.to_string()))
+                }
             };
         }
     }
@@ -246,6 +344,41 @@ pub fn metadata_to_pydict<'a>(
     py: Python<'a>,
 ) -> Result<pyo3::Bound<'a, PyDict>> {
     let dict = PyDict::new(py);
+
+    // Add timestamp as timezone-aware Python datetime (UTC)
+    // Note: uhlc::Timestamp is a Hybrid Logical Clock. We use get_time().to_system_time()
+    // which extracts the physical clock component. This pattern is used consistently
+    // throughout the dora codebase (e.g., in binaries/daemon/src/log.rs, binaries/coordinator/src/lib.rs)
+    // and assumes the physical time component represents UTC wall-clock time.
+    let timestamp = metadata.timestamp();
+    let system_time = timestamp.get_time().to_system_time();
+    let duration_since_epoch = system_time
+        .duration_since(UNIX_EPOCH)
+        .context("Failed to calculate duration since epoch")?;
+
+    // Extract seconds and microseconds (Python datetime supports microsecond precision)
+    let seconds = duration_since_epoch.as_secs() as i64;
+    let microseconds = duration_since_epoch.subsec_micros();
+
+    // Get UTC timezone from Python's datetime module and create timezone-aware datetime
+    // We use Python's datetime.fromtimestamp() to create a UTC-aware datetime object
+    // This avoids float precision loss by using integer seconds and microseconds
+    let dt_module = datetime_module(py).context("Failed to import datetime module")?;
+    let datetime_class = dt_module.getattr("datetime")?;
+    let utc_timezone = dt_module.getattr("timezone")?.getattr("utc")?;
+
+    // Create timezone-aware datetime using fromtimestamp
+    // We compute total_seconds as float (required by fromtimestamp) but preserve
+    // precision by computing from integer seconds and microseconds separately
+    let total_seconds = seconds as f64 + microseconds as f64 / 1_000_000.0;
+    let py_datetime = datetime_class
+        .call_method1("fromtimestamp", (total_seconds, utc_timezone))
+        .context("Failed to create Python datetime from timestamp")?;
+
+    dict.set_item("timestamp", py_datetime)
+        .context("Could not insert timestamp into python dictionary")?;
+
+    // Add existing parameters
     for (k, v) in metadata.parameters.iter() {
         match v {
             Parameter::Bool(bool) => dict
@@ -269,6 +402,25 @@ pub fn metadata_to_pydict<'a>(
             Parameter::ListString(l) => dict
                 .set_item(k, l)
                 .context("Could not insert metadata into python dictionary")?,
+            Parameter::Timestamp(dt) => {
+                // Convert chrono::DateTime<Utc> to Python datetime.datetime
+                let timestamp = dt.timestamp();
+                let microseconds = dt.timestamp_subsec_micros();
+
+                // Get UTC timezone from Python's datetime module
+                let dt_module = datetime_module(py).context("Failed to import datetime module")?;
+                let datetime_class = dt_module.getattr("datetime")?;
+                let utc_timezone = dt_module.getattr("timezone")?.getattr("utc")?;
+
+                // Create timezone-aware datetime using fromtimestamp
+                let total_seconds = timestamp as f64 + microseconds as f64 / 1_000_000.0;
+                let py_datetime = datetime_class
+                    .call_method1("fromtimestamp", (total_seconds, utc_timezone))
+                    .context("Failed to create Python datetime from timestamp")?;
+
+                dict.set_item(k, py_datetime)
+                    .context("Could not insert timestamp into python dictionary")?
+            }
         }
     }
 
@@ -369,5 +521,69 @@ mod tests {
         assert_roundtrip(&list_array).context("ListArray roundtrip failed")?;
 
         Ok(())
+    }
+
+    // Regression tests for dora-rs/adora#147: Python event conversion used
+    // to return "UNKNOWN" with no id for five event types, making fault
+    // tolerance and runtime parameters unusable from Python.
+    mod py_event_types {
+        use super::super::PyEvent;
+        use dora_node_api::{
+            Event,
+            dora_core::config::{DataId, NodeId, OperatorId},
+        };
+
+        #[test]
+        fn node_restarted_has_type_and_id() {
+            let event = Event::NodeRestarted {
+                id: NodeId::from("upstream".to_string()),
+            };
+            assert_eq!(PyEvent::ty(&event), "NODE_RESTARTED");
+            assert_eq!(PyEvent::id(&event), Some("upstream"));
+        }
+
+        #[test]
+        fn input_recovered_has_type_and_id() {
+            let event = Event::InputRecovered {
+                id: DataId::from("sensor".to_string()),
+            };
+            assert_eq!(PyEvent::ty(&event), "INPUT_RECOVERED");
+            assert_eq!(PyEvent::id(&event), Some("sensor"));
+        }
+
+        #[test]
+        fn reload_has_type_and_operator_id() {
+            let event = Event::Reload {
+                operator_id: Some(OperatorId::from("op-1".to_string())),
+            };
+            assert_eq!(PyEvent::ty(&event), "RELOAD");
+            assert_eq!(PyEvent::id(&event), Some("op-1"));
+        }
+
+        #[test]
+        fn reload_without_operator_has_no_id() {
+            let event = Event::Reload { operator_id: None };
+            assert_eq!(PyEvent::ty(&event), "RELOAD");
+            assert_eq!(PyEvent::id(&event), None);
+        }
+
+        #[test]
+        fn param_update_has_type_and_key() {
+            let event = Event::ParamUpdate {
+                key: "threshold".to_string(),
+                value: serde_json::json!(0.85),
+            };
+            assert_eq!(PyEvent::ty(&event), "PARAM_UPDATE");
+            assert_eq!(PyEvent::id(&event), Some("threshold"));
+        }
+
+        #[test]
+        fn param_deleted_has_type_and_key() {
+            let event = Event::ParamDeleted {
+                key: "threshold".to_string(),
+            };
+            assert_eq!(PyEvent::ty(&event), "PARAM_DELETED");
+            assert_eq!(PyEvent::id(&event), Some("threshold"));
+        }
     }
 }

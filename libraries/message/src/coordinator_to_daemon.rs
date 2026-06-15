@@ -8,8 +8,33 @@ use crate::{
     BuildId, DataflowId, SessionId,
     common::{DaemonId, GitSource},
     descriptor::{Descriptor, ResolvedNode},
-    id::{NodeId, OperatorId},
+    id::{DataId, NodeId, OperatorId},
 };
+
+// ---------------------------------------------------------------------------
+// State catch-up types (incremental replay for reconnecting daemons)
+// ---------------------------------------------------------------------------
+
+/// A single state mutation that a reconnecting daemon may have missed.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StateCatchUpEntry {
+    pub sequence: u64,
+    pub operation: StateCatchUpOperation,
+}
+
+/// The kind of state mutation recorded in the replication log.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum StateCatchUpOperation {
+    SetParam {
+        node_id: NodeId,
+        key: String,
+        value: serde_json::Value,
+    },
+    DeleteParam {
+        node_id: NodeId,
+        key: String,
+    },
+}
 
 pub use crate::common::Timestamped;
 
@@ -31,6 +56,7 @@ impl RegisterResult {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub enum DaemonCoordinatorEvent {
     Build(BuildDataflowNodes),
@@ -55,8 +81,81 @@ pub enum DaemonCoordinatorEvent {
         node_id: NodeId,
         tail: Option<usize>,
     },
+    RestartNode {
+        dataflow_id: DataflowId,
+        node_id: NodeId,
+        grace_duration: Option<Duration>,
+    },
+    StopNode {
+        dataflow_id: DataflowId,
+        node_id: NodeId,
+        grace_duration: Option<Duration>,
+    },
+    SetParam {
+        dataflow_id: DataflowId,
+        node_id: NodeId,
+        key: String,
+        value: serde_json::Value,
+    },
+    DeleteParam {
+        dataflow_id: DataflowId,
+        node_id: NodeId,
+        key: String,
+    },
     Destroy,
     Heartbeat,
+    PeerDaemonDisconnected {
+        daemon_id: DaemonId,
+    },
+    // --- Dynamic Topology ---
+    /// Add a node to a running dataflow on this daemon.
+    AddNode {
+        dataflow_id: DataflowId,
+        node: crate::descriptor::ResolvedNode,
+        uv: bool,
+    },
+    /// Remove a node from a running dataflow on this daemon.
+    RemoveNode {
+        dataflow_id: DataflowId,
+        node_id: NodeId,
+        grace_duration: Option<Duration>,
+    },
+    /// Add a mapping (connection) in a running dataflow.
+    AddMapping {
+        dataflow_id: DataflowId,
+        source_node: NodeId,
+        source_output: DataId,
+        target_node: NodeId,
+        target_input: DataId,
+    },
+    /// Remove a mapping (connection) in a running dataflow.
+    RemoveMapping {
+        dataflow_id: DataflowId,
+        source_node: NodeId,
+        source_output: DataId,
+        target_node: NodeId,
+        target_input: DataId,
+    },
+    /// Start forwarding matching output frames back to the coordinator over
+    /// the daemon control channel for CLI topic inspection.
+    StartTopicDebugStream {
+        dataflow_id: DataflowId,
+        outputs: Vec<(NodeId, DataId)>,
+        subscription_id: uuid::Uuid,
+    },
+    /// Stop forwarding output frames for a previously registered CLI topic
+    /// inspection subscription.
+    StopTopicDebugStream {
+        dataflow_id: DataflowId,
+        subscription_id: uuid::Uuid,
+    },
+    /// Incremental state catch-up: replays missed state mutations to a
+    /// reconnecting daemon.
+    StateCatchUp {
+        dataflow_id: DataflowId,
+        /// The entries the daemon missed, ordered by sequence number.
+        entries: Vec<StateCatchUpEntry>,
+    },
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
@@ -96,4 +195,8 @@ pub struct SpawnDataflowNodes {
     pub spawn_nodes: BTreeSet<NodeId>,
     pub uv: bool,
     pub write_events_to: Option<PathBuf>,
+    /// Base URL for downloading artifacts from the coordinator (HTTP distribution mode).
+    /// When set, daemons can pull binaries from `{artifact_base_url}/{build_id}/{node_id}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_base_url: Option<String>,
 }

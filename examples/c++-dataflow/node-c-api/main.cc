@@ -10,13 +10,15 @@ int run(void *dora_context)
 {
     unsigned char counter = 0;
 
-    for (int i = 0; i < 20; i++)
+    while (true)
     {
         void *event = dora_next_event(dora_context);
         if (event == NULL)
         {
-            printf("[c node] ERROR: unexpected end of event\n");
-            return -1;
+            // Stream exhausted (all inputs closed) -- the normal end of the
+            // dataflow, not an error. Don't assume a fixed input count: pub/sub
+            // discovery can drop early messages before subscriptions match.
+            break;
         }
 
         enum DoraEventType ty = read_dora_event_type(event);
@@ -76,6 +78,11 @@ int main()
     std::cout << "HELLO FROM C++ (using C API)" << std::endl;
 
     auto dora_context = init_dora_context_from_env();
+    if (dora_context == NULL)
+    {
+        std::cerr << "failed to init dora context" << std::endl;
+        return 1;
+    }
     auto ret = run(dora_context);
     free_dora_context(dora_context);
 

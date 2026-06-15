@@ -1,5 +1,7 @@
 use std::{net::SocketAddr, path::PathBuf};
 
+use std::sync::Arc;
+
 use crate::{
     DataflowId,
     config::NodeRunConfig,
@@ -8,7 +10,7 @@ use crate::{
     metadata::Metadata,
 };
 
-pub use crate::common::{DataMessage, DropToken, SharedMemoryId, Timestamped};
+pub use crate::common::{DataMessage, SharedMemoryId, Timestamped};
 
 // Passed via env variable
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -26,23 +28,14 @@ pub struct NodeConfig {
     pub dataflow_descriptor: serde_yaml::Value,
     pub dynamic: bool,
     pub write_events_to: Option<PathBuf>,
+    /// Number of times this node has been restarted. 0 on first run.
+    #[serde(default)]
+    pub restart_count: u32,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum DaemonCommunication {
-    Shmem {
-        daemon_control_region_id: SharedMemoryId,
-        daemon_drop_region_id: SharedMemoryId,
-        daemon_events_region_id: SharedMemoryId,
-        daemon_events_close_region_id: SharedMemoryId,
-    },
-    Tcp {
-        socket_addr: SocketAddr,
-    },
-    #[cfg(unix)]
-    UnixDomain {
-        socket_file: PathBuf,
-    },
+    Tcp { socket_addr: SocketAddr },
     Interactive,
 }
 
@@ -51,14 +44,13 @@ pub enum DaemonCommunication {
 #[allow(clippy::large_enum_variant)]
 pub enum DaemonReply {
     Result(Result<(), String>),
-    PreparedMessage { shared_memory_id: SharedMemoryId },
     NextEvents(Vec<Timestamped<NodeEvent>>),
-    NextDropEvents(Vec<Timestamped<NodeDropEvent>>),
     NodeConfig { result: Result<NodeConfig, String> },
     Empty,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 #[allow(clippy::large_enum_variant)]
 pub enum NodeEvent {
     Stop,
@@ -67,16 +59,52 @@ pub enum NodeEvent {
     },
     Input {
         id: DataId,
-        metadata: Metadata,
-        data: Option<DataMessage>,
+        metadata: Arc<Metadata>,
+        data: Option<Arc<DataMessage>>,
     },
     InputClosed {
         id: DataId,
     },
+    /// Notifies a node that a previously closed input has recovered and will receive data again.
+    InputRecovered {
+        id: DataId,
+    },
+    /// Notifies a node that an upstream node has restarted.
+    ///
+    /// Sent to downstream nodes when a node with a restart policy successfully
+    /// restarts after a failure.
+    NodeRestarted {
+        id: NodeId,
+    },
+    /// Notifies a node that all its inputs have been closed.
+    ///
+    /// This event is only sent to nodes that have at least one input.
     AllInputsClosed,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub enum NodeDropEvent {
-    OutputDropped { drop_token: DropToken },
+    /// A runtime parameter has been updated.
+    ///
+    /// Sent when `dora param set` changes a parameter for this node.
+    ///
+    /// `value_json` carries JSON-encoded bytes rather than `serde_json::Value`:
+    /// this message is serialized with bincode on the daemon↔node TCP channel,
+    /// and `serde_json::Value::deserialize` uses `deserialize_any`, which
+    /// bincode does not support.
+    ParamUpdate {
+        key: String,
+        value_json: Vec<u8>,
+    },
+    /// A runtime parameter has been deleted.
+    ///
+    /// Sent when `dora param delete` removes a parameter for this node.
+    ParamDeleted {
+        key: String,
+    },
+    /// An upstream node has failed.
+    ///
+    /// Sent to downstream nodes when an upstream node exits with a
+    /// non-zero exit code.
+    NodeFailed {
+        affected_input_ids: Vec<DataId>,
+        error: String,
+        source_node_id: NodeId,
+    },
 }

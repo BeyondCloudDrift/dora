@@ -2,14 +2,15 @@ use crate::{
     CoreNodeKindExt, Event,
     log::NodeLogger,
     node_communication::spawn_listener_loop,
-    node_inputs,
     spawn::{command::path_spawn_command, prepared::PreparedNode},
 };
 use clonable_command::{Command, Stdio};
 use crossbeam::queue::ArrayQueue;
 use dora_core::{
+    build::{managed_python_bin_dir, managed_python_interpreter},
     descriptor::{Descriptor, OperatorDefinition, OperatorSource, PythonSource, ResolvedNode},
     get_python_path,
+    topics::DORA_ZENOH_CONNECT_ENV,
     uhlc::HLC,
 };
 use dora_message::{
@@ -17,10 +18,87 @@ use dora_message::{
     common::LogLevel,
     daemon_to_coordinator::Timestamped,
     daemon_to_node::{NodeConfig, RuntimeConfig},
+    descriptor::EnvValue,
 };
 use eyre::{ContextCompat, WrapErr, bail};
-use std::{future::Future, path::PathBuf, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    ffi::OsString,
+    future::Future,
+    path::{Path, PathBuf},
+    sync::{Arc, atomic::AtomicU64},
+};
 use tokio::sync::mpsc;
+
+/// Environment variable names that must never be passed to spawned nodes.
+const ENV_DENYLIST: &[&str] = &[
+    "LD_PRELOAD",
+    "LD_AUDIT",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "LD_LIBRARY_PATH",
+    "DORA_AUTH_TOKEN",
+    "DORA_ALLOW_SHELL_NODES",
+];
+
+/// Returns true if the env var key is denied, logging a warning if so.
+fn is_denied_env(key: &str) -> bool {
+    if ENV_DENYLIST.contains(&key) {
+        tracing::warn!(
+            "skipping denied environment variable '{key}' (security: could inject shared libraries)"
+        );
+        true
+    } else {
+        false
+    }
+}
+
+/// Strip all denied env vars from the inherited process environment.
+/// This prevents the daemon's own env (e.g. `DORA_AUTH_TOKEN`) from leaking
+/// to child nodes via `/proc/<pid>/environ`.
+fn strip_denied_env(mut command: Command) -> Command {
+    for key in ENV_DENYLIST {
+        command = command.env_remove(key);
+    }
+    command
+}
+
+/// Point a spawned process at the managed Python env.
+///
+/// Sets `VIRTUAL_ENV` and prepends the env's `bin/` (or `Scripts/` on
+/// Windows) to `PATH`. Without this, subprocesses, console scripts, and
+/// `python -m pip` launched from inside the node still resolve from the
+/// ambient environment — so the runtime is not actually hermetic even
+/// though the top-level interpreter is the managed one.
+///
+/// The composed PATH puts the managed bin dir first, then the user-defined
+/// `PATH` from `node_env` (if any), then the daemon's ambient `PATH`. This
+/// preserves any custom PATH the node author set while still giving the
+/// managed env priority for `python`, `pip`, and friends.
+fn apply_managed_python_runtime_env(
+    command: Command,
+    python_env_dir: &Path,
+    node_env: Option<&BTreeMap<String, EnvValue>>,
+) -> eyre::Result<Command> {
+    let bin_dir = managed_python_bin_dir(python_env_dir);
+
+    let base_path = node_env
+        .and_then(|envs| envs.get("PATH"))
+        .map(|value| OsString::from(value.to_string()))
+        .or_else(|| std::env::var_os("PATH"));
+
+    let mut paths = vec![bin_dir];
+    if let Some(base) = base_path {
+        paths.extend(std::env::split_paths(&base));
+    }
+
+    let new_path = std::env::join_paths(paths)
+        .wrap_err("failed to compose managed Python PATH for runtime spawn")?;
+
+    Ok(command
+        .env("VIRTUAL_ENV", python_env_dir)
+        .env("PATH", new_path))
+}
 
 #[derive(Clone)]
 pub struct Spawner {
@@ -30,13 +108,30 @@ pub struct Spawner {
     /// clock is required for generating timestamps when dropping messages early because queue is full
     pub clock: Arc<HLC>,
     pub uv: bool,
+    pub ft_stats: Arc<crate::FaultToleranceStats>,
+    /// Signals listener loops to shut down when the dataflow finishes.
+    pub shutdown: tokio::sync::watch::Receiver<bool>,
+    /// Loopback endpoint of the daemon's zenoh listener. Forwarded to spawned
+    /// nodes via `DORA_ZENOH_CONNECT` so the >=4 KiB zenoh data path works
+    /// without multicast scouting (#1778).
+    pub zenoh_connect_endpoint: Option<String>,
 }
 
 impl Spawner {
+    fn maybe_inject_zenoh_connect(&self, command: Command) -> Command {
+        match &self.zenoh_connect_endpoint {
+            Some(ep) => command.env(DORA_ZENOH_CONNECT_ENV, ep),
+            None => command,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn_node(
         self,
         node: ResolvedNode,
         node_working_dir: PathBuf,
+        python_env_dir: Option<PathBuf>,
+        confined: bool,
         node_stderr_most_recent: Arc<ArrayQueue<String>>,
         write_events_to: Option<PathBuf>,
         logger: &mut NodeLogger<'_>,
@@ -51,17 +146,15 @@ impl Spawner {
             )
             .await;
 
-        let queue_sizes = node_inputs(&node)
-            .into_iter()
-            .map(|(k, v)| (k, v.queue_size.unwrap_or(10)))
-            .collect();
+        let last_activity = Arc::new(AtomicU64::new(crate::node_communication::current_millis()));
         let daemon_communication = spawn_listener_loop(
             &dataflow_id,
             &node_id,
             &self.daemon_tx,
             self.dataflow_descriptor.communication.local,
-            queue_sizes,
             self.clock.clone(),
+            last_activity.clone(),
+            self.shutdown.clone(),
         )
         .await?;
 
@@ -74,6 +167,7 @@ impl Spawner {
                 .context("failed to serialize dataflow descriptor to YAML")?,
             dynamic: node.kind.dynamic(),
             write_events_to,
+            restart_count: 0,
         };
 
         let mut logger = logger
@@ -84,53 +178,86 @@ impl Spawner {
             self.prepare_node_inner(
                 node,
                 node_working_dir,
+                python_env_dir,
+                confined,
                 &mut logger,
                 dataflow_id,
                 node_config,
                 node_stderr_most_recent,
+                last_activity,
             )
             .await
         };
         Ok(task)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn prepare_node_inner(
         self,
         node: ResolvedNode,
         node_working_dir: PathBuf,
+        python_env_dir: Option<PathBuf>,
+        confined: bool,
         logger: &mut NodeLogger<'_>,
         dataflow_id: uuid::Uuid,
         node_config: NodeConfig,
         node_stderr_most_recent: Arc<ArrayQueue<String>>,
+        last_activity: Arc<AtomicU64>,
     ) -> eyre::Result<PreparedNode> {
         std::fs::create_dir_all(&node_working_dir)
             .context("failed to create node working directory")?;
         let (command, error_msg) = match &node.kind {
             dora_core::descriptor::CoreNodeKind::Custom(n) => {
-                let command =
-                    path_spawn_command(&node_working_dir, self.uv, logger, n, true).await?;
+                let command = path_spawn_command(
+                    &node_working_dir,
+                    self.uv,
+                    python_env_dir.as_deref(),
+                    confined,
+                    logger,
+                    n,
+                    true,
+                )
+                .await?;
 
                 let command = if let Some(mut command) = command {
                     command = command.current_dir(&node_working_dir);
                     command = command.stdin(Stdio::Null);
+                    command = strip_denied_env(command);
 
                     command = command.env(
                         "DORA_NODE_CONFIG",
                         serde_yaml::to_string(&node_config.clone())
                             .wrap_err("failed to serialize node config")?,
                     );
+                    command = self.maybe_inject_zenoh_connect(command);
                     // Injecting the env variable defined in the `yaml` into
                     // the node runtime.
                     if let Some(envs) = &node.env {
                         for (key, value) in envs {
-                            command = command.env(key, value.to_string());
+                            if !is_denied_env(key) {
+                                command = command.env(key, value.to_string());
+                            }
                         }
                     }
                     if let Some(envs) = &n.envs {
                         // node has some inner env variables -> add them too
                         for (key, value) in envs {
-                            command = command.env(key, value.to_string());
+                            if !is_denied_env(key) {
+                                command = command.env(key, value.to_string());
+                            }
                         }
+                    }
+
+                    // For managed Python custom nodes, also set VIRTUAL_ENV and
+                    // prepend the env's bin dir to PATH so subprocesses, console
+                    // scripts, and `python -m pip` see the env. Mirrors the
+                    // managed-interpreter selection in `path_spawn_command`.
+                    if self.uv
+                        && let Some(env_dir) = python_env_dir.as_deref()
+                        && n.build.is_some()
+                    {
+                        command =
+                            apply_managed_python_runtime_env(command, env_dir, node.env.as_ref())?;
                     }
 
                     command = command.env("PYTHONUNBUFFERED", "1");
@@ -166,11 +293,11 @@ impl Spawner {
                     // Use python to spawn runtime if there is a python operator
 
                     // TODO: Handle multi-operator runtime once sub-interpreter is supported
-                    if python_operators.len() > 2 {
+                    if python_operators.len() > 1 {
                         eyre::bail!(
-                            "Runtime currently only support one Python Operator.
-                     This is because pyo4 sub-interpreter is not yet available.
-                     See: https://github.com/PyO4/pyo3/issues/576"
+                            "Runtime currently only supports one Python Operator.
+                     This is because PyO3 sub-interpreter is not yet available.
+                     See: https://github.com/PyO3/pyo3/issues/576"
                         );
                     }
 
@@ -198,14 +325,32 @@ impl Spawner {
                         Some(command)
                     } else {
                         let mut cmd = if self.uv {
-                            let mut cmd = Command::new("uv");
-                            cmd = cmd.arg("run");
-                            cmd = cmd.arg("python");
-                            tracing::info!(
-                                "spawning: uv run python -uc import dora; dora.start_runtime() # {}",
-                                node.id
-                            );
-                            cmd
+                            if let Some(python_env_dir) = python_env_dir.as_deref() {
+                                // Reuse the managed interpreter so Python operators run
+                                // against the same environment Dora prepared during build.
+                                let python = managed_python_interpreter(python_env_dir);
+                                if !python.is_file() {
+                                    eyre::bail!(
+                                        "managed Python interpreter `{}` is missing",
+                                        python.display()
+                                    );
+                                }
+                                tracing::info!(
+                                    "spawning managed Python {} -uc import dora; dora.start_runtime() # {}",
+                                    python.display(),
+                                    node.id
+                                );
+                                Command::new(python)
+                            } else {
+                                let mut cmd = Command::new("uv");
+                                cmd = cmd.arg("run");
+                                cmd = cmd.arg("python");
+                                tracing::info!(
+                                    "spawning: uv run python -uc import dora; dora.start_runtime() # {}",
+                                    node.id
+                                );
+                                cmd
+                            }
                         } else {
                             let python = get_python_path()
                                 .wrap_err("Could not find python path when spawning custom node")?;
@@ -250,9 +395,23 @@ impl Spawner {
                             format!("import dora; dora.start_runtime() # {}", node.id).as_str(),
                         ]);
                         Some(cmd)
+                    } else if file_name == "dora" {
+                        // current_exe is the dora binary — use it so the
+                        // spawned runtime always matches the daemon version.
+                        // See #1797.
+                        let mut cmd = Command::new(&current_exe);
+                        cmd = cmd.arg("runtime");
+                        Some(cmd)
                     } else {
-                        let mut cmd =
-                            Command::new(which::which("dora").wrap_err("failed to get dora path")?);
+                        // current_exe is something else, e.g. an embedded
+                        // example runner that calls `dora_cli::run()` —
+                        // see examples/c-dataflow/run.rs:21. Spawning
+                        // current_exe with `runtime` would recurse into
+                        // the example runner. Fall back to PATH lookup
+                        // for the dora binary. See #1805.
+                        let mut cmd = Command::new(
+                            which::which("dora").wrap_err("failed to find dora binary on PATH")?,
+                        );
                         cmd = cmd.arg("runtime");
                         Some(cmd)
                     }
@@ -270,18 +429,32 @@ impl Spawner {
 
                 let command = if let Some(mut command) = command {
                     command = command.current_dir(&node_working_dir);
+                    command = strip_denied_env(command);
 
                     command = command.env(
                         "DORA_RUNTIME_CONFIG",
                         serde_yaml::to_string(&runtime_config)
                             .wrap_err("failed to serialize runtime config")?,
                     );
+                    command = self.maybe_inject_zenoh_connect(command);
                     // Injecting the env variable defined in the `yaml` into
                     // the node runtime.
                     if let Some(envs) = &node.env {
                         for (key, value) in envs {
-                            command = command.env(key, value.to_string());
+                            if !is_denied_env(key) {
+                                command = command.env(key, value.to_string());
+                            }
                         }
+                    }
+
+                    // For managed Python runtime nodes (Python operator + uv on),
+                    // set VIRTUAL_ENV and prepend the env's bin dir to PATH so
+                    // anything the operator spawns sees the managed env.
+                    if self.uv
+                        && let Some(env_dir) = python_env_dir.as_deref()
+                    {
+                        command =
+                            apply_managed_python_runtime_env(command, env_dir, node.env.as_ref())?;
                     }
 
                     command = command
@@ -309,6 +482,8 @@ impl Spawner {
             clock: self.clock,
             daemon_tx: self.daemon_tx,
             node_stderr_most_recent,
+            last_activity,
+            ft_stats: self.ft_stats,
         })
     }
 }

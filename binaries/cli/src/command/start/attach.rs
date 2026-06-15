@@ -1,4 +1,3 @@
-use communication_layer_request_reply::{TcpConnection, TcpRequestReplyConnection};
 use dora_core::descriptor::{CoreNodeKind, Descriptor, DescriptorExt, resolve_path};
 use dora_message::cli_to_coordinator::ControlRequest;
 use dora_message::common::LogMessage;
@@ -6,24 +5,21 @@ use dora_message::coordinator_to_cli::ControlRequestReply;
 use eyre::Context;
 use notify::event::ModifyKind;
 use notify::{Config, Event as NotifyEvent, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use std::{
-    collections::HashMap,
-    net::{SocketAddr, TcpStream},
-};
+use std::collections::HashMap;
 use std::{path::PathBuf, sync::mpsc, time::Duration};
 use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::common::handle_dataflow_result;
-use crate::output::print_log_message;
+use crate::output::{LogOutputConfig, print_log_message};
+use crate::ws_client::WsSession;
 
 pub fn attach_dataflow(
     dataflow: Descriptor,
     dataflow_path: PathBuf,
     dataflow_id: Uuid,
-    session: &mut TcpRequestReplyConnection,
+    session: &WsSession,
     hot_reload: bool,
-    coordinator_socket: SocketAddr,
     log_level: log::LevelFilter,
 ) -> Result<(), eyre::ErrReport> {
     let (tx, rx) = mpsc::channel();
@@ -44,7 +40,7 @@ pub fn attach_dataflow(
 
     for node in nodes.into_values() {
         match node.kind {
-            // Reloading Custom Nodes is not supported. See: https://github.com/dora-rs/dora/pull/239#discussion_r1154313139
+            // Reloading Custom Nodes is not supported. See: https://github.com/dora-rs/adora/pull/239#discussion_r1154313139
             CoreNodeKind::Custom(_cn) => (),
             CoreNodeKind::Runtime(rn) => {
                 for op in rn.operators.iter() {
@@ -58,7 +54,7 @@ pub fn attach_dataflow(
                         node_path_lookup
                             .insert(path, (dataflow_id, node.id.clone(), Some(op.id.clone())));
                     }
-                    // Reloading non-python operator is not supported. See: https://github.com/dora-rs/dora/pull/239#discussion_r1154313139
+                    // Reloading non-python operator is not supported. See: https://github.com/dora-rs/adora/pull/239#discussion_r1154313139
                 }
             }
         }
@@ -117,41 +113,32 @@ pub fn attach_dataflow(
                     force: true,
                 }))
                 .ok();
-            std::process::abort();
+            std::process::exit(1);
         } else {
-            if ctrlc_tx
-                .send(AttachEvent::Control(ControlRequest::Stop {
-                    dataflow_uuid: dataflow_id,
-                    grace_duration: None,
-                    force: false,
-                }))
-                .is_err()
-            {
-                // bail!("failed to report ctrl-c event to dora-daemon");
-            }
+            let _ = ctrlc_tx.send(AttachEvent::Control(ControlRequest::Stop {
+                dataflow_uuid: dataflow_id,
+                grace_duration: None,
+                force: false,
+            }));
             ctrlc_sent = true;
         }
     })
     .wrap_err("failed to set ctrl-c handler")?;
 
     // subscribe to log messages
-    let mut log_session = TcpConnection {
-        stream: TcpStream::connect(coordinator_socket)
-            .wrap_err("failed to connect to dora coordinator")?,
-    };
-    log_session
-        .send(
-            &serde_json::to_vec(&ControlRequest::LogSubscribe {
-                dataflow_id,
-                level: log_level,
-            })
-            .wrap_err("failed to serialize message")?,
-        )
-        .wrap_err("failed to send log subscribe request to coordinator")?;
+    let log_rx = session.subscribe_logs(
+        &serde_json::to_vec(&ControlRequest::LogSubscribe {
+            dataflow_id,
+            level: log_level,
+        })
+        .wrap_err("failed to serialize message")?,
+    )?;
     std::thread::spawn(move || {
-        while let Ok(raw) = log_session.receive() {
-            let parsed: eyre::Result<LogMessage> =
-                serde_json::from_slice(&raw).context("failed to parse log message");
+        while let Ok(raw) = log_rx.recv() {
+            let parsed: eyre::Result<LogMessage> = match raw {
+                Ok(bytes) => serde_json::from_slice(&bytes).context("failed to parse log message"),
+                Err(err) => Err(err),
+            };
             if tx.send(AttachEvent::Log(parsed)).is_err() {
                 break;
             }
@@ -165,7 +152,11 @@ pub fn attach_dataflow(
             },
             Ok(AttachEvent::Control(control_request)) => control_request,
             Ok(AttachEvent::Log(Ok(log_message))) => {
-                print_log_message(log_message, false, print_daemon_name);
+                let config = LogOutputConfig {
+                    print_daemon_name,
+                    ..LogOutputConfig::default()
+                };
+                print_log_message(log_message, &config);
                 continue;
             }
             Ok(AttachEvent::Log(Err(err))) => {
@@ -193,6 +184,7 @@ pub fn attach_dataflow(
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum AttachEvent {
     Control(ControlRequest),
     Log(eyre::Result<LogMessage>),

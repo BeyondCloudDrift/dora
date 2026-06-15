@@ -2,59 +2,64 @@ use std::io::Write;
 
 use super::{Executable, default_tracing};
 use crate::{
-    LOCALHOST,
-    common::{connect_to_coordinator, query_running_dataflows},
+    common::{CoordinatorOptions, expect_reply, query_running_dataflows, send_control_request},
     formatting::OutputFormat,
+    ws_client::WsSession,
 };
 use clap::Args;
-use communication_layer_request_reply::TcpRequestReplyConnection;
-use dora_core::topics::DORA_COORDINATOR_PORT_CONTROL_DEFAULT;
-use dora_message::{
-    cli_to_coordinator::ControlRequest,
-    coordinator_to_cli::{ControlRequestReply, DataflowStatus},
-};
-use eyre::{Context, bail, eyre};
+use dora_message::{cli_to_coordinator::ControlRequest, coordinator_to_cli::DataflowStatus};
 use serde::Serialize;
 use tabwriter::TabWriter;
 use uuid::Uuid;
 
+#[derive(Debug, Clone, clap::ValueEnum)]
+pub enum SortField {
+    Cpu,
+    Memory,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum, Serialize)]
+pub enum StatusFilter {
+    Running,
+    Finished,
+    Failed,
+}
+
 #[derive(Debug, Args)]
 /// List running dataflows.
 pub struct ListArgs {
-    /// Address of the dora coordinator
-    #[clap(long, value_name = "IP", default_value_t = LOCALHOST)]
-    pub coordinator_addr: std::net::IpAddr,
-    /// Port number of the coordinator control server
-    #[clap(long, value_name = "PORT", default_value_t = DORA_COORDINATOR_PORT_CONTROL_DEFAULT)]
-    pub coordinator_port: u16,
+    #[clap(flatten)]
+    coordinator: CoordinatorOptions,
     /// Output format
-    #[clap(long, value_name = "FORMAT", default_value_t = OutputFormat::Table)]
+    #[clap(long, short = 'f', value_name = "FORMAT", default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
     /// Filter by status (running, finished, failed)
     #[clap(long, value_name = "STATUS")]
-    pub status: Option<String>,
+    pub status: Option<StatusFilter>,
     /// Filter by dataflow name
     #[clap(long, value_name = "PATTERN")]
     pub name: Option<String>,
     /// Sort by field (memory, cpu)
     #[clap(long, value_name = "FIELD")]
-    pub sort_by: Option<String>,
+    pub sort_by: Option<SortField>,
+    /// Only print dataflow UUIDs, one per line
+    #[clap(long, short = 'q', conflicts_with = "format")]
+    pub quiet: bool,
 }
 
 impl Executable for ListArgs {
     fn execute(self) -> eyre::Result<()> {
         default_tracing()?;
 
-        let mut session =
-            connect_to_coordinator((self.coordinator_addr, self.coordinator_port).into())
-                .map_err(|_| eyre!("Failed to connect to coordinator"))?;
+        let session = self.coordinator.connect()?;
 
         list(
-            &mut *session,
+            &session,
             self.format,
             self.status,
             self.name,
             self.sort_by,
+            self.quiet,
         )
     }
 }
@@ -77,36 +82,25 @@ struct DataflowMetrics {
 }
 
 fn list(
-    session: &mut TcpRequestReplyConnection,
+    session: &WsSession,
     format: OutputFormat,
-    status_filter: Option<String>,
+    status_filter: Option<StatusFilter>,
     name_filter: Option<String>,
-    sort_by: Option<String>,
+    sort_by: Option<SortField>,
+    quiet: bool,
 ) -> Result<(), eyre::ErrReport> {
     let list = query_running_dataflows(session)?;
 
     // Get node information
-    let node_info_reply = session
-        .request(&serde_json::to_vec(&ControlRequest::GetNodeInfo).unwrap())
-        .wrap_err("failed to send GetNodeInfo request")?;
-
-    let reply: ControlRequestReply =
-        serde_json::from_slice(&node_info_reply).wrap_err("failed to parse node info reply")?;
-
-    let node_infos = match reply {
-        ControlRequestReply::NodeInfoList(infos) => infos,
-        ControlRequestReply::Error(err) => bail!("{err}"),
-        other => bail!("unexpected node info reply: {other:?}"),
-    };
+    let reply = send_control_request(session, &ControlRequest::GetNodeInfo)?;
+    let node_infos = expect_reply!(reply, NodeInfoList(infos))?;
 
     // Aggregate metrics by dataflow UUID
     let mut dataflow_metrics: std::collections::BTreeMap<Uuid, DataflowMetrics> =
         std::collections::BTreeMap::new();
 
     for node_info in node_infos {
-        let metrics = dataflow_metrics
-            .entry(node_info.dataflow_id)
-            .or_insert_with(DataflowMetrics::default);
+        let metrics = dataflow_metrics.entry(node_info.dataflow_id).or_default();
         metrics.node_count += 1;
 
         if let Some(node_metrics) = node_info.metrics {
@@ -148,15 +142,14 @@ fn list(
         .collect();
 
     // Apply status filter
-    if let Some(ref status_str) = status_filter {
-        let status_lower = status_str.to_lowercase();
+    if let Some(status_filter) = status_filter {
         entries.retain(|entry| {
-            let entry_status = match entry.status {
-                DataflowStatus::Running => "running",
-                DataflowStatus::Finished => "finished",
-                DataflowStatus::Failed => "failed",
-            };
-            entry_status.starts_with(&status_lower)
+            matches!(
+                (status_filter, &entry.status),
+                (StatusFilter::Running, DataflowStatus::Running)
+                    | (StatusFilter::Finished, DataflowStatus::Finished)
+                    | (StatusFilter::Failed, DataflowStatus::Failed)
+            )
         });
     }
 
@@ -168,52 +161,52 @@ fn list(
 
     // Apply sorting
     if let Some(ref sort_field) = sort_by {
-        let sort_lower = sort_field.to_lowercase();
-        match sort_lower.as_str() {
-            "cpu" => {
+        match sort_field {
+            SortField::Cpu => {
                 entries.sort_by(|a, b| {
                     b.cpu
                         .partial_cmp(&a.cpu)
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
             }
-            "memory" => {
+            SortField::Memory => {
                 entries.sort_by(|a, b| {
                     b.memory
                         .partial_cmp(&a.memory)
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
             }
-            _ => {
-                eprintln!(
-                    "Unknown sort field: {}. Valid options: cpu, memory",
-                    sort_field
-                );
-            }
         }
+    }
+
+    if quiet {
+        for entry in &entries {
+            println!("{}", entry.uuid);
+        }
+        return Ok(());
     }
 
     match format {
         OutputFormat::Table => {
             let mut tw = TabWriter::new(std::io::stdout().lock());
             // Header
-            tw.write_all(format!("UUID\tName\tStatus\tNodes\tCPU\tMemory\n").as_bytes())?;
+            tw.write_all(
+                "UUID\tName\tStatus\tNodes\tCPU\tMemory\n"
+                    .to_string()
+                    .as_bytes(),
+            )?;
             for entry in entries {
                 let status = match entry.status {
                     DataflowStatus::Running => "Running",
-                    DataflowStatus::Finished => "Succeeded",
+                    DataflowStatus::Finished => "Finished",
                     DataflowStatus::Failed => "Failed",
                 };
 
+                let memory_str = format_memory_gb(entry.memory);
                 tw.write_all(
                     format!(
-                        "{}\t{}\t{}\t{}\t{}\t{}\n",
-                        entry.uuid,
-                        entry.name,
-                        status,
-                        entry.nodes,
-                        format!("{:.1}%", entry.cpu),
-                        format!("{:.1} GB", entry.memory)
+                        "{}\t{}\t{}\t{}\t{:.1}%\t{}\n",
+                        entry.uuid, entry.name, status, entry.nodes, entry.cpu, memory_str
                     )
                     .as_bytes(),
                 )?;
@@ -228,4 +221,16 @@ fn list(
     }
 
     Ok(())
+}
+
+/// Format a memory value (in GB) with auto-selected unit.
+fn format_memory_gb(gb: f64) -> String {
+    let mb = gb * 1024.0;
+    if mb < 1.0 {
+        format!("{:.1} MB", mb)
+    } else if gb < 1.0 {
+        format!("{:.0} MB", mb)
+    } else {
+        format!("{:.1} GB", gb)
+    }
 }

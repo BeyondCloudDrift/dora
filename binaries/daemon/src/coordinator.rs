@@ -1,24 +1,24 @@
-use crate::{
-    DaemonCoordinatorEvent,
-    socket_stream_utils::{socket_stream_receive, socket_stream_send},
-};
+use crate::DaemonCoordinatorEvent;
 use dora_core::uhlc::HLC;
 use dora_message::{
     common::{DaemonId, Timestamped},
     coordinator_to_daemon::RegisterResult,
     daemon_to_coordinator::{CoordinatorRequest, DaemonCoordinatorReply, DaemonRegisterRequest},
+    ws_protocol::WsResponse,
 };
-use eyre::{Context, eyre};
-use std::{io::ErrorKind, net::SocketAddr, time::Duration};
-use tokio::{
-    net::TcpStream,
-    sync::{mpsc, oneshot},
-    time::sleep,
-};
+use eyre::eyre;
+use futures::{SinkExt, StreamExt};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::{Stream, wrappers::ReceiverStream};
-use tracing::warn;
+use tokio_tungstenite::tungstenite::Message;
+use uuid::Uuid;
 
-const DAEMON_COORDINATOR_RETRY_INTERVAL: std::time::Duration = Duration::from_secs(1);
+const DAEMON_COORDINATOR_RETRY_INITIAL: Duration = Duration::from_secs(1);
+const DAEMON_COORDINATOR_RETRY_MAX: Duration = Duration::from_secs(30);
+/// Maximum number of consecutive failed connection attempts before giving up.
+const DAEMON_COORDINATOR_RETRY_LIMIT: u32 = 50;
+const REGISTER_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 pub struct CoordinatorEvent {
@@ -26,115 +26,305 @@ pub struct CoordinatorEvent {
     pub reply_tx: oneshot::Sender<Option<DaemonCoordinatorReply>>,
 }
 
+/// Wraps the WS send channel for fire-and-forget daemon events to the coordinator.
+#[derive(Clone)]
+pub struct CoordinatorSender {
+    sender: mpsc::Sender<String>,
+}
+
+#[derive(Debug)]
+pub enum TrySendEventError {
+    InvalidUtf8(std::str::Utf8Error),
+    Full,
+    Closed,
+}
+
+impl std::fmt::Display for TrySendEventError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidUtf8(err) => write!(f, "event message not UTF-8: {err}"),
+            Self::Full => write!(f, "WS send channel full"),
+            Self::Closed => write!(f, "WS send channel closed"),
+        }
+    }
+}
+
+impl std::error::Error for TrySendEventError {}
+
+impl CoordinatorSender {
+    fn format_event_message(message: &[u8]) -> Result<String, TrySendEventError> {
+        let params_str = std::str::from_utf8(message).map_err(TrySendEventError::InvalidUtf8)?;
+        let id = Uuid::new_v4();
+        Ok(format!(
+            r#"{{"id":"{id}","method":"daemon_event","params":{params_str}}}"#
+        ))
+    }
+
+    /// Send a serialized event message to the coordinator (fire-and-forget).
+    ///
+    /// Embeds the raw JSON bytes directly to preserve u128 fidelity
+    /// for uhlc::ID inside timestamps.
+    pub async fn send_event(&self, message: &[u8]) -> eyre::Result<()> {
+        let json = Self::format_event_message(message).map_err(|err| eyre!("{err}"))?;
+        self.sender
+            .send(json)
+            .await
+            .map_err(|_| eyre!("WS send channel closed"))
+    }
+
+    pub fn try_send_event(&self, message: &[u8]) -> Result<(), TrySendEventError> {
+        let json = Self::format_event_message(message)?;
+        self.sender.try_send(json).map_err(|err| match err {
+            mpsc::error::TrySendError::Full(_) => TrySendEventError::Full,
+            mpsc::error::TrySendError::Closed(_) => TrySendEventError::Closed,
+        })
+    }
+
+    /// Build a detached sender (and its receiver) for tests that only need a
+    /// distinct, valid `CoordinatorSender` instance.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> (Self, mpsc::Receiver<String>) {
+        let (sender, rx) = mpsc::channel(8);
+        (Self { sender }, rx)
+    }
+}
+
 pub async fn register(
     addr: SocketAddr,
     machine_id: Option<String>,
-    clock: &HLC,
-) -> eyre::Result<(DaemonId, impl Stream<Item = Timestamped<CoordinatorEvent>>)> {
-    let mut stream = loop {
-        match TcpStream::connect(addr)
-            .await
-            .wrap_err("failed to connect to dora-coordinator")
-        {
-            Err(err) => {
-                warn!(
-                    "Could not connect to: {addr}, with error: {err}. Retrying in {DAEMON_COORDINATOR_RETRY_INTERVAL:#?}.."
-                );
-                sleep(DAEMON_COORDINATOR_RETRY_INTERVAL).await;
+    labels: std::collections::BTreeMap<String, String>,
+    clock: Arc<HLC>,
+) -> eyre::Result<(
+    DaemonId,
+    CoordinatorSender,
+    impl Stream<Item = Timestamped<CoordinatorEvent>>,
+)> {
+    let display_url = format!("ws://{addr}/api/daemon");
+    let auth_token = dora_message::auth::discover_token();
+    let ws_stream = {
+        let mut backoff = DAEMON_COORDINATOR_RETRY_INITIAL;
+        let mut attempts: u32 = 0;
+        loop {
+            let request = {
+                let mut req = tokio_tungstenite::tungstenite::http::Request::builder()
+                    .uri(&display_url)
+                    .header("Host", addr.to_string())
+                    .header("Connection", "Upgrade")
+                    .header("Upgrade", "websocket")
+                    .header("Sec-WebSocket-Version", "13")
+                    .header(
+                        "Sec-WebSocket-Key",
+                        tokio_tungstenite::tungstenite::handshake::client::generate_key(),
+                    );
+                if let Some(ref token) = auth_token {
+                    req = req.header("Authorization", format!("Bearer {}", token.as_hex()));
+                }
+                req.body(()).expect("valid WS request")
+            };
+            match tokio_tungstenite::connect_async(request).await {
+                Ok((stream, _)) => break stream,
+                Err(err) => {
+                    attempts += 1;
+                    if attempts >= DAEMON_COORDINATOR_RETRY_LIMIT {
+                        return Err(eyre::eyre!(
+                            "failed to connect to coordinator at {display_url} after {attempts} attempts: {err}"
+                        ));
+                    }
+                    // Add jitter: +/- 25% of backoff to prevent thundering herd
+                    let jitter_range = backoff / 4;
+                    let jitter = Duration::from_millis(
+                        (rand_jitter_millis() % (jitter_range.as_millis() as u64 * 2 + 1))
+                            .saturating_sub(jitter_range.as_millis() as u64),
+                    );
+                    let sleep_duration = backoff.saturating_add(jitter);
+                    tracing::warn!(
+                        "Could not connect to WS at {display_url}: {err}. Retrying in {sleep_duration:#?} ({attempts}/{DAEMON_COORDINATOR_RETRY_LIMIT}).."
+                    );
+                    tokio::time::sleep(sleep_duration).await;
+                    backoff = (backoff * 2).min(DAEMON_COORDINATOR_RETRY_MAX);
+                }
             }
-            Ok(stream) => {
-                break stream;
-            }
-        };
+        }
     };
-    stream
-        .set_nodelay(true)
-        .wrap_err("failed to set TCP_NODELAY")?;
-    let register = serde_json::to_vec(&Timestamped {
-        inner: CoordinatorRequest::Register(DaemonRegisterRequest::new(machine_id)),
+
+    let (mut ws_tx, mut ws_rx) = ws_stream.split();
+
+    // Channel for outgoing messages (daemon events + command replies).
+    // The coordinator sender writes to this, and the spawned task reads and forwards to WS.
+    let (send_tx, mut send_rx) = mpsc::channel::<String>(64);
+
+    // Send Register request.
+    // Serialize params via to_string (not to_value) to preserve u128 fidelity
+    // for uhlc::ID(NonZeroU128) inside the timestamp.
+    let register_params_json = serde_json::to_string(&Timestamped {
+        inner: CoordinatorRequest::Register(DaemonRegisterRequest::new(machine_id, labels)),
         timestamp: clock.new_timestamp(),
     })?;
-    socket_stream_send(&mut stream, &register)
+    let register_id = Uuid::new_v4();
+    let register_json = format!(
+        r#"{{"id":"{register_id}","method":"daemon_event","params":{register_params_json}}}"#
+    );
+    ws_tx
+        .send(Message::Text(register_json.into()))
         .await
-        .wrap_err("failed to send register request to dora-coordinator")?;
-    let reply_raw = socket_stream_receive(&mut stream)
-        .await
-        .wrap_err("failed to register reply from dora-coordinator")?;
-    let result: Timestamped<RegisterResult> = serde_json::from_slice(&reply_raw)
-        .wrap_err("failed to deserialize dora-coordinator reply")?;
-    let daemon_id = result.inner.to_result()?;
-    if let Err(err) = clock.update_with_timestamp(&result.timestamp) {
-        tracing::warn!("failed to update timestamp after register: {err}");
-    }
+        .map_err(|e| eyre!("failed to send register request: {e}"))?;
 
-    tracing::info!("Connected to dora-coordinator at {:?}", addr);
-
-    let (tx, rx) = mpsc::channel(1);
-    tokio::spawn(async move {
+    // Wait for register reply with timeout.
+    // The coordinator's register handler sends back Timestamped<RegisterResult>
+    // wrapped in a WsRequest with method "daemon_event".
+    let daemon_id = tokio::time::timeout(REGISTER_TIMEOUT, async {
         loop {
-            let event = match socket_stream_receive(&mut stream).await {
-                Ok(raw) => match serde_json::from_slice(&raw) {
-                    Ok(event) => event,
-                    Err(err) => {
-                        let err =
-                            eyre!(err).wrap_err("failed to deserialize incoming coordinator event");
-                        tracing::warn!("{err:?}");
-                        continue;
-                    }
-                },
-                Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
-                Err(err) => {
-                    let err = eyre!(err).wrap_err("failed to receive incoming event");
-                    tracing::warn!("{err:?}");
-                    continue;
-                }
-            };
-            let Timestamped {
-                inner: event,
-                timestamp,
-            } = event;
-            let (reply_tx, reply_rx) = oneshot::channel();
-            match tx
-                .send(Timestamped {
-                    inner: CoordinatorEvent { event, reply_tx },
-                    timestamp,
-                })
+            let msg = ws_rx
+                .next()
                 .await
-            {
-                Ok(()) => {}
-                Err(_) => {
-                    // receiving end of channel was closed
-                    break;
-                }
-            }
+                .ok_or_else(|| eyre!("WS connection closed before register reply"))?
+                .map_err(|e| eyre!("WS error during register: {e}"))?;
 
-            let Ok(reply) = reply_rx.await else {
-                tracing::warn!("daemon sent no reply");
+            let Message::Text(text) = msg else {
                 continue;
             };
-            if let Some(reply) = reply {
-                let serialized = match serde_json::to_vec(&reply)
-                    .wrap_err("failed to serialize DaemonCoordinatorReply")
-                {
-                    Ok(r) => r,
-                    Err(err) => {
-                        tracing::error!("{err:?}");
+
+            // Parse directly from raw text to preserve u128 fidelity.
+            let raw: RegisterReplyRaw = match serde_json::from_str(&text) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let result = raw.params;
+
+            if let Err(err) = clock.update_with_timestamp(&result.timestamp) {
+                tracing::warn!("failed to update timestamp after register: {err}");
+            }
+
+            break result.inner.to_result();
+        }
+    })
+    .await
+    .map_err(|_| eyre!("timeout waiting for register reply from coordinator"))??;
+
+    tracing::info!("Connected to dora-coordinator at ws://{addr}/api/daemon");
+
+    let (tx, rx) = mpsc::channel(1);
+
+    // Spawned task: bidirectional WS message routing.
+    // - Reads coordinator commands from WS, sends to event channel, awaits reply, sends reply back.
+    // - Reads outgoing events from send_rx, forwards to WS.
+    let task_clock = clock.clone();
+    tokio::spawn(async move {
+        let clock = task_clock;
+        loop {
+            tokio::select! {
+                msg = ws_rx.next() => {
+                    let Some(msg) = msg else { break };
+                    let text = match msg {
+                        Ok(Message::Text(text)) => text,
+                        Ok(Message::Close(_)) => break,
+                        Ok(Message::Ping(data)) => {
+                            let _ = ws_tx.send(Message::Pong(data)).await;
+                            continue;
+                        }
+                        Ok(_) => continue,
+                        Err(e) => {
+                            tracing::warn!("WS coordinator connection error: {e}");
+                            break;
+                        }
+                    };
+
+                    // Parse directly from raw text to preserve u128 fidelity
+                    // for uhlc::ID inside timestamps.
+                    let raw: CoordinatorCommandRaw = match serde_json::from_str(&text) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::warn!("failed to parse coordinator WS message: {e}");
+                            continue;
+                        }
+                    };
+
+                    let request_id = raw.id;
+                    let needs_reply = raw.method == "daemon_command";
+                    let event = raw.params;
+
+                    if let Err(err) = clock.update_with_timestamp(&event.timestamp) {
+                        tracing::warn!("failed to update daemon clock: {err}");
+                    }
+
+                    let (reply_tx, reply_rx) = oneshot::channel();
+                    if tx
+                        .send(Timestamped {
+                            inner: CoordinatorEvent {
+                                event: event.inner,
+                                reply_tx,
+                            },
+                            timestamp: event.timestamp,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+
+                    let Ok(reply) = reply_rx.await else {
+                        tracing::warn!("daemon sent no reply");
                         continue;
+                    };
+
+                    if let Some(reply) = reply {
+                        if needs_reply {
+                            let response = match serde_json::to_value(&reply) {
+                                Ok(val) => WsResponse::ok(request_id, val),
+                                Err(e) => {
+                                    tracing::error!("failed to serialize reply: {e}");
+                                    WsResponse::err(request_id, format!("{e}"))
+                                }
+                            };
+                            if let Ok(json) = serde_json::to_string(&response)
+                                && ws_tx.send(Message::Text(json.into())).await.is_err() {
+                                    break;
+                                }
+                        }
+                        if let DaemonCoordinatorReply::DestroyResult { notify, .. } = reply {
+                            if let Some(notify) = notify {
+                                let _ = notify.send(());
+                            }
+                            break;
+                        }
                     }
-                };
-                if let Err(err) = socket_stream_send(&mut stream, &serialized).await {
-                    tracing::warn!("failed to send reply to coordinator: {err}");
-                    continue;
-                };
-                if let DaemonCoordinatorReply::DestroyResult { notify, .. } = reply {
-                    if let Some(notify) = notify {
-                        let _ = notify.send(());
+                }
+                Some(outgoing) = send_rx.recv() => {
+                    if ws_tx.send(Message::Text(outgoing.into())).await.is_err() {
+                        break;
                     }
-                    break;
                 }
             }
         }
     });
 
-    Ok((daemon_id, ReceiverStream::new(rx)))
+    Ok((
+        daemon_id,
+        CoordinatorSender { sender: send_tx },
+        ReceiverStream::new(rx),
+    ))
+}
+
+/// Helper for deserializing register reply directly from raw JSON text,
+/// bypassing `serde_json::Value` to preserve u128 fidelity for uhlc::ID.
+#[derive(serde::Deserialize)]
+struct RegisterReplyRaw {
+    params: Timestamped<RegisterResult>,
+}
+
+/// Helper for deserializing coordinator commands directly from raw JSON text,
+/// bypassing `serde_json::Value` to preserve u128 fidelity for uhlc::ID.
+#[derive(serde::Deserialize)]
+struct CoordinatorCommandRaw {
+    id: Uuid,
+    method: String,
+    params: Timestamped<DaemonCoordinatorEvent>,
+}
+
+/// Jitter for reconnect backoff using a properly seeded random source.
+fn rand_jitter_millis() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish()
 }

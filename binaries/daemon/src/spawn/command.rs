@@ -1,7 +1,10 @@
 use crate::log::NodeLogger;
 use clonable_command::Command;
 use dora_core::{
-    descriptor::{DYNAMIC_SOURCE, SHELL_SOURCE, resolve_path, source_is_url},
+    build::managed_python_interpreter,
+    descriptor::{
+        DYNAMIC_SOURCE, SHELL_SOURCE, resolve_path, resolve_path_confined, source_is_url,
+    },
     get_python_path,
 };
 use dora_download::download_file;
@@ -9,9 +12,12 @@ use dora_message::common::LogLevel;
 use eyre::WrapErr;
 use std::path::Path;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn path_spawn_command(
     working_dir: &Path,
     uv: bool,
+    python_env_dir: Option<&Path>,
+    confined: bool,
     logger: &mut NodeLogger<'_>,
     node: &dora_core::descriptor::CustomNode,
     permit_url: bool,
@@ -19,6 +25,20 @@ pub(super) async fn path_spawn_command(
     let cmd = match node.path.as_str() {
         DYNAMIC_SOURCE => return Ok(None),
         SHELL_SOURCE => {
+            if std::env::var("DORA_ALLOW_SHELL_NODES").as_deref() != Ok("true") {
+                eyre::bail!(
+                    "Shell nodes are disabled by default (security risk). \
+                     Set DORA_ALLOW_SHELL_NODES=true to enable."
+                );
+            }
+            logger
+                .log(
+                    LogLevel::Warn,
+                    Some("spawner".into()),
+                    "DORA_ALLOW_SHELL_NODES is set: shell node will execute arbitrary commands"
+                        .to_string(),
+                )
+                .await;
             if cfg!(target_os = "windows") {
                 let cmd = Command::new("cmd");
                 cmd.args(["/C", &node.args.clone().unwrap_or_default()])
@@ -28,17 +48,45 @@ pub(super) async fn path_spawn_command(
             }
         }
         source => {
-            let resolved_path = if source_is_url(source) {
+            let resolved_path = if confined {
+                // hub-sourced node (spec §11): the entrypoint resolves only
+                // within the node's own working dir or managed env — no env
+                // expansion, no URL download, no ambient-$PATH fallback.
+                // (The *interpreter* for a script-only `.py` entrypoint still
+                // comes from `uv run` like any non-hub script node — hub
+                // Python nodes are expected to ship a `build:` so they get a
+                // managed env, spec §15 Q4.)
+                resolve_path_confined(source, working_dir, python_env_dir)
+                    .wrap_err_with(|| format!("failed to resolve hub entrypoint `{source}`"))?
+            } else if source_is_url(source) {
                 if !permit_url {
                     eyre::bail!("URL paths are not supported in this case");
                 }
                 // try to download the shared library
                 let target_dir = Path::new("build");
-                download_file(source, target_dir)
+                download_file(source, target_dir, None)
                     .await
                     .wrap_err("failed to download custom node")?
             } else {
-                let source = shellexpand::env(source)?;
+                let source = shellexpand::env_with_context_no_errors(source, |var| {
+                    // Only expand a controlled allowlist of safe variables
+                    const ALLOWED_VARS: &[&str] = &[
+                        "HOME",
+                        "USER",
+                        "DORA_WORKSPACE",
+                        "CARGO_MANIFEST_DIR",
+                        "PWD",
+                    ];
+                    if ALLOWED_VARS.contains(&var) {
+                        std::env::var(var).ok()
+                    } else {
+                        tracing::warn!(
+                            "skipping env expansion for '${var}' in node path \
+                             (only HOME, USER, DORA_WORKSPACE, CARGO_MANIFEST_DIR, PWD are allowed)"
+                        );
+                        None
+                    }
+                });
                 resolve_path(source.as_ref(), working_dir)
                     .wrap_err_with(|| format!("failed to resolve node source `{source}`"))?
             };
@@ -47,17 +95,48 @@ pub(super) async fn path_spawn_command(
             let mut cmd = match resolved_path.extension().map(|ext| ext.to_str()) {
                 Some(Some("py")) => {
                     let mut cmd = if uv {
-                        let mut cmd = Command::new("uv");
-                        cmd = cmd.arg("run");
-                        cmd = cmd.arg("python");
-                        logger
-                            .log(
-                                LogLevel::Info,
-                                Some("spawner".into()),
-                                format!("spawning: uv run python -u {}", resolved_path.display()),
-                            )
-                            .await;
-                        cmd
+                        if let Some(python_env_dir) =
+                            python_env_dir.filter(|_| node.build.is_some())
+                        {
+                            // Reuse the interpreter from Dora's prepared env so
+                            // custom Python nodes see the dependencies built there.
+                            let python = managed_python_interpreter(python_env_dir);
+                            if !python.is_file() {
+                                eyre::bail!(
+                                    "managed Python interpreter `{}` is missing",
+                                    python.display()
+                                );
+                            }
+                            logger
+                                .log(
+                                    LogLevel::Info,
+                                    Some("spawner".into()),
+                                    format!(
+                                        "spawning managed Python {} -u {}",
+                                        python.display(),
+                                        resolved_path.display()
+                                    ),
+                                )
+                                .await;
+                            Command::new(python)
+                        } else {
+                            // Nodes without build-time Python setup still rely on
+                            // the caller's active uv environment for imports.
+                            let mut cmd = Command::new("uv");
+                            cmd = cmd.arg("run");
+                            cmd = cmd.arg("python");
+                            logger
+                                .log(
+                                    LogLevel::Info,
+                                    Some("spawner".into()),
+                                    format!(
+                                        "spawning: uv run python -u {}",
+                                        resolved_path.display()
+                                    ),
+                                )
+                                .await;
+                            cmd
+                        }
                     } else {
                         let python = get_python_path()
                             .wrap_err("Could not find python path when spawning custom node")?;
@@ -89,11 +168,29 @@ pub(super) async fn path_spawn_command(
             };
 
             if let Some(args) = &node.args {
-                cmd = cmd.args(args.split_ascii_whitespace());
+                let parsed = shlex::split(args)
+                    .ok_or_else(|| eyre::eyre!("invalid quoting in node args: {args}"))?;
+                cmd = cmd.args(parsed);
             }
             cmd
         }
     };
 
     Ok(Some(cmd))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn shlex_splits_quoted_args() {
+        let input = "--foo 'hello world' --bar";
+        let result = shlex::split(input).unwrap();
+        assert_eq!(result, vec!["--foo", "hello world", "--bar"]);
+    }
+
+    #[test]
+    fn shlex_rejects_unmatched_quote() {
+        let input = "--foo 'unclosed";
+        assert!(shlex::split(input).is_none());
+    }
 }

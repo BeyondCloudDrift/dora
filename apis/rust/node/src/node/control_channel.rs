@@ -29,18 +29,8 @@ impl ControlChannel {
         let channel = match daemon_communication {
             DaemonCommunicationWrapper::Standard(daemon_communication) => {
                 match daemon_communication {
-                    DaemonCommunication::Shmem {
-                        daemon_control_region_id,
-                        ..
-                    } => unsafe { DaemonChannel::new_shmem(daemon_control_region_id) }
-                        .wrap_err("failed to create shmem control channel")?,
                     DaemonCommunication::Tcp { socket_addr } => {
                         DaemonChannel::new_tcp(*socket_addr)
-                            .wrap_err("failed to connect control channel")?
-                    }
-                    #[cfg(unix)]
-                    DaemonCommunication::UnixDomain { socket_file } => {
-                        DaemonChannel::new_unix_socket(socket_file)
                             .wrap_err("failed to connect control channel")?
                     }
                     DaemonCommunication::Interactive => {
@@ -123,6 +113,28 @@ impl ControlChannel {
         match reply {
             DaemonReply::Empty => Ok(()),
             other => bail!("unexpected SendMessage reply: {other:?}"),
+        }
+    }
+
+    pub fn report_output_sent(
+        &mut self,
+        output_id: DataId,
+        metadata: Metadata,
+    ) -> eyre::Result<()> {
+        let request = DaemonRequest::OutputSent {
+            output_id,
+            metadata,
+        };
+        let reply = self
+            .channel
+            .request(&Timestamped {
+                inner: request,
+                timestamp: self.clock.new_timestamp(),
+            })
+            .wrap_err("failed to send OutputSent request to dora-daemon")?;
+        match reply {
+            DaemonReply::Empty => Ok(()),
+            other => bail!("unexpected OutputSent reply: {other:?}"),
         }
     }
 }

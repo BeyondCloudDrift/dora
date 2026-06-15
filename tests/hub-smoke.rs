@@ -1,0 +1,619 @@
+//! Hermetic end-to-end test of the `hub:` flow (P2.11).
+//!
+//! Builds a self-contained fixture in a tempdir — a git source repo holding a
+//! trivial node, a local `node-index` catalog pinning it by commit, and a
+//! `hub.toml` binding the `test` namespace to that index — then drives
+//! `dora hub search/info`, `dora build`, `dora build --locked`, and
+//! `dora hub fetch` against it. No network, no live catalog, and no Python
+//! bindings (the node is a plain Rust `main` that exits 0).
+
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+    sync::Once,
+};
+
+static BUILD_CLI: Once = Once::new();
+
+fn dora_bin() -> PathBuf {
+    BUILD_CLI.call_once(|| {
+        let status = Command::new("cargo")
+            .args(["build", "-p", "dora-cli"])
+            .status()
+            .expect("cargo build dora-cli");
+        assert!(status.success(), "failed to build dora CLI");
+    });
+    let target = std::env::var("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("target"));
+    let bin = target
+        .join("debug")
+        .join(format!("dora{}", std::env::consts::EXE_SUFFIX));
+    assert!(bin.exists(), "dora binary missing at {}", bin.display());
+    bin
+}
+
+fn git(dir: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .current_dir(dir)
+        .args([
+            "-c",
+            "user.email=t@dora.rs",
+            "-c",
+            "user.name=t",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .status()
+        .expect("run git");
+    assert!(status.success(), "git {args:?} failed");
+}
+
+fn write(path: &Path, content: &str) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(path, content).unwrap();
+}
+
+struct Fixture {
+    _tmp: tempfile::TempDir,
+    root: PathBuf,
+    hub_config: PathBuf,
+}
+
+/// Build the source repo + index + hub.toml; returns the fixture paths.
+fn build_fixture() -> Fixture {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+
+    // 1. a git source repo with a trivial node + its manifest
+    let src = root.join("source");
+    write(
+        &src.join("node-hub/hello/Cargo.toml"),
+        "[package]\nname = \"hub-smoke-hello\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+         \n[[bin]]\nname = \"hub-smoke-hello\"\npath = \"src/main.rs\"\n\n[workspace]\n",
+    );
+    write(
+        &src.join("node-hub/hello/src/main.rs"),
+        "fn main() { println!(\"hello from the hub smoke node\"); }\n",
+    );
+    write(
+        &src.join("node-hub/hello/dora-node.yml"),
+        "apiVersion: 1\nname: hub-smoke-hello\nnamespace: test\n\
+         description: \"hermetic smoke node\"\ncategories: [debug]\n\
+         keywords: [smoke]\nruntime: rust\n\
+         entrypoint: target/release/hub-smoke-hello\nbuild: cargo build --release\n",
+    );
+    git(&src, &["init", "--quiet", "-b", "main"]);
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "--quiet", "-m", "init"]);
+    let commit = String::from_utf8(
+        Command::new("git")
+            .current_dir(&src)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    // allow blobless clone over the local transport
+    git(&src, &["config", "uploadpack.allowFilter", "true"]);
+
+    // 2. the index catalog
+    let src_url = format!("file://{}", src.display());
+    write(
+        &root.join("index/test/hub-smoke-hello/0.1.0.yml"),
+        &format!(
+            "manifest:\n  apiVersion: 1\n  name: hub-smoke-hello\n  namespace: test\n  \
+             description: \"hermetic smoke node\"\n  categories: [debug]\n  keywords: [smoke]\n  \
+             runtime: rust\n  entrypoint: target/release/hub-smoke-hello\n  \
+             build: cargo build --release\nsource:\n  git: {src_url}\n  rev: {commit}\n  \
+             subdir: node-hub/hello\n"
+        ),
+    );
+
+    // 3. hub.toml binding the `test` namespace to the local index
+    let hub_config = root.join("hub.toml");
+    write(
+        &hub_config,
+        &format!(
+            "[[index]]\nalias = \"smoke\"\npath = \"{}\"\nnamespaces = [\"test\"]\n",
+            root.join("index").display()
+        ),
+    );
+
+    Fixture {
+        _tmp: tmp,
+        root,
+        hub_config,
+    }
+}
+
+fn dora(fixture: &Fixture) -> Command {
+    let mut cmd = Command::new(dora_bin());
+    cmd.env("DORA_HUB_CONFIG", &fixture.hub_config);
+    // the fixture index entries point at a `file://` source repo; opt in to
+    // local sources, which a public index would otherwise reject
+    cmd.env("DORA_HUB_ALLOW_LOCAL_SOURCES", "1");
+    cmd.current_dir(&fixture.root);
+    cmd
+}
+
+#[test]
+fn hub_end_to_end() {
+    // Skip cleanly where git isn't available rather than hard-failing.
+    if Command::new("git").arg("--version").output().is_err() {
+        eprintln!("git not available — skipping hub smoke test");
+        return;
+    }
+    let fixture = build_fixture();
+
+    // search finds the node by keyword
+    let out = dora(&fixture)
+        .args(["hub", "search", "smoke"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "search failed: {}", stderr(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("test/hub-smoke-hello"),
+        "search output: {stdout}"
+    );
+
+    // info prints the contracts
+    let out = dora(&fixture)
+        .args(["hub", "info", "test/hub-smoke-hello"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "info failed: {}", stderr(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("hermetic smoke node"),
+        "info output missing description"
+    );
+
+    // a dataflow referencing the hub package
+    write(
+        &fixture.root.join("flow/dataflow.yml"),
+        "nodes:\n  - id: hello\n    hub: test/hub-smoke-hello@^0.1\n",
+    );
+    let flow = fixture.root.join("flow/dataflow.yml");
+
+    // build resolves, clones at the pin, builds in the subdir, writes lockfile
+    let out = dora(&fixture)
+        .args(["build", flow.to_str().unwrap(), "--write-lockfile"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "build failed: {}", stderr(&out));
+    let lockfile = fixture.root.join("flow/dataflow.dora-lock.yaml");
+    let lock = std::fs::read_to_string(&lockfile).unwrap();
+    assert!(lock.contains("subdir: node-hub/hello"), "lockfile: {lock}");
+    assert!(
+        lock.contains("name: test/hub-smoke-hello"),
+        "lockfile: {lock}"
+    );
+
+    // hub list shows the pinned package
+    let out = dora(&fixture)
+        .args(["hub", "list", flow.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "list failed: {}", stderr(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("test/hub-smoke-hello"),
+        "list output"
+    );
+
+    // run executes the node (it prints and exits 0)
+    let out = dora(&fixture)
+        .args(["run", flow.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "run failed: {}", stderr(&out));
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("hello from the hub smoke node"),
+        "node output missing:\n{combined}"
+    );
+
+    // --locked + --offline rebuild from the pin without touching the network
+    let out = dora(&fixture)
+        .args(["build", flow.to_str().unwrap(), "--locked", "--offline"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "locked build failed: {}",
+        stderr(&out)
+    );
+
+    // --locked must reject a rewritten index entry: the commit pins the source
+    // tree, but the manifest (entrypoint, build, contract) lives in the
+    // (mutable) index entry, so a tampered `build:` must hard-error via the
+    // pinned manifest digest rather than run silently.
+    let entry_path = fixture.root.join("index/test/hub-smoke-hello/0.1.0.yml");
+    let original_entry = std::fs::read_to_string(&entry_path).unwrap();
+    let tampered = original_entry.replace("build: cargo build --release", "build: echo pwned");
+    assert_ne!(
+        original_entry, tampered,
+        "tamper replace should change the entry"
+    );
+    std::fs::write(&entry_path, &tampered).unwrap();
+    let out = dora(&fixture)
+        .args(["build", flow.to_str().unwrap(), "--locked", "--offline"])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "locked build must reject a tampered manifest"
+    );
+    assert!(
+        stderr(&out).contains("changed its manifest"),
+        "expected a manifest-tamper error, got: {}",
+        stderr(&out)
+    );
+    std::fs::write(&entry_path, &original_entry).unwrap(); // restore for the steps below
+
+    // hub fetch pre-clones the pinned source
+    let out = dora(&fixture)
+        .args([
+            "hub",
+            "fetch",
+            flow.to_str().unwrap(),
+            "--target-dir",
+            "cache",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "fetch failed: {}", stderr(&out));
+    assert!(
+        fixture
+            .root
+            .join("cache")
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_some(),
+        "fetch populated nothing"
+    );
+
+    // a stale clone (dir deleted, completion marker left behind) must re-clone
+    // rather than report success with no source
+    let cache = fixture.root.join("cache");
+    let clone_dir = std::fs::read_dir(&cache)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.is_dir())
+        .expect("a clone dir");
+    std::fs::remove_dir_all(&clone_dir).unwrap(); // marker `.<commit>.complete` stays
+    let out = dora(&fixture)
+        .args([
+            "hub",
+            "fetch",
+            flow.to_str().unwrap(),
+            "--target-dir",
+            "cache",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "re-fetch failed: {}", stderr(&out));
+    assert!(
+        clone_dir.is_dir(),
+        "stale marker was trusted; clone not restored"
+    );
+
+    // fetch must validate the dataflow against the lockfile: a flow that no
+    // longer references the locked hub node is a stale mirror and must error
+    std::fs::write(&flow, "nodes:\n  - id: plain\n    path: dynamic\n").unwrap();
+    let out = dora(&fixture)
+        .args([
+            "hub",
+            "fetch",
+            flow.to_str().unwrap(),
+            "--target-dir",
+            "cache",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "fetch of a stale lockfile must fail");
+    assert!(
+        stderr(&out).contains("no longer has") || stderr(&out).contains("regenerate"),
+        "expected a stale-lockfile error, got: {}",
+        stderr(&out)
+    );
+}
+
+/// The hub resolver loads a package's shipped `types:` into the dataflow's
+/// type registry. The index entry is untrusted, so a rewritten entry that
+/// ships a `std/` override (or a cross-namespace type) must be rejected at
+/// resolve time — before the type can back a consumer's port check (P2.12).
+#[test]
+fn hub_rejects_invalid_shipped_type() {
+    if Command::new("git").arg("--version").output().is_err() {
+        eprintln!("git not available — skipping hub shipped-type test");
+        return;
+    }
+    let fixture = build_fixture();
+
+    // Rewrite the entry's manifest to ship a `std/` type — the namespace rule
+    // forbids it, and the resolver must enforce that on the untrusted entry.
+    let entry_path = fixture.root.join("index/test/hub-smoke-hello/0.1.0.yml");
+    let entry = std::fs::read_to_string(&entry_path).unwrap();
+    let tampered = entry.replace(
+        "  build: cargo build --release\nsource:",
+        "  build: cargo build --release\n  types:\n    std/core/v1/Hijack:\n      arrow: Struct\nsource:",
+    );
+    assert_ne!(entry, tampered, "expected the types injection to apply");
+    std::fs::write(&entry_path, &tampered).unwrap();
+
+    write(
+        &fixture.root.join("flow/dataflow.yml"),
+        "nodes:\n  - id: hello\n    hub: test/hub-smoke-hello@^0.1\n",
+    );
+    let flow = fixture.root.join("flow/dataflow.yml");
+    let out = dora(&fixture)
+        .args(["build", flow.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "build must reject a package shipping a `std/` type"
+    );
+    assert!(
+        stderr(&out).contains("invalid custom types") || stderr(&out).contains("std/"),
+        "expected a shipped-type rejection, got: {}",
+        stderr(&out)
+    );
+}
+
+/// `dora build --hub-override <pkg>=<path>` substitutes a local checkout for a
+/// hub package (UC11): the manifest is read from the checkout, contracts are
+/// validated, and the node builds from local source — no index resolution, no
+/// clone. We assert the build roots at the checkout (its `target/` appears) and
+/// that the override is reported.
+#[test]
+fn hub_override_builds_from_local_checkout() {
+    if Command::new("git").arg("--version").output().is_err() {
+        eprintln!("git not available — skipping hub override test");
+        return;
+    }
+    let fixture = build_fixture();
+
+    // the local checkout is the node's source dir inside the fixture repo
+    let checkout = fixture.root.join("source/node-hub/hello");
+    assert!(checkout.join("dora-node.yml").is_file(), "fixture checkout");
+
+    write(
+        &fixture.root.join("flow/dataflow.yml"),
+        "nodes:\n  - id: hello\n    hub: test/hub-smoke-hello@^0.1\n",
+    );
+    let flow = fixture.root.join("flow/dataflow.yml");
+
+    let out = dora(&fixture)
+        .args([
+            "build",
+            flow.to_str().unwrap(),
+            "--hub-override",
+            &format!("test/hub-smoke-hello={}", checkout.display()),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "override build failed: {}",
+        stderr(&out)
+    );
+    let combined = format!("{}{}", String::from_utf8_lossy(&out.stdout), stderr(&out));
+    assert!(
+        combined.contains("overriding hub package test/hub-smoke-hello"),
+        "expected an override note, got:\n{combined}"
+    );
+    // the node built from local source: the binary lands in the checkout's
+    // own target dir, not a clone under the hub cache
+    let built = checkout.join("target/release/hub-smoke-hello");
+    assert!(
+        built.exists(),
+        "override did not build in the local checkout (missing {})",
+        built.display()
+    );
+}
+
+/// `dora run --hub-override` must build AND run the LOCAL checkout, not the
+/// published/committed source. We modify the checkout's source (uncommitted)
+/// to print a unique marker; if the override truly uses local source, that
+/// marker — not the index-pinned version — appears at run time (UC11).
+#[test]
+fn hub_run_override_executes_local_source() {
+    if Command::new("git").arg("--version").output().is_err() {
+        eprintln!("git not available — skipping hub run-override test");
+        return;
+    }
+    let fixture = build_fixture();
+    let checkout = fixture.root.join("source/node-hub/hello");
+
+    // edit the checkout's source WITHOUT committing — the index pin still
+    // points at the original commit, so only a local override sees this.
+    let marker = "LOCAL-OVERRIDE-MARKER-9173";
+    write(
+        &checkout.join("src/main.rs"),
+        &format!("fn main() {{ println!(\"{marker}\"); }}\n"),
+    );
+
+    write(
+        &fixture.root.join("flow/dataflow.yml"),
+        "nodes:\n  - id: hello\n    hub: test/hub-smoke-hello@^0.1\n",
+    );
+    let flow = fixture.root.join("flow/dataflow.yml");
+    let out = dora(&fixture)
+        .args([
+            "run",
+            flow.to_str().unwrap(),
+            "--hub-override",
+            &format!("test/hub-smoke-hello={}", checkout.display()),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "run --hub-override failed: {}",
+        stderr(&out)
+    );
+    let combined = format!("{}{}", String::from_utf8_lossy(&out.stdout), stderr(&out));
+    assert!(
+        combined.contains(marker),
+        "run did not execute the local checkout (marker absent):\n{combined}"
+    );
+}
+
+/// An override that names no node in the dataflow is reported, not silently
+/// ignored.
+#[test]
+fn hub_override_unused_is_warned() {
+    if Command::new("git").arg("--version").output().is_err() {
+        eprintln!("git not available — skipping hub override-warn test");
+        return;
+    }
+    let fixture = build_fixture();
+    let checkout = fixture.root.join("source/node-hub/hello");
+    write(
+        &fixture.root.join("flow/dataflow.yml"),
+        "nodes:\n  - id: hello\n    hub: test/hub-smoke-hello@^0.1\n",
+    );
+    let flow = fixture.root.join("flow/dataflow.yml");
+    let out = dora(&fixture)
+        .args([
+            "build",
+            flow.to_str().unwrap(),
+            "--hub-override",
+            &format!("test/not-a-node={}", checkout.display()),
+        ])
+        .output()
+        .unwrap();
+    // resolution still proceeds against the index for the real node; the unused
+    // override is surfaced as a warning
+    assert!(
+        stderr(&out).contains("did not match any hub node")
+            || String::from_utf8_lossy(&out.stdout).contains("did not match any hub node"),
+        "expected an unused-override warning, got:\n{}",
+        stderr(&out)
+    );
+}
+
+/// An override is also surfaced when the dataflow has *no* hub nodes at all —
+/// the resolver early-returns in that case, so the warning must fire there too.
+#[test]
+fn hub_override_warns_when_no_hub_nodes() {
+    if Command::new("git").arg("--version").output().is_err() {
+        eprintln!("git not available — skipping hub override no-hub-node test");
+        return;
+    }
+    let fixture = build_fixture();
+    let checkout = fixture.root.join("source/node-hub/hello"); // any existing dir
+    // a dataflow with only a non-hub (dynamic) node — nothing to build
+    write(
+        &fixture.root.join("flow/dataflow.yml"),
+        "nodes:\n  - id: plain\n    path: dynamic\n",
+    );
+    let flow = fixture.root.join("flow/dataflow.yml");
+    let out = dora(&fixture)
+        .args([
+            "build",
+            flow.to_str().unwrap(),
+            "--hub-override",
+            &format!("test/ghost={}", checkout.display()),
+        ])
+        .output()
+        .unwrap();
+    let combined = format!("{}{}", String::from_utf8_lossy(&out.stdout), stderr(&out));
+    assert!(
+        combined.contains("did not match any hub node"),
+        "expected an unused-override warning even with no hub nodes, got:\n{combined}"
+    );
+}
+
+/// `--hub-override` + `--write-lockfile` is rejected: the override substitutes
+/// local source, so a regenerated lockfile would silently drop the hub pin.
+#[test]
+fn hub_override_rejects_write_lockfile() {
+    if Command::new("git").arg("--version").output().is_err() {
+        eprintln!("git not available — skipping hub override write-lockfile test");
+        return;
+    }
+    let fixture = build_fixture();
+    let checkout = fixture.root.join("source/node-hub/hello");
+    write(
+        &fixture.root.join("flow/dataflow.yml"),
+        "nodes:\n  - id: hello\n    hub: test/hub-smoke-hello@^0.1\n",
+    );
+    let flow = fixture.root.join("flow/dataflow.yml");
+    let out = dora(&fixture)
+        .args([
+            "build",
+            flow.to_str().unwrap(),
+            "--write-lockfile",
+            "--hub-override",
+            &format!("test/hub-smoke-hello={}", checkout.display()),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "must reject --hub-override + --write-lockfile"
+    );
+    assert!(
+        stderr(&out).contains("write-lockfile"),
+        "expected a write-lockfile rejection, got: {}",
+        stderr(&out)
+    );
+}
+
+/// `--hub-override` is rejected with a remote coordinator even when the
+/// override package matches NO node (a typo must not silently fall through to
+/// a distributed build).
+#[test]
+fn hub_override_rejects_remote_coordinator_even_if_unmatched() {
+    if Command::new("git").arg("--version").output().is_err() {
+        eprintln!("git not available — skipping hub override coordinator test");
+        return;
+    }
+    let fixture = build_fixture();
+    let checkout = fixture.root.join("source/node-hub/hello");
+    write(
+        &fixture.root.join("flow/dataflow.yml"),
+        "nodes:\n  - id: hello\n    hub: test/hub-smoke-hello@^0.1\n",
+    );
+    let flow = fixture.root.join("flow/dataflow.yml");
+    let out = dora(&fixture)
+        .args([
+            "build",
+            flow.to_str().unwrap(),
+            "--coordinator-addr",
+            "127.0.0.1",
+            // a package that matches no node in the dataflow
+            "--hub-override",
+            &format!("test/not-a-node={}", checkout.display()),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "must reject --hub-override + remote coordinator regardless of match"
+    );
+    assert!(
+        stderr(&out).contains("remote") && stderr(&out).contains("coordinator"),
+        "expected a remote-coordinator rejection, got: {}",
+        stderr(&out)
+    );
+}
+
+fn stderr(out: &std::process::Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}

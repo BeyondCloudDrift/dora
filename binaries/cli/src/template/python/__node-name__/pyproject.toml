@@ -5,9 +5,9 @@ authors = [{ name = "Your Name", email = "email@email.com" }]
 description = "Node Name"
 license = { text = "MIT" }
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.11"
 
-dependencies = ["dora-rs >= 0.3.9"]
+dependencies = ["dora-rs >= 0.2.0"]
 
 [dependency-groups]
 dev = ["pytest >=8.1.1", "ruff >=0.9.1"]

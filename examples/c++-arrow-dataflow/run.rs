@@ -1,5 +1,6 @@
+use dora_cli::{Executable, RunCommand};
 use eyre::{Context, bail};
-use std::{env::consts::EXE_SUFFIX, path::Path, process::Command};
+use std::{env::consts::EXE_SUFFIX, path::Path, process::Command, time::Duration};
 
 struct ArrowConfig {
     cflags: String,
@@ -43,7 +44,7 @@ fn main() -> eyre::Result<()> {
         "node_rust_api",
         &[
             "-I",
-            &node_cxxbridge.as_os_str().to_str().unwrap(),
+            node_cxxbridge.as_os_str().to_str().unwrap(),
             "-l",
             "dora_node_api_cxx",
             &arrow_config.cflags,
@@ -51,7 +52,12 @@ fn main() -> eyre::Result<()> {
         ],
     )?;
 
-    dora_cli::run("dataflow.yml".to_string(), false)?;
+    // Bound the run so a wedged node fails fast via the daemon's stop
+    // escalation instead of hanging until the CI step timeout (#2152).
+    // A healthy run self-terminates quickly.
+    let mut run = RunCommand::new("dataflow.yml".to_string());
+    run.stop_after = Some(Duration::from_secs(120));
+    run.execute()?;
 
     Ok(())
 }
@@ -98,7 +104,7 @@ fn build_package(package: &str) -> eyre::Result<()> {
 fn build_cxx_node(root: &Path, paths: &[&Path], out_name: &str, args: &[&str]) -> eyre::Result<()> {
     let mut clang = std::process::Command::new("clang++");
     clang.args(paths);
-    clang.arg("-std=c++17");
+    clang.arg("-std=c++20");
     #[cfg(target_os = "linux")]
     {
         clang.arg("-l").arg("m");

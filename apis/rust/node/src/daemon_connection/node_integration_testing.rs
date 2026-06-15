@@ -16,7 +16,7 @@ use dora_message::{
     common::{DataMessage, Timestamped},
     daemon_to_node::{DaemonReply, NodeEvent},
     integration_testing_format::{
-        IncomingEvent, InputData, IntegrationTestInput, TimedIncomingEvent,
+        IncomingEvent, InputData, IntegrationTestInput, RecordingStatus, TimedIncomingEvent,
     },
     metadata::{ArrowTypeInfo, Metadata},
     node_to_daemon::DaemonRequest,
@@ -53,6 +53,30 @@ impl IntegrationTestingEvents {
             TestingInput::Input(input) => input,
         };
 
+        // Refuse to replay poisoned recordings. The `events` array is
+        // known incomplete relative to the original run; loading it
+        // anyway would defeat the whole point of recording (#1857).
+        // Hand-authored fixtures and pre-#1857 recordings have
+        // `recording_status: None` and pass through cleanly.
+        if let Some(boxed) = &node_info.recording_status
+            && let RecordingStatus::Poisoned {
+                first_failure_event_index,
+                first_failure_time_offset_secs,
+                first_failure_error,
+                additional_failures,
+            } = boxed.as_ref()
+        {
+            eyre::bail!(
+                "refusing to replay poisoned recording for node `{node_id}`: \
+                 the original recorder failed at event index {first_failure_event_index} \
+                 (~{first_failure_time_offset_secs:.3}s into the run), then \
+                 {additional_failures} additional event(s) also failed to record. \
+                 The `events` array is incomplete and replay will not reproduce \
+                 the original behavior. First failure: {first_failure_error}",
+                node_id = node_info.id,
+            );
+        }
+
         let output_writer = match output {
             TestingOutput::ToFile(output_file_path) => {
                 let file = File::create(&output_file_path)
@@ -85,8 +109,7 @@ impl IntegrationTestingEvents {
         let reply = match &request.inner {
             DaemonRequest::Register(_) => DaemonReply::Result(Ok(())),
             DaemonRequest::Subscribe => DaemonReply::Result(Ok(())),
-            DaemonRequest::SubscribeDrop => DaemonReply::Result(Ok(())),
-            DaemonRequest::NextEvent { .. } => {
+            DaemonRequest::NextEvent => {
                 let events = if let Some(event) = self.next_event()? {
                     vec![event]
                 } else {
@@ -99,6 +122,7 @@ impl IntegrationTestingEvents {
                 metadata,
                 data,
             } => self.handle_output(output_id, metadata, data)?,
+            DaemonRequest::OutputSent { .. } => DaemonReply::Empty,
             DaemonRequest::CloseOutputs(data_ids) => {
                 println!("{} {data_ids:?}", "node reports closed outputs".blue());
                 DaemonReply::Result(Ok(()))
@@ -106,14 +130,6 @@ impl IntegrationTestingEvents {
             DaemonRequest::OutputsDone => {
                 println!("{}", "node reports OutputsDone".blue());
                 DaemonReply::Result(Ok(()))
-            }
-            DaemonRequest::ReportDropTokens { drop_tokens } => {
-                println!("{} {drop_tokens:?}", "node reports drop tokens".blue());
-                DaemonReply::Empty
-            }
-            DaemonRequest::NextFinishedDropTokens => {
-                // interactive nodes don't use shared memory -> no drop tokens
-                DaemonReply::NextDropEvents(vec![])
             }
             DaemonRequest::EventStreamDropped => {
                 println!("{}", "node reports EventStreamDropped".blue());
@@ -135,10 +151,11 @@ impl IntegrationTestingEvents {
         let start_timestamp = self.start_timestamp;
         let skip_output_time_offsets = self.options.skip_output_time_offsets;
 
+        let arc_data = data.as_ref().map(|d| std::sync::Arc::new(d.clone()));
         let output = convert_output_to_json(
             output_id,
             metadata,
-            data,
+            &arc_data,
             start_timestamp,
             skip_output_time_offsets,
         )?;
@@ -197,8 +214,10 @@ impl IntegrationTestingEvents {
                 meta.parameters = metadata.unwrap_or_default();
                 NodeEvent::Input {
                     id,
-                    metadata: meta,
-                    data: data.map(|d| DataMessage::Vec(aligned_vec::AVec::from_slice(1, &d))),
+                    metadata: std::sync::Arc::new(meta),
+                    data: data.map(|d| {
+                        std::sync::Arc::new(DataMessage::Vec(aligned_vec::AVec::from_slice(1, &d)))
+                    }),
                 }
             }
             IncomingEvent::InputClosed { id } => NodeEvent::InputClosed { id },
@@ -219,7 +238,7 @@ enum OutputWriter {
 pub fn convert_output_to_json(
     output_id: &dora_message::id::DataId,
     metadata: &Metadata,
-    data: &Option<DataMessage>,
+    data: &Option<std::sync::Arc<DataMessage>>,
     start_timestamp: Timestamp,
     skip_output_time_offsets: bool,
 ) -> eyre::Result<serde_json::Map<String, serde_json::Value>> {
@@ -230,11 +249,9 @@ pub fn convert_output_to_json(
         output.insert("time_offset_secs".into(), time_offset.as_secs_f64().into());
     }
     if data.is_some() {
-        let (drop_tx, drop_rx) = flume::unbounded();
-        let data_array = data_to_arrow_array(data.clone(), metadata, drop_tx)
-            .context("failed to convert output to arrow array")?;
-        // integration testing doesn't use shared memory -> no drop tokens
-        let _ = drop_rx;
+        let data_array =
+            data_to_arrow_array(data.clone().map(std::sync::Arc::unwrap_or_clone), metadata)
+                .context("failed to convert output to arrow array")?;
 
         let data_type_json = serde_json::to_value(data_array.data_type())
             .context("failed to serialize data type as JSON")?;

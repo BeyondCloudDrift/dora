@@ -14,28 +14,29 @@ links = "dora-ros2-bridge"
 [features]
 default = ["generate-messages"]
 generate-messages = ["dep:dora-ros2-bridge-msg-gen", "dep:rust-format"]
+ros2-examples = []
 
 [dependencies]
 array-init = "2.1.0"
-serde = { version = "1.0.164", features = ["derive"] }
+serde = { workspace = true }
 serde-big-array = "0.5.1"
 widestring = "1.0.2"
 ros2-client = "0.8.0"
 rustdds = "=0.11.4" # pinned because of https://github.com/Atostek/RustDDS/issues/375
-eyre = { version = "0.6.8" }
-tracing = "0.1.37"
+eyre = { workspace = true }
+tracing = { workspace = true }
 tracing-subscriber = "0.3.20"
 flume = "0.11.0"
-futures = { version = "0.3.21", features = ["thread-pool"] }
+futures = { workspace = true, features = ["thread-pool"] }
 futures-timer = "3.0.3"
 
 [dev-dependencies]
 dora-daemon = { workspace = true }
-tokio = { version = "1.29.1", features = ["full"] }
+tokio = { workspace = true, features = ["full"] }
 dora-cli = { workspace = true }
 dunce = "1.0.2"
 rand = "0.8.5"
-futures = { version = "0.3.28", default-features = false }
+futures = { workspace = true }
 process-wrap = { version = "8.2.1", features = ["std", "tokio1"] }
 
 [build-dependencies]
@@ -65,9 +66,64 @@ name = "rust-ros2-dataflow-service-server"
 path = "../../../examples/ros2-bridge/rust/service-server/run.rs"
 
 [[example]]
+name = "rust-ros2-dataflow-action-client"
+path = "../../../examples/ros2-bridge/rust/action-client/run.rs"
+required-features = ["ros2-examples"]
+
+[[example]]
+name = "rust-ros2-dataflow-action-server"
+path = "../../../examples/ros2-bridge/rust/action-server/run.rs"
+required-features = ["ros2-examples"]
+
+[[example]]
+name = "rust-ros2-dataflow-parameter"
+path = "../../../examples/ros2-bridge/rust/parameter/run.rs"
+
+[[example]]
 name = "python-ros2-dataflow"
 path = "../../../examples/ros2-bridge/python/turtle/run.rs"
 
 [[example]]
+name = "python-ros2-dataflow-service-client"
+path = "../../../examples/ros2-bridge/python/service-client/run.rs"
+
+[[example]]
+name = "python-ros2-dataflow-service-server"
+path = "../../../examples/ros2-bridge/python/service-server/run.rs"
+
+[[example]]
+name = "python-ros2-dataflow-action-client"
+path = "../../../examples/ros2-bridge/python/action-client/run.rs"
+
+[[example]]
+name = "python-ros2-dataflow-action-server"
+path = "../../../examples/ros2-bridge/python/action-server/run.rs"
+
+[[example]]
+name = "python-ros2-dataflow-parameter"
+path = "../../../examples/ros2-bridge/python/parameter/run.rs"
+
+[[example]]
 name = "cxx-ros2-dataflow"
 path = "../../../examples/ros2-bridge/c++/turtle/run.rs"
+required-features = ["ros2-examples"]
+
+[[example]]
+name = "cxx-ros2-dataflow-action-client"
+path = "../../../examples/ros2-bridge/c++/action-client/run.rs"
+required-features = ["ros2-examples"]
+
+[[example]]
+name = "cxx-ros2-dataflow-action-client-concurrent"
+path = "../../../examples/ros2-bridge/c++/action-client-concurrent/run.rs"
+required-features = ["ros2-examples"]
+
+[[example]]
+name = "cxx-ros2-dataflow-service-server"
+path = "../../../examples/ros2-bridge/c++/service-server/run.rs"
+required-features = ["ros2-examples"]
+
+[[example]]
+name = "cxx-ros2-dataflow-action-server"
+path = "../../../examples/ros2-bridge/c++/action-server/run.rs"
+required-features = ["ros2-examples"]
