@@ -1112,12 +1112,55 @@ dora hub info <pkg>[@<ver>]                # contracts + example for a package
 dora hub list <dataflow.yml>               # hub packages pinned in the lockfile
 dora hub fetch <dataflow.yml | pkg@ver>    # warm the index cache + mirror sources
                [--target-dir DIR]
+dora hub publish [PATH] [--dry-run]        # validate + add a pinned index entry
+                 [--rev REF] [--repo URL]
+                 [--version SEMVER] [--index ALIAS]
+dora hub yank <pkg>@<version>              # yank/restore a published version
+              [--reason R] [--undo]
+dora hub outdated <dataflow.yml>           # locked hub pins behind the index
+                  [--offline]
+dora hub update <dataflow.yml>             # re-resolve hub pins + rewrite lockfile
+                [--offline] [--dry-run]
 ```
+
+`yank` flips the `yanked` flag on a published version: new resolutions skip it,
+an existing `--locked` pin keeps working but `dora build` warns; `--undo`
+restores it (the one mutation an index entry allows, §7.5). For a local
+(`path =`) index the flag is flipped in place; for a git-backed index it prints
+the flag-flip change to open as a PR.
+
+`outdated` reads a dataflow's lockfile and, for each pinned hub package,
+compares the pin against the latest non-yanked **stable** version in the index
+(ignoring the dataflow's range, so a major/minor bump still shows up;
+pre-releases are not reported, matching resolution). Update the `hub:` range and
+rebuild to upgrade. Exits non-zero if any package could not be checked.
+
+`update` runs the same resolve / contract / type-check / lockfile pipeline as
+`dora build --write-lockfile` — re-resolving every hub node to the latest
+version satisfying the descriptor's `hub:` range (and any plain `git:` nodes to
+their current ref) — then stops *before* building. The lockfile it writes is
+therefore identical to a real build's, and consumable under `dora build
+--locked`. Because it re-checks each package's contract, it fails if a newer
+version's manifest no longer matches the wiring (rather than locking a version
+that won't build). `--dry-run` resolves and reports without writing.
+(Per-package filtering — `update <pkg>` — is not yet implemented; it re-resolves
+all hub nodes.)
 
 `init` pre-fills the name, runtime, and entrypoint from `pyproject.toml` /
 `Cargo.toml` when present and the namespace from the `origin` git remote;
 typed inputs/outputs are left as commented examples. Check the result with
 `dora validate --node-manifest dora-node.yml`.
+
+`publish` validates the manifest, reads the version from `[package].version`
+(Cargo) / `[project].version` (pyproject), resolves the source pin (the
+`origin` remote or `--repo`, the `--rev`/`HEAD` commit, and the directory's
+subdir within the repo), and produces the index entry
+`<namespace>/<name>/<version>.yml`. `--dry-run` prints the entry without
+writing it. Otherwise it writes into a **local** (`path =`) index — the
+enterprise/private and fixture form — and refuses to overwrite an existing
+version (the index is append-only). For a git-backed index it prints the entry
+and where to add it; automated PR-opening against the official `node-index`
+lands with the index bootstrap.
 
 `search`/`info`/`fetch` accept `--offline` to use only the cached index.
 Indexes are configured in `~/.config/dora/hub.toml`; a namespace resolves

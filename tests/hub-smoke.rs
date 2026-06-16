@@ -614,6 +614,640 @@ fn hub_override_rejects_remote_coordinator_even_if_unmatched() {
     );
 }
 
+/// `dora hub publish --dry-run` validates the manifest and previews the index
+/// entry (the version from Cargo.toml, the resolved git pin + subdir) without
+/// writing anything (P3.1).
+#[test]
+fn hub_publish_dry_run_previews_entry() {
+    if Command::new("git").arg("--version").output().is_err() {
+        eprintln!("git not available — skipping hub publish dry-run test");
+        return;
+    }
+    let fixture = build_fixture();
+    let src = fixture.root.join("source");
+    let checkout = src.join("node-hub/hello");
+    let out = dora(&fixture)
+        .args([
+            "hub",
+            "publish",
+            checkout.to_str().unwrap(),
+            "--dry-run",
+            "--repo",
+            &format!("file://{}", src.display()),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "publish --dry-run failed: {}",
+        stderr(&out)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // version 0.1.0 from Cargo.toml; subdir from the repo layout; name/namespace
+    assert!(
+        stdout.contains("test/hub-smoke-hello/0.1.0.yml"),
+        "expected the entry path in the preview:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("subdir: node-hub/hello"),
+        "expected the resolved subdir in the preview:\n{stdout}"
+    );
+    // dry run must not have written anything into the index
+    assert!(
+        !fixture
+            .root
+            .join("index/test/hub-smoke-hello/0.2.0.yml")
+            .exists(),
+        "dry-run must not write entries"
+    );
+}
+
+/// End-to-end: `dora hub publish` writes a pinned index entry that `dora build`
+/// then resolves and builds — the publish→consume loop, fully local (P3.1).
+#[test]
+fn hub_publish_then_build_resolves() {
+    if Command::new("git").arg("--version").output().is_err() {
+        eprintln!("git not available — skipping hub publish→build test");
+        return;
+    }
+    let fixture = build_fixture();
+    let src = fixture.root.join("source");
+    let checkout = src.join("node-hub/hello");
+
+    // remove the fixture's pre-written entry so `publish` creates it fresh
+    let entry = fixture.root.join("index/test/hub-smoke-hello/0.1.0.yml");
+    std::fs::remove_file(&entry).unwrap();
+
+    let out = dora(&fixture)
+        .args([
+            "hub",
+            "publish",
+            checkout.to_str().unwrap(),
+            "--repo",
+            &format!("file://{}", src.display()),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "publish failed: {}", stderr(&out));
+    assert!(entry.exists(), "publish did not write the index entry");
+    let written = std::fs::read_to_string(&entry).unwrap();
+    assert!(
+        written.contains("subdir: node-hub/hello"),
+        "entry: {written}"
+    );
+    assert!(
+        written.contains("name: hub-smoke-hello"),
+        "entry must hold the manifest: {written}"
+    );
+
+    // append-only: re-publishing the same version is refused
+    let out = dora(&fixture)
+        .args([
+            "hub",
+            "publish",
+            checkout.to_str().unwrap(),
+            "--repo",
+            &format!("file://{}", src.display()),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "re-publishing same version must fail"
+    );
+    assert!(
+        stderr(&out).contains("already exists"),
+        "expected append-only rejection, got: {}",
+        stderr(&out)
+    );
+
+    // the published entry resolves end-to-end through `dora build`
+    write(
+        &fixture.root.join("flow/dataflow.yml"),
+        "nodes:\n  - id: hello\n    hub: test/hub-smoke-hello@^0.1\n",
+    );
+    let flow = fixture.root.join("flow/dataflow.yml");
+    let out = dora(&fixture)
+        .args(["build", flow.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "build of a freshly-published package failed: {}",
+        stderr(&out)
+    );
+}
+
+/// `dora hub publish` reads the manifest and version from the *committed*
+/// source at `source.rev`, not the working tree. A dirty version bump must not
+/// produce an immutable entry whose version doesn't exist at the pinned commit.
+#[test]
+fn hub_publish_reads_committed_source_not_worktree() {
+    if Command::new("git").arg("--version").output().is_err() {
+        eprintln!("git not available — skipping hub publish dirty-tree test");
+        return;
+    }
+    let fixture = build_fixture();
+    let src = fixture.root.join("source");
+    let checkout = src.join("node-hub/hello");
+
+    // free the committed version's slot so publish can write it fresh
+    std::fs::remove_file(fixture.root.join("index/test/hub-smoke-hello/0.1.0.yml")).unwrap();
+
+    // bump the version in the working tree WITHOUT committing it
+    write(
+        &checkout.join("Cargo.toml"),
+        "[package]\nname = \"hub-smoke-hello\"\nversion = \"0.9.9\"\nedition = \"2021\"\n\
+         \n[[bin]]\nname = \"hub-smoke-hello\"\npath = \"src/main.rs\"\n\n[workspace]\n",
+    );
+
+    let out = dora(&fixture)
+        .args([
+            "hub",
+            "publish",
+            checkout.to_str().unwrap(),
+            "--repo",
+            &format!("file://{}", src.display()),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "publish failed: {}", stderr(&out));
+    // the committed 0.1.0 is published; the uncommitted 0.9.9 is ignored
+    assert!(
+        fixture
+            .root
+            .join("index/test/hub-smoke-hello/0.1.0.yml")
+            .exists(),
+        "publish must use the committed version (0.1.0)"
+    );
+    assert!(
+        !fixture
+            .root
+            .join("index/test/hub-smoke-hello/0.9.9.yml")
+            .exists(),
+        "publish must not embed the uncommitted working-tree version (0.9.9)"
+    );
+}
+
+/// `--index` must not let a namespace be seeded into an index it isn't bound to
+/// (spec §7.3). The `test` namespace is bound to the local `smoke` index, so
+/// publishing it into the `official` index is rejected.
+#[test]
+fn hub_publish_rejects_index_not_bound_to_namespace() {
+    if Command::new("git").arg("--version").output().is_err() {
+        eprintln!("git not available — skipping hub publish wrong-index test");
+        return;
+    }
+    let fixture = build_fixture();
+    let src = fixture.root.join("source");
+    let checkout = src.join("node-hub/hello");
+    let out = dora(&fixture)
+        .args([
+            "hub",
+            "publish",
+            checkout.to_str().unwrap(),
+            "--repo",
+            &format!("file://{}", src.display()),
+            "--index",
+            "official",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "publishing into an unbound index must fail"
+    );
+    assert!(
+        stderr(&out).contains("is bound to index"),
+        "expected a namespace-binding rejection, got: {}",
+        stderr(&out)
+    );
+}
+
+/// `dora hub yank` flips the `yanked` flag on a local index entry: a fresh
+/// resolve then skips the version (build fails when nothing else satisfies the
+/// range), and `--undo` restores it (UC10).
+#[test]
+fn hub_yank_skips_version_then_undo_restores() {
+    if Command::new("git").arg("--version").output().is_err() {
+        eprintln!("git not available — skipping hub yank test");
+        return;
+    }
+    let fixture = build_fixture();
+    let entry = fixture.root.join("index/test/hub-smoke-hello/0.1.0.yml");
+    write(
+        &fixture.root.join("flow/dataflow.yml"),
+        "nodes:\n  - id: hello\n    hub: test/hub-smoke-hello@^0.1\n",
+    );
+    let flow = fixture.root.join("flow/dataflow.yml");
+
+    // baseline: builds before the yank
+    assert!(
+        dora(&fixture)
+            .args(["build", flow.to_str().unwrap()])
+            .output()
+            .unwrap()
+            .status
+            .success(),
+        "baseline build should succeed"
+    );
+
+    // yank it
+    let out = dora(&fixture)
+        .args([
+            "hub",
+            "yank",
+            "test/hub-smoke-hello@0.1.0",
+            "--reason",
+            "broken",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "yank failed: {}", stderr(&out));
+    let written = std::fs::read_to_string(&entry).unwrap();
+    assert!(written.contains("yanked: true"), "entry: {written}");
+    assert!(written.contains("broken"), "yank reason missing: {written}");
+
+    // a fresh resolve now finds no non-yanked version satisfying `^0.1`
+    let out = dora(&fixture)
+        .args(["build", flow.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "build must fail when the only matching version is yanked"
+    );
+
+    // undo restores it
+    let out = dora(&fixture)
+        .args(["hub", "yank", "test/hub-smoke-hello@0.1.0", "--undo"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "undo failed: {}", stderr(&out));
+    assert!(
+        std::fs::read_to_string(&entry)
+            .unwrap()
+            .contains("yanked: false"),
+        "undo did not clear the flag"
+    );
+    assert!(
+        dora(&fixture)
+            .args(["build", flow.to_str().unwrap()])
+            .output()
+            .unwrap()
+            .status
+            .success(),
+        "build should succeed again after undo"
+    );
+}
+
+/// Re-yanking an already-yanked version with a *different* `--reason` updates
+/// the recorded reason instead of silently discarding it.
+#[test]
+fn hub_yank_updates_reason_when_already_yanked() {
+    if Command::new("git").arg("--version").output().is_err() {
+        eprintln!("git not available — skipping hub yank reason-update test");
+        return;
+    }
+    let fixture = build_fixture();
+    let entry = fixture.root.join("index/test/hub-smoke-hello/0.1.0.yml");
+
+    let yank = |reason: &str| {
+        dora(&fixture)
+            .args([
+                "hub",
+                "yank",
+                "test/hub-smoke-hello@0.1.0",
+                "--reason",
+                reason,
+            ])
+            .output()
+            .unwrap()
+    };
+
+    assert!(yank("first").status.success(), "initial yank failed");
+    // re-yank with a corrected reason — must take effect, not no-op
+    let out = yank("corrected");
+    assert!(out.status.success(), "re-yank failed: {}", stderr(&out));
+    let written = std::fs::read_to_string(&entry).unwrap();
+    assert!(
+        written.contains("corrected") && !written.contains("first"),
+        "re-yank must update the reason, got: {written}"
+    );
+}
+
+/// A yank reference with `..` path segments must be rejected before any file
+/// is touched — the write path can't be allowed to escape the catalog root.
+#[test]
+fn hub_yank_rejects_path_traversal() {
+    let fixture = build_fixture();
+    for bad in ["../..@0.1.0", "../x@0.1.0", "..@0.1.0"] {
+        let out = dora(&fixture).args(["hub", "yank", bad]).output().unwrap();
+        assert!(!out.status.success(), "`{bad}` must be rejected");
+        // it must be rejected by the key-part guard (not merely a missing file),
+        // proving the traversal never reached a filesystem path
+        assert!(
+            stderr(&out).contains("invalid package"),
+            "`{bad}` should be rejected by the key-part guard, got: {}",
+            stderr(&out)
+        );
+    }
+}
+
+/// A symlinked package directory resolving outside the catalog root must be
+/// rejected — the `..` guard blocks lexical traversal; this blocks symlink
+/// escape, matching the read-path confinement.
+#[cfg(unix)]
+#[test]
+fn hub_yank_rejects_symlink_escape() {
+    let fixture = build_fixture();
+    // a target entry that lives OUTSIDE the catalog root
+    let outside = fixture.root.join("outside/test/hub-smoke-hello");
+    write(&outside.join("0.1.0.yml"), "manifest: {}\nsource: {}\n");
+    // replace the in-catalog package dir with a symlink to that outside dir
+    let pkg_dir = fixture.root.join("index/test/hub-smoke-hello");
+    std::fs::remove_dir_all(&pkg_dir).unwrap();
+    std::os::unix::fs::symlink(&outside, &pkg_dir).unwrap();
+
+    let out = dora(&fixture)
+        .args(["hub", "yank", "test/hub-smoke-hello@0.1.0"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "symlink escape must be rejected");
+    assert!(
+        stderr(&out).contains("escapes the catalog root"),
+        "expected catalog-confinement rejection, got: {}",
+        stderr(&out)
+    );
+}
+
+/// Yanking against a git-backed index (the official one) can't flip a file in
+/// place — it prints the flag-flip PR instructions instead.
+#[test]
+fn hub_yank_git_index_prints_pr_instructions() {
+    let fixture = build_fixture();
+    let out = dora(&fixture)
+        .args(["hub", "yank", "dora-rs/some-node@1.0.0"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "yank git-index failed: {}",
+        stderr(&out)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("git-backed") && stdout.contains("yanked: true"),
+        "expected flag-flip PR instructions, got:\n{stdout}"
+    );
+}
+
+/// `dora hub outdated` reports a hub pin that is behind the index's latest
+/// non-yanked version, and says nothing when up to date (P3.2).
+#[test]
+fn hub_outdated_reports_newer_version() {
+    if Command::new("git").arg("--version").output().is_err() {
+        eprintln!("git not available — skipping hub outdated test");
+        return;
+    }
+    let fixture = build_fixture();
+    write(
+        &fixture.root.join("flow/dataflow.yml"),
+        "nodes:\n  - id: hello\n    hub: test/hub-smoke-hello@^0.1\n",
+    );
+    let flow = fixture.root.join("flow/dataflow.yml");
+    // pin 0.1.0 in the lockfile
+    assert!(
+        dora(&fixture)
+            .args(["build", flow.to_str().unwrap(), "--write-lockfile"])
+            .output()
+            .unwrap()
+            .status
+            .success(),
+        "build --write-lockfile should succeed"
+    );
+
+    // only 0.1.0 exists -> up to date
+    let out = dora(&fixture)
+        .args(["hub", "outdated", flow.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "outdated failed: {}", stderr(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("up to date"),
+        "expected up-to-date, got:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // add a newer version into the index (copy the 0.1.0 entry to 0.2.0)
+    let entry_010 = fixture.root.join("index/test/hub-smoke-hello/0.1.0.yml");
+    let entry_020 = fixture.root.join("index/test/hub-smoke-hello/0.2.0.yml");
+    std::fs::copy(&entry_010, &entry_020).unwrap();
+
+    let out = dora(&fixture)
+        .args(["hub", "outdated", flow.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "outdated failed: {}", stderr(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("0.1.0 -> 0.2.0") && stdout.contains("newer available"),
+        "expected an outdated report, got:\n{stdout}"
+    );
+}
+
+/// A check that can't complete (the pinned package is gone from the index) must
+/// exit non-zero and must NOT be summarized as "up to date" (P3.2).
+#[test]
+fn hub_outdated_errors_when_pin_unresolvable() {
+    if Command::new("git").arg("--version").output().is_err() {
+        eprintln!("git not available — skipping hub outdated error test");
+        return;
+    }
+    let fixture = build_fixture();
+    write(
+        &fixture.root.join("flow/dataflow.yml"),
+        "nodes:\n  - id: hello\n    hub: test/hub-smoke-hello@^0.1\n",
+    );
+    let flow = fixture.root.join("flow/dataflow.yml");
+    assert!(
+        dora(&fixture)
+            .args(["build", flow.to_str().unwrap(), "--write-lockfile"])
+            .output()
+            .unwrap()
+            .status
+            .success(),
+        "build --write-lockfile should succeed"
+    );
+
+    // remove the index entry so the pin can no longer be resolved
+    std::fs::remove_file(fixture.root.join("index/test/hub-smoke-hello/0.1.0.yml")).unwrap();
+
+    let out = dora(&fixture)
+        .args(["hub", "outdated", flow.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "a failed check must exit non-zero");
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("up to date"),
+        "a failed check must not be summarized as up to date:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// `dora hub update` re-resolves hub pins to the latest in-range version and
+/// rewrites the lockfile without building; a later `dora build --locked` then
+/// accepts the refreshed lockfile, and re-running update is a no-op (P3.2).
+#[test]
+fn hub_update_bumps_pin_and_stays_locked_compatible() {
+    if Command::new("git").arg("--version").output().is_err() {
+        eprintln!("git not available — skipping hub update test");
+        return;
+    }
+    let fixture = build_fixture();
+    write(
+        &fixture.root.join("flow/dataflow.yml"),
+        "nodes:\n  - id: hello\n    hub: test/hub-smoke-hello@^0.1\n",
+    );
+    let flow = fixture.root.join("flow/dataflow.yml");
+    let lockfile = fixture.root.join("flow/dataflow.dora-lock.yaml");
+
+    // pin 0.1.0
+    assert!(
+        dora(&fixture)
+            .args(["build", flow.to_str().unwrap(), "--write-lockfile"])
+            .output()
+            .unwrap()
+            .status
+            .success(),
+        "initial build --write-lockfile should succeed"
+    );
+    assert!(
+        std::fs::read_to_string(&lockfile)
+            .unwrap()
+            .contains("version: 0.1.0"),
+        "lockfile should pin 0.1.0"
+    );
+
+    // a newer in-range version appears in the index (^0.1 admits 0.1.1)
+    std::fs::copy(
+        fixture.root.join("index/test/hub-smoke-hello/0.1.0.yml"),
+        fixture.root.join("index/test/hub-smoke-hello/0.1.1.yml"),
+    )
+    .unwrap();
+
+    // update bumps the pin (no build)
+    let out = dora(&fixture)
+        .args(["hub", "update", flow.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "update failed: {}", stderr(&out));
+    let after_update = std::fs::read_to_string(&lockfile).unwrap();
+    assert!(
+        after_update.contains("version: 0.1.1"),
+        "update should bump the pin to 0.1.1"
+    );
+
+    // the real invariant: `update`'s lockfile is byte-identical to what
+    // `dora build --write-lockfile` writes for the same descriptor + index
+    // state (build re-resolves hub nodes fresh when not `--locked`). A wrong
+    // commit/subdir/fingerprint would diverge here even though `--locked`
+    // treats those as warn-only.
+    let out = dora(&fixture)
+        .args(["build", flow.to_str().unwrap(), "--write-lockfile"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "reference build failed: {}",
+        stderr(&out)
+    );
+    let after_build = std::fs::read_to_string(&lockfile).unwrap();
+    assert_eq!(
+        after_update, after_build,
+        "update must write the same lockfile bytes as `dora build --write-lockfile`"
+    );
+
+    // and the refreshed lockfile is consumable under `--locked`
+    let out = dora(&fixture)
+        .args(["build", flow.to_str().unwrap(), "--locked"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "build --locked after update failed: {}",
+        stderr(&out)
+    );
+
+    // re-running update is idempotent: still resolves to 0.1.1, same lockfile
+    let before = std::fs::read_to_string(&lockfile).unwrap();
+    let out = dora(&fixture)
+        .args(["hub", "update", flow.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "second update failed: {}",
+        stderr(&out)
+    );
+    assert_eq!(
+        before,
+        std::fs::read_to_string(&lockfile).unwrap(),
+        "re-running update on an up-to-date lockfile must not change it"
+    );
+}
+
+/// `dora hub update --dry-run` is read-only: it neither rewrites the lockfile
+/// nor creates the build session file (the resolve stops before the session
+/// read that would write `out/<name>.dora-session.yaml`) (P3.2).
+#[test]
+fn hub_update_dry_run_is_read_only() {
+    if Command::new("git").arg("--version").output().is_err() {
+        eprintln!("git not available — skipping hub update dry-run test");
+        return;
+    }
+    let fixture = build_fixture();
+    write(
+        &fixture.root.join("flow/dataflow.yml"),
+        "nodes:\n  - id: hello\n    hub: test/hub-smoke-hello@^0.1\n",
+    );
+    let flow = fixture.root.join("flow/dataflow.yml");
+    let lockfile = fixture.root.join("flow/dataflow.dora-lock.yaml");
+    assert!(
+        dora(&fixture)
+            .args(["build", flow.to_str().unwrap(), "--write-lockfile"])
+            .output()
+            .unwrap()
+            .status
+            .success(),
+        "build --write-lockfile should succeed"
+    );
+
+    // clean slate: drop the build's `out/` so we can prove dry-run won't recreate it
+    std::fs::remove_dir_all(fixture.root.join("flow/out")).ok();
+    let session = fixture.root.join("flow/out/dataflow.dora-session.yaml");
+    let before = std::fs::read_to_string(&lockfile).unwrap();
+
+    let out = dora(&fixture)
+        .args(["hub", "update", flow.to_str().unwrap(), "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "update --dry-run failed: {}",
+        stderr(&out)
+    );
+    assert_eq!(
+        before,
+        std::fs::read_to_string(&lockfile).unwrap(),
+        "--dry-run must not rewrite the lockfile"
+    );
+    assert!(
+        !session.exists(),
+        "--dry-run must not create the build session file"
+    );
+}
+
 fn stderr(out: &std::process::Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
