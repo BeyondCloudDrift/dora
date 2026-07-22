@@ -1,3 +1,48 @@
+//! Binary `.drec` recording format for dora dataflow message capture and replay.
+//!
+//! A recording is a [`RecordingHeader`], a sequence of [`RecordEntry`] records,
+//! and an optional [`RecordingFooter`]. Capture a stream with
+//! [`RecordingWriter`] and read it back with [`RecordingReader`]. Both are
+//! generic over any [`std::io::Write`] / [`std::io::Read`], so they work with
+//! files as well as in-memory buffers.
+//!
+//! ```
+//! use dora_recording::{RecordEntry, RecordingHeader, RecordingReader, RecordingWriter};
+//! use std::io::Cursor;
+//!
+//! # fn main() -> eyre::Result<()> {
+//! let header = RecordingHeader {
+//!     version: 1,
+//!     start_nanos: 0,
+//!     dataflow_id: uuid::Uuid::nil(),
+//!     descriptor_yaml: b"nodes: []".to_vec(),
+//! };
+//!
+//! // Write one entry into an in-memory buffer.
+//! let mut buf: Vec<u8> = Vec::new();
+//! {
+//!     let mut writer = RecordingWriter::new(&mut buf, &header)?;
+//!     writer.write_entry(&RecordEntry {
+//!         node_id: "camera".to_string(),
+//!         output_id: "image".to_string(),
+//!         timestamp_offset_nanos: 0,
+//!         event_bytes: vec![1, 2, 3],
+//!     })?;
+//!     let footer = writer.finish()?;
+//!     assert_eq!(footer.total_messages, 1);
+//! }
+//!
+//! // Read it back.
+//! let mut reader = RecordingReader::open(Cursor::new(buf))?;
+//! assert_eq!(reader.header().dataflow_id, uuid::Uuid::nil());
+//! let entry = reader.next_entry()?.expect("one entry");
+//! assert_eq!(entry.node_id, "camera");
+//! assert_eq!(entry.event_bytes, vec![1, 2, 3]);
+//! assert!(reader.next_entry()?.is_none());
+//! # Ok(())
+//! # }
+//! ```
+
 use std::io::{self, BufReader, BufWriter, Read, Write};
 
 use eyre::Context;
@@ -43,6 +88,7 @@ pub struct RecordingWriter<W: Write> {
 }
 
 impl<W: Write> RecordingWriter<W> {
+    /// Create a writer over `inner`, immediately writing the recording header.
     pub fn new(inner: W, header: &RecordingHeader) -> eyre::Result<Self> {
         let mut writer = BufWriter::new(inner);
         write_header(&mut writer, header)?;
@@ -53,6 +99,7 @@ impl<W: Write> RecordingWriter<W> {
         })
     }
 
+    /// Append a single message entry to the recording.
     pub fn write_entry(&mut self, entry: &RecordEntry) -> eyre::Result<()> {
         let node_id_bytes = entry.node_id.as_bytes();
         let output_id_bytes = entry.output_id.as_bytes();
@@ -67,12 +114,25 @@ impl<W: Write> RecordingWriter<W> {
         let record_len = u32::try_from(record_len_usize)
             .map_err(|_| eyre::eyre!("record length {record_len_usize} exceeds u32::MAX"))?;
 
+        let node_len = u16::try_from(node_id_bytes.len()).map_err(|_| {
+            eyre::eyre!(
+                "node_id too long: {} bytes (max {})",
+                node_id_bytes.len(),
+                u16::MAX
+            )
+        })?;
+        let output_len = u16::try_from(output_id_bytes.len()).map_err(|_| {
+            eyre::eyre!(
+                "output_id too long: {} bytes (max {})",
+                output_id_bytes.len(),
+                u16::MAX
+            )
+        })?;
+
         self.writer.write_all(&record_len.to_le_bytes())?;
-        self.writer
-            .write_all(&(node_id_bytes.len() as u16).to_le_bytes())?;
+        self.writer.write_all(&node_len.to_le_bytes())?;
         self.writer.write_all(node_id_bytes)?;
-        self.writer
-            .write_all(&(output_id_bytes.len() as u16).to_le_bytes())?;
+        self.writer.write_all(&output_len.to_le_bytes())?;
         self.writer.write_all(output_id_bytes)?;
         self.writer
             .write_all(&entry.timestamp_offset_nanos.to_le_bytes())?;
@@ -85,6 +145,7 @@ impl<W: Write> RecordingWriter<W> {
         Ok(())
     }
 
+    /// Write the footer (message/byte totals), flush, and consume the writer.
     pub fn finish(mut self) -> eyre::Result<RecordingFooter> {
         let footer = RecordingFooter {
             total_messages: self.total_messages,
@@ -98,12 +159,9 @@ impl<W: Write> RecordingWriter<W> {
         Ok(footer)
     }
 
+    /// Flush buffered bytes to the underlying writer without finishing.
     pub fn flush(&mut self) -> eyre::Result<()> {
         self.writer.flush().wrap_err("flush failed")
-    }
-
-    pub fn stats(&self) -> (u64, u64) {
-        (self.total_messages, self.total_bytes)
     }
 }
 
@@ -115,12 +173,14 @@ pub struct RecordingReader<R: Read> {
 }
 
 impl<R: Read> RecordingReader<R> {
+    /// Open a reader over `inner`, immediately parsing and validating the header.
     pub fn open(inner: R) -> eyre::Result<Self> {
         let mut reader = BufReader::new(inner);
         let header = read_header(&mut reader)?;
         Ok(Self { reader, header })
     }
 
+    /// The recording header parsed by [`open`](Self::open).
     pub fn header(&self) -> &RecordingHeader {
         &self.header
     }
@@ -486,6 +546,38 @@ mod tests {
         assert!(
             err.to_string().contains("too large"),
             "expected 'too large' error, got: {err}"
+        );
+    }
+
+    /// `node_id` longer than `u16::MAX` bytes must return `Err`, not silently
+    /// truncate the length field and write a corrupt entry.
+    #[test]
+    fn writer_rejects_oversized_node_id() {
+        let header = sample_header();
+        let long_id = "x".repeat(usize::from(u16::MAX) + 1);
+        let entry = sample_entry(&long_id, "out", 0, b"data");
+        let mut buf = Vec::new();
+        let mut writer = RecordingWriter::new(&mut buf, &header).unwrap();
+        let err = writer.write_entry(&entry).unwrap_err();
+        assert!(
+            err.to_string().contains("node_id too long"),
+            "expected 'node_id too long' error, got: {err}"
+        );
+    }
+
+    /// `output_id` longer than `u16::MAX` bytes must return `Err`, not silently
+    /// truncate the length field and write a corrupt entry.
+    #[test]
+    fn writer_rejects_oversized_output_id() {
+        let header = sample_header();
+        let long_id = "y".repeat(usize::from(u16::MAX) + 1);
+        let entry = sample_entry("node", &long_id, 0, b"data");
+        let mut buf = Vec::new();
+        let mut writer = RecordingWriter::new(&mut buf, &header).unwrap();
+        let err = writer.write_entry(&entry).unwrap_err();
+        assert!(
+            err.to_string().contains("output_id too long"),
+            "expected 'output_id too long' error, got: {err}"
         );
     }
 

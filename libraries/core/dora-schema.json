@@ -88,6 +88,14 @@
             "$ref": "#/$defs/EnvValue"
           }
         },
+        "finish_grace_secs": {
+          "description": "Per-node finish-drain grace period in seconds.\n\nOverrides the global `DORA_FINISH_DRAIN_GRACE_SECS` for this node only.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
         "health_check_timeout": {
           "description": "Health check timeout in seconds.\n\nWhen set, the daemon monitors this node for activity. If the node does not\ncommunicate with the daemon within this timeout, it is killed and the restart\npolicy is evaluated.",
           "type": [
@@ -175,6 +183,13 @@
         "path": {
           "description": "Path of the source code\n\nIf you want to use a specific `conda` environment.\nProvide the python path within the source.\n\nsource: /home/peter/miniconda3/bin/python\n\nargs: some_node.py\n\nSource can match any executable in PATH.",
           "type": "string"
+        },
+        "path_sha256": {
+          "description": "SHA-256 the `path` download must match (set for hub binary artifacts,\nspec §8.2). When present the daemon fetches `path` as a verified URL\ndownload regardless of confinement — the checksum is the trust anchor.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "restart_delay": {
           "description": "Initial delay in seconds before restarting (exponential backoff).",
@@ -492,6 +507,14 @@
             "$ref": "#/$defs/EnvValue"
           }
         },
+        "finish_grace_secs": {
+          "description": "Per-node finish-drain grace period in seconds.\n\nOverrides the global `DORA_FINISH_DRAIN_GRACE_SECS` for this node only.\nWhen all other nodes in a dataflow have finished, the daemon waits this\nlong after the node's last input closes before force-stopping it.\n\nSet to a large value (e.g. `3600.0`) for nodes that need significant\npost-input compute time (ML training, large-batch inference, checkpoint\nwrites) to prevent premature SIGKILL while the computation is in progress.\n\nWhen unset, the global grace period applies (default 120s, controlled\nby `DORA_FINISH_DRAIN_GRACE_SECS`).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
         "git": {
           "description": "Git repository URL for downloading nodes.\n\nThe `git` key allows downloading nodes (i.e. their source code) from git repositories.\nThis can be especially useful for distributed dataflows.\n\nWhen a `git` key is specified, `dora build` automatically clones the specified repository\n(or reuse an existing clone).\nThen it checks out the specified [`branch`](Self::branch), [`tag`](Self::tag), or\n[`rev`](Self::rev), or the default branch if none of them are specified.\nAfterwards it runs the [`build`](Self::build) command if specified.\n\nNote that the git clone directory is set as working directory for both the\n[`build`](Self::build) command and the specified [`path`](Self::path).\n\n## Example\n\n```yaml\nnodes:\n  - id: rust-node\n    git: https://github.com/dora-rs/dora.git\n    build: cargo build -p rust-dataflow-example-node\n    path: target/debug/rust-dataflow-example-node\n```\n\nIn the above example, `dora build` will first clone the specified `git` repository and then\nrun the specified `build` inside the local clone directory.\nWhen `dora run` or `dora start` is invoked, the working directory will be the git clone\ndirectory too. So a relative `path` will start from the clone directory.",
           "type": [
@@ -649,6 +672,13 @@
         },
         "path": {
           "description": "Path to executable or script that should be run.\n\nSpecifies the path of the executable or script that Dora should run when starting the\ndataflow.\nThis can point to a normal executable (e.g. when using a compiled language such as Rust) or\na Python script.\n\nDora will automatically append a `.exe` extension on Windows systems when the specified\nfile name has no extension.\n\n## Example\n\n```yaml\nnodes:\n  - id: rust-example\n    path: target/release/rust-node\n  - id: python-example\n    path: ./receive_data.py\n```\n\n## URL as Path\n\nThe `path` field can also point to a URL instead of a local path.\nIn this case, Dora will download the given file when starting the dataflow.\n\nNote that this is quite an old feature and using this functionality is **not recommended**\nanymore. Instead, we recommend using a [`git`][Self::git] and/or [`build`](Self::build)\nkey.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path_sha256": {
+          "description": "SHA-256 checksum the `path` download must match, verified after fetch\nand on cache reuse (spec §8.2/§8.4). Set internally when a `hub:`\nreference resolves to a prebuilt binary artifact; rarely set by hand.",
           "type": [
             "string",
             "null"

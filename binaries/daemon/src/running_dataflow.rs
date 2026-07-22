@@ -1,8 +1,8 @@
 //! Running dataflow state and associated types.
 
 use crate::{
-    DoraEvent, OutputId, coordinator, empty_type_info, fault_tolerance::CascadingErrorCauses,
-    pending::PendingNodes, send_with_timestamp,
+    DoraEvent, OutputId, coordinator, fault_tolerance::CascadingErrorCauses, pending::PendingNodes,
+    send_with_timestamp,
 };
 use dora_core::{
     config::{DataId, NodeId},
@@ -16,7 +16,12 @@ use dora_message::{
     metadata::{self},
     node_to_daemon::Timestamped,
 };
-/// Default grace period before force-killing a stopped node.
+/// Default grace period before force-killing a stopped node. A stopped node is
+/// hard-killed at `DEFAULT_STOP_GRACE + DEFAULT_STOP_GRACE/2` (= 15s), so a node's own
+/// zenoh teardown deadline must stay under that or it gets force-killed mid-teardown
+/// (`ExitCode(1)` on Windows — dora-rs/dora#2742). Kept in sync by
+/// `ZENOH_TEARDOWN_TIMEOUT` in `apis/rust/node/src/node/mod.rs` and its
+/// `zenoh_teardown_fits_within_daemon_force_kill_grace` guard test.
 const DEFAULT_STOP_GRACE: Duration = Duration::from_millis(10_000);
 /// Default grace period before force-killing a restarting node.
 const DEFAULT_RESTART_GRACE: Duration = Duration::from_millis(5_000);
@@ -42,7 +47,7 @@ use tracing::warn;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::Event;
-use process_wrap::tokio::TokioChildWrapper;
+use process_wrap::tokio::ChildWrapper;
 
 pub(crate) struct InputDeadline {
     pub timeout: Duration,
@@ -89,6 +94,10 @@ pub struct RunningNode {
     pub(crate) force_restart_next: Arc<AtomicBool>,
     pub(crate) last_activity: Arc<AtomicU64>,
     pub(crate) health_check_timeout: Option<Duration>,
+    /// Per-node finish-drain grace override (from `finish_grace_secs` in the
+    /// descriptor). When `Some`, overrides the global `DORA_FINISH_DRAIN_GRACE_SECS`
+    /// for this node in the finish-straggler watchdog.
+    pub(crate) finish_grace_secs: Option<Duration>,
 }
 
 impl RunningNode {
@@ -108,7 +117,7 @@ pub(crate) enum ProcessOperation {
 }
 
 impl ProcessOperation {
-    pub fn execute(&self, child: &mut dyn TokioChildWrapper) {
+    pub fn execute(&self, child: &mut dyn ChildWrapper) {
         match self {
             Self::SoftKill => {
                 #[cfg(unix)]
@@ -179,6 +188,10 @@ pub struct LogSubscriber {
 pub struct RunningDataflow {
     pub(crate) id: uuid::Uuid,
     pub(crate) descriptor: Descriptor,
+    /// Per-node zenoh listener + dial-list, so the node↔node links this dataflow
+    /// needs are established deterministically rather than left to gossip.
+    /// Populated when the dataflow is spawned; see `plan_zenoh_peering`.
+    pub(crate) zenoh_peering: Arc<BTreeMap<NodeId, crate::spawn::NodeZenohPeering>>,
     pub(crate) pending_nodes: PendingNodes,
     pub(crate) dataflow_started: bool,
     pub(crate) subscribe_channels: HashMap<NodeId, Sender<Timestamped<NodeEvent>>>,
@@ -199,6 +212,12 @@ pub struct RunningDataflow {
     /// that node's drain phase. Drives the finish-straggler watchdog
     /// (dora-rs/dora#2152).
     pub(crate) all_inputs_closed_at: HashMap<NodeId, Instant>,
+    /// Nodes that have subscribed at least once. Distinguishes a node that has
+    /// connected (and may since have dropped its event stream) from one still
+    /// starting up — only the former is a finish-straggler candidate. Set on
+    /// subscribe, cleared on node removal so a re-added node ID starts a fresh
+    /// incarnation rather than looking already-connected (dora-rs/dora#2270).
+    pub(crate) connected_nodes: BTreeSet<NodeId>,
     /// Nodes already escalated by the finish-straggler watchdog (one-shot).
     pub(crate) finish_escalated: BTreeSet<NodeId>,
     pub(crate) stop_sent: bool,
@@ -247,6 +266,7 @@ impl RunningDataflow {
         let (listener_shutdown_tx, listener_shutdown_rx) = tokio::sync::watch::channel(false);
         Self {
             id: dataflow_id,
+            zenoh_peering: Arc::new(BTreeMap::new()),
             pending_nodes: PendingNodes::new(dataflow_id, daemon_id),
             dataflow_started: false,
             subscribe_channels: HashMap::new(),
@@ -262,6 +282,7 @@ impl RunningDataflow {
             open_external_mappings: Default::default(),
             _timer_handles: BTreeMap::new(),
             all_inputs_closed_at: HashMap::new(),
+            connected_nodes: BTreeSet::new(),
             finish_escalated: BTreeSet::new(),
             stop_sent: false,
             empty_set: BTreeSet::new(),
@@ -323,11 +344,8 @@ impl RunningDataflow {
                     #[cfg(not(feature = "telemetry"))]
                     let parameters = BTreeMap::new();
 
-                    let metadata = metadata::Metadata::from_parameters(
-                        clock.new_timestamp(),
-                        empty_type_info(),
-                        parameters,
-                    );
+                    let metadata =
+                        metadata::Metadata::from_parameters(clock.new_timestamp(), parameters);
 
                     let event = Timestamped {
                         inner: DoraEvent::Timer {
@@ -347,6 +365,17 @@ impl RunningDataflow {
             tokio::spawn(task);
             self._timer_handles.insert(interval, handle);
         }
+
+        // Record that the dataflow has been started. This must hold on *every*
+        // start path — the single-daemon `Subscribe`-readiness path and the
+        // distributed coordinator `AllNodesReady` path both funnel through
+        // here — so the flag lives in `start()` rather than at the call sites.
+        // The `AddNode` handler relies on it to tell "already running, spawn a
+        // task for a freshly-added interval" apart from "still bringing up, let
+        // the readiness path spawn the tasks". Setting it at only one call site
+        // (as before) left it `false` for the entire life of a distributed
+        // dataflow, silently starving timer inputs on nodes added later.
+        self.dataflow_started = true;
 
         Ok(())
     }
@@ -395,7 +424,7 @@ impl RunningDataflow {
         } else {
             let grace_duration_kills = self.grace_duration_kills.clone();
             tokio::spawn(async move {
-                let duration = grace_duration.unwrap_or(Duration::from_millis(10000));
+                let duration = grace_duration.unwrap_or(DEFAULT_STOP_GRACE);
                 tokio::time::sleep(duration).await;
 
                 for (node, proc) in &running_processes {
@@ -515,8 +544,12 @@ impl RunningDataflow {
             .store(true, atomic::Ordering::Release);
         // A fresh incarnation starts with a clean drain state: a stale
         // AllInputsClosed timestamp from the previous incarnation must not
-        // trip the finish-straggler watchdog on the restarted node.
+        // trip the finish-straggler watchdog on the restarted node. The
+        // connected marker is cleared too, so the restarting process is not
+        // treated as connected (and silence-escalatable) before it re-subscribes
+        // (dora-rs/dora#2270).
         self.all_inputs_closed_at.remove(node_id);
+        self.connected_nodes.remove(node_id);
         self.finish_escalated.remove(node_id);
         self.send_stop_and_schedule_kill(
             node_id,
@@ -580,59 +613,182 @@ impl RunningDataflow {
         self.open_inputs.get(node_id).unwrap_or(&self.empty_set)
     }
 
+    /// All output ids produced by `node_id`, whether they are consumed by a
+    /// local node (recorded in `mappings`) or only by nodes on another daemon
+    /// (recorded in `open_external_mappings`).
+    ///
+    /// Deriving the set from `mappings` alone misses outputs that have no local
+    /// consumer, so their remote consumers would never receive the
+    /// `OutputClosed` event when the producing node finishes (dora-rs/dora#2152
+    /// region — graceful cross-daemon shutdown).
+    pub(crate) fn node_output_ids(&self, node_id: &NodeId) -> BTreeSet<DataId> {
+        node_output_ids(&self.mappings, &self.open_external_mappings, node_id)
+    }
+
     /// Nodes blocking an otherwise-finished dataflow (dora-rs/dora#2152).
     ///
-    /// Returns nodes that have been draining (received `AllInputsClosed`)
-    /// for longer than `grace`, but only once *every* running non-dynamic
-    /// node of the dataflow is draining — a running source (which never
-    /// receives `AllInputsClosed`) means the dataflow is still producing
-    /// and nothing is escalated. Explicitly stopped dataflows are excluded:
-    /// `stop_all` runs its own kill escalation. Dataflows with open
-    /// cross-daemon output mappings are also excluded — a local node that
-    /// looks like a straggler may still be flushing outputs to consumers
-    /// on other daemons, which this daemon cannot see.
-    pub(crate) fn finish_stragglers(&self, grace: Duration) -> Vec<NodeId> {
+    /// Returns nodes that should be force-stopped because the dataflow is
+    /// "otherwise finished" — every running non-dynamic node is quiescent —
+    /// but they have not exited. A node is quiescent once it has either been
+    /// draining (received `AllInputsClosed`) past `grace`, or — never having
+    /// reached the drain state — gone silent (no daemon traffic) past `grace`.
+    /// The second arm catches a node that wedges *before* draining (dora#2152:
+    /// the operator runtime stuck after stop), which the drain-only gate let
+    /// hang indefinitely.
+    ///
+    /// A running source (no inputs, never drains) means the dataflow is still
+    /// producing, so nothing escalates; likewise an active non-source node
+    /// (recent traffic) means work is still in progress. Explicitly stopped
+    /// dataflows are excluded (`stop_all` runs its own kill escalation), as are
+    /// dataflows with open cross-daemon output mappings — a local node that
+    /// looks like a straggler may still be flushing outputs to consumers on
+    /// other daemons, which this daemon cannot see.
+    ///
+    /// `now_millis` is the current `node_communication::current_millis()`, the
+    /// clock `RunningNode::last_activity` is stamped against.
+    pub(crate) fn finish_stragglers(&self, grace: Duration, now_millis: u64) -> Vec<NodeId> {
         if self.stop_sent || !self.open_external_mappings.is_empty() {
             return Vec::new();
         }
         select_finish_stragglers(
-            self.running_nodes
-                .iter()
-                .map(|(id, node)| (id, node.node_config.dynamic)),
-            &self.all_inputs_closed_at,
+            self.running_nodes.iter().map(|(id, node)| {
+                let last = node.last_activity.load(atomic::Ordering::Acquire);
+                StragglerNode {
+                    id,
+                    dynamic: node.node_config.dynamic,
+                    never_finishes: self.node_never_finishes(id),
+                    // A node is only a silence candidate once it has subscribed
+                    // — i.e. has connected and can receive AllInputsClosed/Stop.
+                    // Until then it is still starting (a slow model-load node),
+                    // not a wedge, even though `last_activity` is seeded at spawn
+                    // time and would otherwise read as long-silent. Uses the
+                    // sticky `connected_nodes` rather than current channel
+                    // presence so a node that dropped its event stream but is
+                    // still alive remains a candidate (dora#2270 review).
+                    connected: self.connected_nodes.contains(id),
+                    drained_for: self.all_inputs_closed_at.get(id).map(Instant::elapsed),
+                    silent_for: Duration::from_millis(now_millis.saturating_sub(last)),
+                    node_grace: node.finish_grace_secs,
+                }
+            }),
             &self.finish_escalated,
             grace,
         )
     }
+
+    /// Whether a node can never reach natural finish, so the finish-straggler
+    /// watchdog must leave it alone (it is stopped only via the explicit-stop
+    /// path). True for a source (no inputs) and — crucially — for any node fed
+    /// by a `Timer` or `Logs` input: those virtual inputs never close, so the
+    /// node never receives `AllInputsClosed`, and timer/log delivery is
+    /// daemon-to-node so it never refreshes `last_activity`. Such a node looks
+    /// "silent and never drained" exactly like a wedge, but is alive by design
+    /// (dora-rs/dora#2270) — e.g. a long-running timer-only side-effect node.
+    fn node_never_finishes(&self, node_id: &NodeId) -> bool {
+        let is_source = self
+            .descriptor
+            .nodes
+            .iter()
+            .find(|n| &n.id == node_id)
+            .is_some_and(|n| n.inputs.is_empty());
+        let has_timer = self
+            .timers
+            .values()
+            .any(|receivers| receivers.iter().any(|(id, _)| id == node_id));
+        let has_logs = self
+            .log_subscribers
+            .iter()
+            .any(|sub| &sub.node_id == node_id);
+        is_source || has_timer || has_logs
+    }
+}
+
+/// One running node's view for [`select_finish_stragglers`].
+struct StragglerNode<'a> {
+    id: &'a NodeId,
+    dynamic: bool,
+    /// Node that never reaches natural finish — a source, or one kept alive by
+    /// a `Timer`/`Logs` input (see [`RunningDataflow::node_never_finishes`]).
+    never_finishes: bool,
+    /// Whether the node has subscribed and can receive finish events. A node
+    /// that has not connected yet is still starting up, not wedged.
+    connected: bool,
+    /// Time since `AllInputsClosed`, or `None` if it never reached drain.
+    drained_for: Option<Duration>,
+    /// Time since the last daemon-bound message from this node. Only meaningful
+    /// once `connected` — `last_activity` is seeded at spawn time.
+    silent_for: Duration,
+    /// Per-node grace override from `finish_grace_secs` in the descriptor.
+    /// When `Some`, takes precedence over the global grace passed to
+    /// [`select_finish_stragglers`] for this node only.
+    node_grace: Option<Duration>,
+}
+
+/// Pure core of [`RunningDataflow::node_output_ids`].
+///
+/// Unions the output ids of `node_id` across both the locally-consumed
+/// `mappings` and the remote-only `open_external_mappings`.
+fn node_output_ids(
+    mappings: &HashMap<OutputId, BTreeSet<(NodeId, DataId)>>,
+    open_external_mappings: &BTreeSet<OutputId>,
+    node_id: &NodeId,
+) -> BTreeSet<DataId> {
+    mappings
+        .keys()
+        .chain(open_external_mappings.iter())
+        .filter(|output| &output.0 == node_id)
+        .map(|output| output.1.clone())
+        .collect()
 }
 
 /// Pure core of [`RunningDataflow::finish_stragglers`].
 fn select_finish_stragglers<'a>(
-    running_nodes: impl Iterator<Item = (&'a NodeId, bool)>,
-    all_inputs_closed_at: &HashMap<NodeId, Instant>,
+    running_nodes: impl Iterator<Item = StragglerNode<'a>>,
     already_escalated: &BTreeSet<NodeId>,
     grace: Duration,
 ) -> Vec<NodeId> {
-    // Gate first: every running non-dynamic node must be draining,
-    // otherwise the dataflow is not "otherwise finished" (e.g. a running
-    // source) and nothing may be escalated.
-    let mut draining = Vec::new();
-    for (node_id, dynamic) in running_nodes {
-        if dynamic {
+    // Gate first: every running non-dynamic node must be quiescent (drained or
+    // silent past grace), otherwise the dataflow is not "otherwise finished"
+    // (a running source, or a node still producing) and nothing may escalate.
+    let mut eligible = Vec::new();
+    for node in running_nodes {
+        if node.dynamic {
             continue;
         }
-        match all_inputs_closed_at.get(node_id) {
-            Some(drain_started) => draining.push((node_id, drain_started)),
-            None => return Vec::new(),
+        if node.never_finishes {
+            // a live source (or timer/log-fed node) keeps the dataflow running;
+            // it is stopped only via the explicit-stop path, never escalated here
+            return Vec::new();
+        }
+        // Per-node `finish_grace_secs` overrides the global grace so that nodes
+        // with long post-input compute (ML training, large-batch inference) are
+        // not SIGKILLed while legitimately busy (dora-rs/dora#2284).
+        let effective_grace = node.node_grace.unwrap_or(grace);
+        match node.drained_for {
+            // draining: ready past grace; still within grace it is progressing
+            // toward exit and does not veto, but is not escalated yet
+            Some(drained_for) => {
+                if drained_for >= effective_grace {
+                    eligible.push(node.id.clone());
+                }
+            }
+            // never drained: only "finished" if a connected node has wedged
+            // silent past grace. An unconnected node is still starting up (so
+            // the dataflow is not otherwise finished); a connected but active
+            // node still has work in progress — both veto.
+            None => {
+                if node.connected && node.silent_for >= effective_grace {
+                    eligible.push(node.id.clone());
+                } else {
+                    return Vec::new();
+                }
+            }
         }
     }
 
-    draining
+    eligible
         .into_iter()
-        .filter(|(node_id, drain_started)| {
-            drain_started.elapsed() >= grace && !already_escalated.contains(*node_id)
-        })
-        .map(|(node_id, _)| node_id.clone())
+        .filter(|node_id| !already_escalated.contains(node_id))
         .collect()
 }
 
@@ -646,26 +802,83 @@ mod tests {
         NodeId::from(name.to_string())
     }
 
-    /// Backdates are kept tiny (≤2s): on Windows, `Instant` is anchored at
-    /// boot and larger subtractions underflow on fresh CI runners — the
-    /// exact panic class fixed in dora-rs/dora#2088.
-    fn drained_since(entries: &[(&str, Duration)]) -> HashMap<NodeId, Instant> {
-        entries
-            .iter()
-            .map(|(name, age)| (node_id(name), Instant::now() - *age))
-            .collect()
+    fn data_id(name: &str) -> DataId {
+        DataId::from(name.to_string())
+    }
+
+    // ---- node_output_ids: remote-only outputs must be included ----
+
+    #[test]
+    fn node_output_ids_unions_local_and_remote_outputs() {
+        let source = node_id("source");
+        let mut mappings: HashMap<OutputId, BTreeSet<(NodeId, DataId)>> = HashMap::new();
+        // `source/local_out` is consumed by a local node.
+        mappings.insert(
+            OutputId(source.clone(), data_id("local_out")),
+            BTreeSet::from([(node_id("sink"), data_id("in"))]),
+        );
+        // `source/remote_out` is consumed only by a node on another daemon.
+        let open_external_mappings =
+            BTreeSet::from([OutputId(source.clone(), data_id("remote_out"))]);
+
+        let outputs = node_output_ids(&mappings, &open_external_mappings, &source);
+
+        // Both the locally-consumed and the remote-only output must appear, so
+        // the remote consumer receives an `OutputClosed` when `source` finishes.
+        assert_eq!(
+            outputs,
+            BTreeSet::from([data_id("local_out"), data_id("remote_out")]),
+        );
+    }
+
+    #[test]
+    fn node_output_ids_ignores_other_producers() {
+        let mut mappings: HashMap<OutputId, BTreeSet<(NodeId, DataId)>> = HashMap::new();
+        mappings.insert(
+            OutputId(node_id("other"), data_id("x")),
+            BTreeSet::from([(node_id("sink"), data_id("in"))]),
+        );
+        let open_external_mappings = BTreeSet::from([OutputId(node_id("other"), data_id("y"))]);
+
+        let outputs = node_output_ids(&mappings, &open_external_mappings, &node_id("source"));
+        assert!(outputs.is_empty());
     }
 
     const TEST_GRACE: Duration = Duration::from_millis(100);
     const PAST_GRACE: Duration = Duration::from_secs(2);
+    const WITHIN_GRACE: Duration = Duration::ZERO;
+
+    /// A finishing (non-source, no timer/log), connected node draining for `age`.
+    fn drained<'a>(id: &'a NodeId, age: Duration) -> StragglerNode<'a> {
+        StragglerNode {
+            id,
+            dynamic: false,
+            never_finishes: false,
+            connected: true,
+            drained_for: Some(age),
+            silent_for: Duration::ZERO,
+            node_grace: None,
+        }
+    }
+
+    /// A finishing, connected node that never drained, silent for `silent_for`.
+    fn never_drained<'a>(id: &'a NodeId, silent_for: Duration) -> StragglerNode<'a> {
+        StragglerNode {
+            id,
+            dynamic: false,
+            never_finishes: false,
+            connected: true,
+            drained_for: None,
+            silent_for,
+            node_grace: None,
+        }
+    }
 
     #[test]
     fn straggler_past_grace_is_selected() {
-        let running = [(node_id("sink"), false)];
-        let drained = drained_since(&[("sink", PAST_GRACE)]);
+        let sink = node_id("sink");
         let selected = select_finish_stragglers(
-            running.iter().map(|(id, d)| (id, *d)),
-            &drained,
+            [drained(&sink, PAST_GRACE)].into_iter(),
             &BTreeSet::new(),
             TEST_GRACE,
         );
@@ -674,11 +887,9 @@ mod tests {
 
     #[test]
     fn straggler_within_grace_is_not_selected() {
-        let running = [(node_id("sink"), false)];
-        let drained = drained_since(&[("sink", Duration::ZERO)]);
+        let sink = node_id("sink");
         let selected = select_finish_stragglers(
-            running.iter().map(|(id, d)| (id, *d)),
-            &drained,
+            [drained(&sink, WITHIN_GRACE)].into_iter(),
             &BTreeSet::new(),
             TEST_GRACE,
         );
@@ -689,11 +900,19 @@ mod tests {
     fn running_source_blocks_escalation_of_drained_nodes() {
         // `source` never receives AllInputsClosed; while it runs, the
         // dataflow is not "otherwise finished" and nothing escalates.
-        let running = [(node_id("source"), false), (node_id("sink"), false)];
-        let drained = drained_since(&[("sink", PAST_GRACE)]);
+        let source = node_id("source");
+        let sink = node_id("sink");
+        let source_node = StragglerNode {
+            id: &source,
+            dynamic: false,
+            never_finishes: true,
+            connected: true,
+            drained_for: None,
+            silent_for: PAST_GRACE,
+            node_grace: None,
+        };
         let selected = select_finish_stragglers(
-            running.iter().map(|(id, d)| (id, *d)),
-            &drained,
+            [source_node, drained(&sink, PAST_GRACE)].into_iter(),
             &BTreeSet::new(),
             TEST_GRACE,
         );
@@ -702,11 +921,19 @@ mod tests {
 
     #[test]
     fn dynamic_nodes_neither_block_nor_escalate() {
-        let running = [(node_id("dynamic"), true), (node_id("sink"), false)];
-        let drained = drained_since(&[("sink", PAST_GRACE)]);
+        let dynamic = node_id("dynamic");
+        let sink = node_id("sink");
+        let dynamic_node = StragglerNode {
+            id: &dynamic,
+            dynamic: true,
+            never_finishes: false,
+            connected: true,
+            drained_for: None,
+            silent_for: WITHIN_GRACE,
+            node_grace: None,
+        };
         let selected = select_finish_stragglers(
-            running.iter().map(|(id, d)| (id, *d)),
-            &drained,
+            [dynamic_node, drained(&sink, PAST_GRACE)].into_iter(),
             &BTreeSet::new(),
             TEST_GRACE,
         );
@@ -715,12 +942,10 @@ mod tests {
 
     #[test]
     fn already_escalated_nodes_are_not_reselected() {
-        let running = [(node_id("sink"), false)];
-        let drained = drained_since(&[("sink", PAST_GRACE)]);
+        let sink = node_id("sink");
         let escalated: BTreeSet<_> = [node_id("sink")].into();
         let selected = select_finish_stragglers(
-            running.iter().map(|(id, d)| (id, *d)),
-            &drained,
+            [drained(&sink, PAST_GRACE)].into_iter(),
             &escalated,
             TEST_GRACE,
         );
@@ -729,15 +954,208 @@ mod tests {
 
     #[test]
     fn multiple_drained_stragglers_are_all_selected() {
-        let running = [(node_id("a"), false), (node_id("b"), false)];
-        let drained = drained_since(&[("a", PAST_GRACE), ("b", PAST_GRACE)]);
+        let a = node_id("a");
+        let b = node_id("b");
         let selected = select_finish_stragglers(
-            running.iter().map(|(id, d)| (id, *d)),
-            &drained,
+            [drained(&a, PAST_GRACE), drained(&b, PAST_GRACE)].into_iter(),
             &BTreeSet::new(),
             TEST_GRACE,
         );
         assert_eq!(selected, vec![node_id("a"), node_id("b")]);
+    }
+
+    // ---- dora-rs/dora#2270: wedge-before-drain escalation ----
+
+    #[test]
+    fn non_source_wedged_silent_past_grace_is_escalated() {
+        // the #2152/#2270 case: a node that never reached the drain state but
+        // has gone silent past grace while the rest of the dataflow finished.
+        let stuck = node_id("runtime");
+        let selected = select_finish_stragglers(
+            [never_drained(&stuck, PAST_GRACE)].into_iter(),
+            &BTreeSet::new(),
+            TEST_GRACE,
+        );
+        assert_eq!(selected, vec![node_id("runtime")]);
+    }
+
+    #[test]
+    fn unconnected_node_silent_past_grace_is_not_escalated() {
+        // `last_activity` is seeded at spawn, so a slow-starting node that has
+        // not subscribed yet reads as long-silent — but it is still coming up,
+        // not wedged, and must not be killed (dora#2270 review regression).
+        let starting = node_id("slow_loader");
+        let node = StragglerNode {
+            id: &starting,
+            dynamic: false,
+            never_finishes: false,
+            connected: false,
+            drained_for: None,
+            silent_for: PAST_GRACE,
+            node_grace: None,
+        };
+        let selected = select_finish_stragglers([node].into_iter(), &BTreeSet::new(), TEST_GRACE);
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn non_source_active_without_drain_blocks_escalation() {
+        // a non-source node still sending daemon traffic means work is in
+        // progress — the dataflow is not otherwise finished.
+        let active = node_id("active");
+        let sink = node_id("sink");
+        let selected = select_finish_stragglers(
+            [
+                never_drained(&active, WITHIN_GRACE),
+                drained(&sink, PAST_GRACE),
+            ]
+            .into_iter(),
+            &BTreeSet::new(),
+            TEST_GRACE,
+        );
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn never_finishing_node_is_not_escalated_when_silent() {
+        // a source or timer/log-fed node is stopped via the explicit-stop path,
+        // never via finish-straggler escalation — even when silent past grace.
+        // Guards the dora#2270 regression where a long-running timer-only node
+        // (silent, never drained) was force-killed after the grace period.
+        let perpetual = node_id("timer_node");
+        let node = StragglerNode {
+            id: &perpetual,
+            dynamic: false,
+            never_finishes: true,
+            connected: true,
+            drained_for: None,
+            silent_for: PAST_GRACE,
+            node_grace: None,
+        };
+        let selected = select_finish_stragglers([node].into_iter(), &BTreeSet::new(), TEST_GRACE);
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn drained_and_wedged_stragglers_escalate_together() {
+        let sink = node_id("sink");
+        let stuck = node_id("runtime");
+        let selected = select_finish_stragglers(
+            [
+                drained(&sink, PAST_GRACE),
+                never_drained(&stuck, PAST_GRACE),
+            ]
+            .into_iter(),
+            &BTreeSet::new(),
+            TEST_GRACE,
+        );
+        assert_eq!(selected, vec![node_id("sink"), node_id("runtime")]);
+    }
+
+    // ---- dora-rs/dora#2284: per-node finish-grace override ----
+
+    #[test]
+    fn node_with_longer_per_node_grace_is_not_escalated_when_global_grace_expired() {
+        // Trainer has a 10-minute per-node grace; global grace is 100ms.
+        // After PAST_GRACE (> global grace) the trainer must NOT be killed.
+        let trainer = node_id("trainer");
+        let node = StragglerNode {
+            id: &trainer,
+            dynamic: false,
+            never_finishes: false,
+            connected: true,
+            drained_for: Some(PAST_GRACE),
+            silent_for: PAST_GRACE,
+            node_grace: Some(Duration::from_secs(600)),
+        };
+        let selected = select_finish_stragglers([node].into_iter(), &BTreeSet::new(), TEST_GRACE);
+        assert!(
+            selected.is_empty(),
+            "trainer should not be escalated before its own grace"
+        );
+    }
+
+    #[test]
+    fn node_with_longer_per_node_grace_is_escalated_after_its_own_grace() {
+        // After the per-node grace the node is eligible for escalation.
+        let trainer = node_id("trainer");
+        let long_grace = Duration::from_millis(50);
+        let node = StragglerNode {
+            id: &trainer,
+            dynamic: false,
+            never_finishes: false,
+            connected: true,
+            drained_for: Some(Duration::from_millis(200)), // well past long_grace
+            silent_for: Duration::ZERO,
+            node_grace: Some(long_grace),
+        };
+        let selected = select_finish_stragglers([node].into_iter(), &BTreeSet::new(), TEST_GRACE);
+        assert_eq!(selected, vec![node_id("trainer")]);
+    }
+
+    #[test]
+    fn per_node_grace_does_not_block_other_nodes_already_past_global_grace() {
+        // sink is past global grace; trainer has a longer per-node grace and is
+        // still within it.  The trainer's long grace must NOT veto sink's escalation.
+        // But sink cannot escalate alone — the gate requires ALL non-dynamic
+        // nodes to be quiescent.  The trainer is still "within grace" (drained_for
+        // is Some but < effective_grace), so it does not veto — but it also is
+        // not yet escalated.  Sink therefore escalates on its own.
+        let sink = node_id("sink");
+        let trainer = node_id("trainer");
+        let long_grace = Duration::from_secs(600);
+        let trainer_node = StragglerNode {
+            id: &trainer,
+            dynamic: false,
+            never_finishes: false,
+            connected: true,
+            drained_for: Some(PAST_GRACE), // past global grace, within per-node grace
+            silent_for: PAST_GRACE,
+            node_grace: Some(long_grace),
+        };
+        let selected = select_finish_stragglers(
+            [drained(&sink, PAST_GRACE), trainer_node].into_iter(),
+            &BTreeSet::new(),
+            TEST_GRACE,
+        );
+        // sink is past global grace (no per-node override); trainer is within
+        // its own grace — only sink should be escalated
+        assert_eq!(selected, vec![node_id("sink")]);
+    }
+
+    #[test]
+    fn never_drained_node_within_per_node_grace_vetoes_whole_dataflow() {
+        // Intended behavioral expansion (dora-rs/dora#2284): a connected node
+        // that has NOT yet drained (no AllInputsClosed) but declares a large
+        // `finish_grace_secs` is treated as legitimately busy. While it is
+        // within its own grace it takes the never-drained `None` arm and vetoes
+        // escalation for the ENTIRE dataflow — even a sibling that drained long
+        // past the global grace. This deliberately holds the finish-straggler
+        // watchdog open for the long-grace node's window (e.g. a trainer that
+        // keeps computing after a sibling sink finished), rather than killing
+        // the dataflow at the global grace as before this PR.
+        let sink = node_id("sink");
+        let trainer = node_id("trainer");
+        let long_grace = Duration::from_secs(600);
+        let trainer_node = StragglerNode {
+            id: &trainer,
+            dynamic: false,
+            never_finishes: false,
+            connected: true,
+            drained_for: None,      // has not received AllInputsClosed yet
+            silent_for: PAST_GRACE, // silent past global grace, within per-node grace
+            node_grace: Some(long_grace),
+        };
+        let selected = select_finish_stragglers(
+            [drained(&sink, PAST_GRACE), trainer_node].into_iter(),
+            &BTreeSet::new(),
+            TEST_GRACE,
+        );
+        assert!(
+            selected.is_empty(),
+            "a busy long-grace node not yet drained must hold the dataflow open, \
+             vetoing escalation of drained siblings"
+        );
     }
 
     // ---- dora-rs/adora#149: InputDeadline::is_timed_out ----

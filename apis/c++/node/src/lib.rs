@@ -8,11 +8,13 @@ use std::{
 use crate::ffi::MetadataValueType;
 
 use chrono::DateTime;
+#[cfg(any(feature = "ros2-bridge", test))]
+use dora_node_api::merged::MergeExternal;
 use dora_node_api::{
     self, Event, EventStream, Metadata as DoraMetadata,
     MetadataParameters as DoraMetadataParameters, Parameter as DoraParameter, TryRecvError,
     arrow::array::{AsArray, UInt8Array},
-    merged::{MergeExternal, MergedEvent},
+    merged::MergedEvent,
 };
 use eyre::{Result as EyreResult, bail, eyre};
 use serde::Serialize;
@@ -365,6 +367,7 @@ fn dora_events_into_combined(events: Box<Events>) -> ffi::CombinedEvents {
     ffi::CombinedEvents {
         events: Box::new(MergedEvents {
             events: Some(Box::new(events)),
+            #[cfg(any(feature = "ros2-bridge", test))]
             next_id: 1,
         }),
     }
@@ -374,6 +377,7 @@ fn empty_combined_events() -> ffi::CombinedEvents {
     ffi::CombinedEvents {
         events: Box::new(MergedEvents {
             events: Some(Box::new(stream::empty())),
+            #[cfg(any(feature = "ros2-bridge", test))]
             next_id: 1,
         }),
     }
@@ -419,11 +423,16 @@ fn event_type(event: &DoraEvent) -> ffi::DoraEventType {
     }
 }
 
+// `Box<DoraEvent>` is mandated by the cxx bridge signature (ownership transfer
+// across the FFI boundary), so the `boxed_local` lint is a false positive.
+#[allow(clippy::boxed_local)]
 fn event_as_input(event: Box<DoraEvent>) -> eyre::Result<ffi::DoraInput> {
-    let EventOrReason::Event(Event::Input { id, metadata, data }) = event.0 else {
+    let EventOrReason::Event(Event::Input { id, data, .. }) = event.0 else {
         bail!("not an input event");
     };
-    let data = match metadata.type_info.data_type {
+    // The payload is decoded from a self-describing Arrow IPC stream, so read
+    // the type from the array itself.
+    let data = match data.data_type() {
         dora_node_api::arrow::datatypes::DataType::UInt8 => {
             let array: &UInt8Array = data.as_primitive();
             array.values().to_vec()
@@ -445,6 +454,7 @@ fn event_as_input(event: Box<DoraEvent>) -> eyre::Result<ffi::DoraInput> {
     })
 }
 
+#[allow(clippy::boxed_local)] // `Box<DoraEvent>` is mandated by the cxx bridge signature.
 fn event_as_node_failed(event: Box<DoraEvent>) -> eyre::Result<ffi::DoraNodeFailed> {
     let EventOrReason::Event(Event::NodeFailed {
         affected_input_ids,
@@ -508,6 +518,7 @@ fn dataflow_descriptor_json(output_sender: &Box<OutputSender>) -> eyre::Result<S
     serde_json::to_string(desc).map_err(|e| eyre!("failed to serialize dataflow descriptor: {e}"))
 }
 
+#[allow(clippy::boxed_local)] // `Box<DoraEvent>` is mandated by the cxx bridge signature.
 unsafe fn event_as_arrow_input(
     event: Box<DoraEvent>,
     out_array: *mut u8,
@@ -765,9 +776,18 @@ impl Metadata {
     }
 
     pub fn set_timestamp(&mut self, key: &str, value: i64) -> EyreResult<()> {
-        // Convert nanoseconds since Unix epoch to chrono::DateTime<Utc>
-        let secs = value / 1_000_000_000;
-        let subsec_nanos = (value % 1_000_000_000) as u32;
+        // Convert nanoseconds since Unix epoch to chrono::DateTime<Utc>.
+        //
+        // Use Euclidean division so pre-epoch (negative) timestamps split
+        // correctly. Plain `/` and `%` truncate toward zero, yielding a
+        // *negative* remainder for negative inputs; casting that to `u32`
+        // wraps it to a huge value and makes `from_timestamp` reject the
+        // (otherwise valid) instant. `div_euclid`/`rem_euclid` keep the
+        // remainder in `0..1_000_000_000`, matching how `from_timestamp`
+        // interprets `(secs, subsec_nanos)` and round-tripping with
+        // `get_timestamp` for negative values.
+        let secs = value.div_euclid(1_000_000_000);
+        let subsec_nanos = value.rem_euclid(1_000_000_000) as u32;
 
         let dt = DateTime::from_timestamp(secs, subsec_nanos)
             .ok_or_else(|| eyre!("Invalid timestamp: out of range (nanos: {value})"))?;
@@ -800,6 +820,7 @@ impl Metadata {
     }
 }
 
+#[allow(clippy::boxed_local)] // `Box<DoraEvent>` is mandated by the cxx bridge signature.
 unsafe fn event_as_arrow_input_with_info(
     event: Box<DoraEvent>,
     out_array: *mut u8,
@@ -904,6 +925,7 @@ fn send_output_internal(
 
 pub struct MergedEvents {
     events: Option<Box<dyn Stream<Item = MergedEvent<ExternalEvent>> + Unpin>>,
+    #[cfg(any(feature = "ros2-bridge", test))]
     next_id: u32,
 }
 
@@ -977,12 +999,8 @@ unsafe fn send_arrow_output_impl(
 }
 
 impl MergedEvents {
-    fn next(&mut self) -> MergedDoraEvent {
-        let event = futures_lite::future::block_on(self.events.as_mut().unwrap().next());
-        MergedDoraEvent(event)
-    }
-
-    pub fn merge(&mut self, events: impl Stream<Item = Box<dyn Any>> + Unpin + 'static) -> u32 {
+    #[cfg(any(feature = "ros2-bridge", test))]
+    fn merge(&mut self, events: impl Stream<Item = Box<dyn Any>> + Unpin + 'static) -> u32 {
         let id = self.next_id;
         self.next_id += 1;
         let events = Box::pin(events.map(move |event| ExternalEvent { event, id }));
@@ -996,6 +1014,11 @@ impl MergedEvents {
         self.events = Some(merged);
 
         id
+    }
+
+    fn next(&mut self) -> MergedDoraEvent {
+        let event = futures_lite::future::block_on(self.events.as_mut().unwrap().next());
+        MergedDoraEvent(event)
     }
 }
 
@@ -1036,28 +1059,10 @@ mod tests {
     use super::*;
     use dora_node_api::{
         ArrowData,
-        arrow::{
-            array::{ArrayRef, Int32Array},
-            datatypes::DataType,
-        },
-        metadata::ArrowTypeInfo,
+        arrow::array::{ArrayRef, Int32Array},
         uhlc::HLC,
     };
     use std::sync::Arc;
-
-    fn type_info(data_type: DataType) -> ArrowTypeInfo {
-        ArrowTypeInfo {
-            data_type,
-            len: 0,
-            null_count: 0,
-            validity: None,
-            offset: 0,
-            buffer_offsets: vec![],
-            child_data: vec![],
-            field_names: None,
-            schema_hash: None,
-        }
-    }
 
     /// Regression test for #2030: a non-UInt8 input (e.g. Int32 from another
     /// node) must return an `Err` from `event_as_input` instead of aborting
@@ -1067,11 +1072,62 @@ mod tests {
         let array: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
         let event = Box::new(DoraEvent(EventOrReason::Event(Event::Input {
             id: "my_input".into(),
-            metadata: DoraMetadata::new(HLC::default().new_timestamp(), type_info(DataType::Int32)),
+            metadata: DoraMetadata::new(HLC::default().new_timestamp()),
             data: ArrowData(array),
         })));
 
         let result = event_as_input(event);
         assert!(result.is_err(), "expected Err for non-UInt8 input, got Ok");
+    }
+
+    #[test]
+    fn merged_events_assigns_ids_to_external_streams() {
+        let mut events = MergedEvents {
+            events: Some(Box::new(stream::empty())),
+            #[cfg(any(feature = "ros2-bridge", test))]
+            next_id: 1,
+        };
+
+        let first_id = events.merge(stream::once(Box::new("first") as Box<dyn Any>));
+        let second_id = events.merge(stream::once(Box::new("second") as Box<dyn Any>));
+
+        assert_eq!(first_id, 1);
+        assert_eq!(second_id, 2);
+
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            if let Some(MergedEvent::External(event)) = events.next().0 {
+                seen.push(event.id);
+            }
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, vec![1, 2]);
+    }
+
+    /// Regression test: `set_timestamp` must accept and correctly represent
+    /// pre-epoch (negative) nanosecond timestamps. The previous truncating
+    /// `value % 1_000_000_000` produced a negative remainder that wrapped when
+    /// cast to `u32`, making `from_timestamp` reject valid instants. The value
+    /// must also round-trip through `get_timestamp`.
+    #[test]
+    fn set_timestamp_roundtrips_negative_values() {
+        for value in [
+            -1_i64,
+            -500_000_000,
+            -1_000_000_000,
+            -1_500_000_000,
+            -1_000_000_001,
+            0,
+            1,
+            1_500_000_000,
+        ] {
+            let mut meta = Metadata::empty();
+            meta.set_timestamp("ts", value)
+                .unwrap_or_else(|e| panic!("set_timestamp({value}) failed: {e}"));
+            let got = meta
+                .get_timestamp("ts")
+                .unwrap_or_else(|e| panic!("get_timestamp after set({value}) failed: {e}"));
+            assert_eq!(got, value, "timestamp {value} did not round-trip");
+        }
     }
 }

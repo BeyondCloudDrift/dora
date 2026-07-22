@@ -358,6 +358,8 @@ dora build <PATH> [OPTIONS]
 
 **Git sources:** Nodes with a `git:` field are cloned/updated before building. The build command runs from the git repository root.
 
+**URL sources:** Nodes with an `http(s)://` path are downloaded before building. For `https://` sources, TLS certificates are validated against the operating system's trust store, so minimal images (scratch, distroless) need `ca-certificates` installed for URL downloads to work. This also means enterprise/corporate root CAs installed on the machine are honored.
+
 **Managed Python environments (`--uv`):** For Python nodes (`.py` custom nodes with a `build:` block, and runtime nodes with Python operators), `--uv` now creates a dedicated `uv` virtual environment per node at `<working-dir>/.dora/python-envs/<node-id>/`. The build commands run inside that venv with `VIRTUAL_ENV` set and the env's `bin/` (or `Scripts/` on Windows) prepended to `PATH`. `dora start` and `dora run` automatically reuse the same interpreter at spawn time, so a Python node sees the exact dependencies installed at build time — no more drift between build and runtime, and no contamination across nodes. Custom Python nodes without a `build:` block keep using the caller's ambient `uv` environment. The env is reused (not re-created) on subsequent builds.
 
 #### `dora start`
@@ -1101,17 +1103,19 @@ See the [Type Annotations Guide](types.md) for the full type library and usage d
 
 #### `dora hub` (unstable)
 
-Package, discover, and use dora nodes (see
-[the Dora Hub plan](plan-node-hub.md)):
+Package, discover, and use dora nodes. For the full walkthrough see the
+[Hub guide](../guide/src/hub/overview.md); the design spec is
+[the Dora Hub plan](plan-node-hub.md).
 
 ```
 dora hub init [PATH]                       # scaffold a dora-node.yml manifest
 dora hub search <query> [--category C]     # find nodes by name/keyword/category
-                        [--platform P]
-dora hub info <pkg>[@<ver>]                # contracts + example for a package
+                        [--platform P] [--offline]
+dora hub info <pkg>[@<ver>] [--offline]    # contracts + example for a package
 dora hub list <dataflow.yml>               # hub packages pinned in the lockfile
 dora hub fetch <dataflow.yml | pkg@ver>    # warm the index cache + mirror sources
                [--target-dir DIR]
+dora hub install                           # (stub) prints how to add a hub: node
 dora hub publish [PATH] [--dry-run]        # validate + add a pinned index entry
                  [--rev REF] [--repo URL]
                  [--version SEMVER] [--index ALIAS]
@@ -1162,7 +1166,7 @@ version (the index is append-only). For a git-backed index it prints the entry
 and where to add it; automated PR-opening against the official `node-index`
 lands with the index bootstrap.
 
-`search`/`info`/`fetch` accept `--offline` to use only the cached index.
+`search`/`info`/`outdated`/`update` accept `--offline` to use only the cached index.
 Indexes are configured in `~/.config/dora/hub.toml`; a namespace resolves
 against exactly one index (see the plan §7.3). `hub:` nodes in a dataflow are
 resolved by `dora build` — there is deliberately no `dora hub install` (hub
@@ -1217,7 +1221,7 @@ Check for and install CLI updates.
 dora self update [--check-only]
 ```
 
-Downloads from GitHub releases (`dora-rs/dora`).
+Downloads from GitHub releases (`dora-rs/dora`). TLS certificates are validated against the operating system's trust store; minimal images need `ca-certificates` installed.
 
 #### `dora self uninstall`
 

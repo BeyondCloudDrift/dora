@@ -54,9 +54,9 @@ impl From<LogMessageHelper> for LogMessage {
             dataflow_id: helper.dataflow_id.or(fields
                 .and_then(|f| f.get("dataflow_id").cloned())
                 .and_then(|id| Uuid::parse_str(&id).ok())),
-            node_id: helper
-                .node_id
-                .or(fields.and_then(|f| f.get("node_id").cloned()).map(NodeId)),
+            node_id: helper.node_id.or(fields
+                .and_then(|f| f.get("node_id").cloned())
+                .and_then(|id| id.parse::<NodeId>().ok())),
             daemon_id: helper.daemon_id.or(fields
                 .and_then(|f| f.get("daemon_id").cloned())
                 .and_then(|id| DaemonId::from_display_str(&id))),
@@ -140,8 +140,8 @@ impl std::fmt::Display for NodeError {
                     13 => "SIGPIPE".into(),
                     14 => "SIGALRM".into(),
                     15 => "SIGTERM".into(),
-                    22 => "SIGABRT".into(),
-                    23 => "NSIG".into(),
+                    22 => "SIGTTOU".into(),
+                    23 => "SIGURG".into(),
                     other => other.to_string().into(),
                 };
                 if matches!(self.cause, NodeErrorCause::GraceDuration) {
@@ -281,22 +281,6 @@ impl DaemonId {
         }
     }
 
-    /// Load a persisted daemon ID from `<working_dir>/.daemon-id`, or create and persist a new one.
-    pub fn load_or_create(
-        working_dir: &std::path::Path,
-        machine_id: Option<String>,
-    ) -> std::io::Result<Self> {
-        let path = working_dir.join(".daemon-id");
-        if let Ok(contents) = std::fs::read_to_string(&path)
-            && let Ok(uuid) = contents.trim().parse::<Uuid>()
-        {
-            return Ok(DaemonId { machine_id, uuid });
-        }
-        let id = Self::new(machine_id);
-        std::fs::write(&path, id.uuid.to_string())?;
-        Ok(id)
-    }
-
     pub fn matches_machine_id(&self, machine_id: &str) -> bool {
         self.machine_id
             .as_ref()
@@ -383,10 +367,55 @@ pub struct HubProvenance {
     pub manifest_digest: Option<String>,
 }
 
+/// Lockfile pin for a `hub:` node resolved to a prebuilt binary artifact
+/// (spec §8.2). Mirrors [`GitSource`] for the binary source form: the
+/// `url`+`sha256` pin the bytes (re-verified on download), and `hub` records
+/// the package/version/manifest provenance for `--locked` tamper detection.
+#[derive(Debug, serde::Deserialize, serde::Serialize, Clone, PartialEq, Eq)]
+pub struct BinaryPin {
+    /// Platform the artifact was selected for at lock time (`<os>-<arch>`).
+    pub platform: String,
+    /// Download URL of the prebuilt artifact.
+    pub url: String,
+    /// SHA-256 the download must match.
+    pub sha256: String,
+    /// Hub provenance (index key, version, manifest digest).
+    pub hub: HubProvenance,
+}
+
 // Test roundtrip serialization of LogMessage
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn node_error_with_signal(signal: i32) -> NodeError {
+        NodeError {
+            timestamp: uhlc::HLC::default().new_timestamp(),
+            cause: NodeErrorCause::Other {
+                stderr: String::new(),
+            },
+            exit_status: NodeExitStatus::Signal(signal),
+        }
+    }
+
+    #[test]
+    fn node_error_signal_display_uses_linux_signal_names() {
+        for (signal, name) in [(6, "SIGABRT"), (22, "SIGTTOU"), (23, "SIGURG")] {
+            assert_eq!(
+                node_error_with_signal(signal).to_string(),
+                format!("exited because of signal {name}")
+            );
+        }
+    }
+
+    #[test]
+    fn node_error_signal_display_falls_back_to_signal_number() {
+        assert_eq!(
+            node_error_with_signal(40).to_string(),
+            "exited because of signal 40"
+        );
+    }
+
     #[test]
     fn test_log_message_serialization() {
         let log_message = LogMessage {
@@ -412,6 +441,45 @@ mod tests {
     fn stdout_passes_stdout_filter() {
         let stdout = LogLevelOrStdout::Stdout;
         assert!(stdout.passes(&LogLevelOrStdout::Stdout));
+    }
+
+    /// A `node_id` recovered from the untrusted `fields` map must go through
+    /// `NodeId` validation. It was previously wrapped via the raw tuple
+    /// constructor (`.map(NodeId)`), bypassing `validate_node_id` and yielding
+    /// a `NodeId` that could contain `/` or dot-segments -- the very
+    /// path-traversal characters the newtype exists to forbid. Every other
+    /// field recovered here (`build_id`, `dataflow_id`, `daemon_id`) already
+    /// parses defensively; `node_id` was the odd one out.
+    #[test]
+    fn node_id_recovered_from_fields_is_validated() {
+        let make = |node_id: &str| LogMessageHelper {
+            build_id: None,
+            dataflow_id: None,
+            node_id: None,
+            daemon_id: None,
+            level: LogLevelOrStdout::Stdout,
+            target: None,
+            module_path: None,
+            file: None,
+            line: None,
+            message: Some("m".to_string()),
+            timestamp: Utc::now(),
+            fields: Some(BTreeMap::from([(
+                "node_id".to_string(),
+                node_id.to_string(),
+            )])),
+        };
+
+        // A valid id is promoted to the typed field.
+        assert_eq!(
+            LogMessage::from(make("sensor")).node_id,
+            Some("sensor".parse().unwrap())
+        );
+
+        // Invalid ids (path separator / dot-segment) are rejected rather than
+        // silently wrapped into an unvalidated NodeId.
+        assert_eq!(LogMessage::from(make("a/b")).node_id, None);
+        assert_eq!(LogMessage::from(make("../evil")).node_id, None);
     }
 
     /// #2027: `DaemonId` must survive a `Display` -> `from_display_str` round
@@ -511,22 +579,5 @@ mod tests {
         let id = DaemonId::new(None);
         // v7 UUIDs have version nibble = 7
         assert_eq!(id.uuid.get_version_num(), 7);
-    }
-
-    #[test]
-    fn daemon_id_load_or_create_persists() {
-        let dir = tempfile::tempdir().unwrap();
-        let id1 = DaemonId::load_or_create(dir.path(), Some("m1".into())).unwrap();
-        let id2 = DaemonId::load_or_create(dir.path(), Some("m1".into())).unwrap();
-        assert_eq!(id1.uuid, id2.uuid);
-    }
-
-    #[test]
-    fn daemon_id_load_or_create_different_dirs() {
-        let dir1 = tempfile::tempdir().unwrap();
-        let dir2 = tempfile::tempdir().unwrap();
-        let id1 = DaemonId::load_or_create(dir1.path(), None).unwrap();
-        let id2 = DaemonId::load_or_create(dir2.path(), None).unwrap();
-        assert_ne!(id1.uuid, id2.uuid);
     }
 }

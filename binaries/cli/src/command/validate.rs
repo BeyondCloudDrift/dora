@@ -2,7 +2,7 @@ use super::Executable;
 use dora_core::{
     descriptor::{
         Descriptor, DescriptorExt,
-        validate::{check_type_annotations_full, check_wiring},
+        validate::{check_dataflow_static, check_type_annotations_full, check_wiring},
     },
     manifest::{NodeManifest, inject::inject_adjacent_manifests},
     types::TypeRegistry,
@@ -70,7 +70,7 @@ fn validate_dataflow(dataflow: &Path, strict_types: bool, offline: bool) -> eyre
         .with_context(|| {
             format!(
                 "failed to read dataflow at `{}`\n\n  \
-                     hint: check the file exists and is valid YAML",
+                     hint: check the file exists, is valid YAML, and matches the dataflow schema (see details below)",
                 dataflow.display()
             )
         })?
@@ -94,13 +94,45 @@ fn validate_dataflow(dataflow: &Path, strict_types: bool, offline: bool) -> eyre
         }
     }
 
-    // Resolve hub: references against the (cached) index so their contracts
-    // take part in validation (spec §6.2 ordering note)
+    // If a lockfile exists, use its pins for hub: resolution so validate
+    // reflects the same versions a --locked build would use and works offline
+    // against the index cache. Without a lockfile, fall through to live
+    // resolution (same as before).
+    let lockfile_path = super::build::lockfile::BuildLockfile::path_for_dataflow(dataflow, None);
+    let lockfile = if lockfile_path.exists() {
+        match super::build::lockfile::BuildLockfile::read_from(&lockfile_path) {
+            Ok(lf) => {
+                println!(
+                    "  Using hub pins from lockfile `{}`",
+                    lockfile_path.display()
+                );
+                Some(lf)
+            }
+            Err(e) => {
+                eprintln!(
+                    "  warning: could not read lockfile `{}`: {e} — resolving hub: nodes live",
+                    lockfile_path.display()
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let hub_pins = lockfile.as_ref().map(|l| l.git_sources.clone());
+    let hub_binary_pins = lockfile.as_ref().map(|l| l.binary_sources.clone());
+
+    // Resolve hub: references so their contracts take part in validation
+    // (spec §6.2 ordering note).
     let hub_resolution = super::build::hub::resolve_hub_nodes(
         &mut descriptor,
         &mut registry,
         offline,
-        None,
+        hub_pins.as_ref(),
+        hub_binary_pins.as_ref(),
+        // validate is advisory, not a reproducibility gate: use lockfile pins
+        // when valid, but a missing/stale pin resolves live instead of failing.
+        false,
         &std::collections::BTreeMap::<String, std::path::PathBuf>::new(),
     )?;
     for note in &hub_resolution.notes {
@@ -110,6 +142,12 @@ fn validate_dataflow(dataflow: &Path, strict_types: bool, offline: bool) -> eyre
     // Check input/output wiring (no build required)
     check_wiring(&descriptor).context("wiring check failed")?;
     println!("Input/output wiring OK.");
+
+    // Static whole-descriptor checks (timing fields, log config, ros2 configs) —
+    // the same ones `dora run`/`dora status --dataflow` enforce, minus
+    // source-path existence which needs a build first.
+    check_dataflow_static(&descriptor).context("descriptor check failed")?;
+    println!("Descriptor config OK.");
 
     // Inject contracts from node manifests adjacent to path: nodes (§6.2)
     let injection = inject_adjacent_manifests(&mut descriptor, working_dir, &mut registry);

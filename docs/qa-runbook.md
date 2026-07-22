@@ -55,7 +55,7 @@ rustup component add miri --toolchain nightly   # optional; for unsafe-code anal
 | `make qa-full` | `qa-fast` + full test suite + coverage | ~5-10 min | Pre-push |
 | `make qa-deep` | `qa-full` + mutation testing on diff + semver | ~15 min | Target Tier 1 local gate (stronger than today's CI: adds coverage, adversarial, mutants, semver) |
 | `make qa-tier1` | alias for `qa-deep` | — | Back-compat; prefer `qa-deep` |
-| `make qa-nightly` | `qa-deep` + proptest@1000 + miri (if installed) + example-smoke (in scratch venv with `-e apis/python/node`) + ci-nightly-jobs | ~3-4 hours | Full parity with `.github/workflows/nightly.yml` after the #1716 rebalance: **18 test jobs total**. example-smoke covers the **4 example-backed** GHA jobs (smoke-suite, log-sinks, service-action, streaming); `scripts/qa/ci-nightly-jobs.sh` drives the **14 remaining** with platform-aware dispatch (record-replay, cluster-smoke, topic-and-top, cpu-affinity [Linux], redb-backend, daemon-reconnect [Linux], state-reconstruction, test-cross-platform [macOS+Windows], examples, cli-tests, bench-example, cross-check, ros2-bridge [Linux+ROS2], msrv). Requires **both `uv` and Python 3.12** — both preflighted; fails fast with a specific install hint for whichever is missing (`curl -LsSf https://astral.sh/uv/install.sh \| sh` for uv, `uv python install 3.12` for the interpreter). example-smoke installs workspace Python bindings into the scratch venv to match the GHA Python setup (avoids PyPI drift, #1710). Green local run on platform X predicts a green CI nightly for platform X's jobs; jobs that can't run on the dev's OS SKIP cleanly. Does NOT include full-repo mutation testing (see `qa-mutation-audit`). |
+| `make qa-nightly` | `qa-deep` + proptest@1000 + miri (if installed) + example-smoke (in scratch venv with `-e apis/python/node`) + hub-smoke + ci-nightly-jobs | ~3-4 hours | Full parity with `.github/workflows/nightly.yml` after the #1716 rebalance: **19 test jobs total**. example-smoke covers the **4 example-backed** GHA jobs (smoke-suite, log-sinks, service-action, streaming); hub-smoke covers the **Hub e2e** job (tests/hub-smoke.rs); `scripts/qa/ci-nightly-jobs.sh` drives the **14 remaining** with platform-aware dispatch (record-replay, cluster-smoke, topic-and-top, cpu-affinity [Linux], redb-backend, daemon-reconnect [Linux], state-reconstruction, test-cross-platform [macOS+Windows], examples, cli-tests, bench-example, cross-check, ros2-bridge [Linux+ROS2], msrv). Requires **both `uv` and Python 3.12** — both preflighted; fails fast with a specific install hint for whichever is missing (`curl -LsSf https://astral.sh/uv/install.sh \| sh` for uv, `uv python install 3.12` for the interpreter). example-smoke installs workspace Python bindings into the scratch venv to match the GHA Python setup (avoids PyPI drift, #1710). Green local run on platform X predicts a green CI nightly for platform X's jobs; jobs that can't run on the dev's OS SKIP cleanly. Does NOT include full-repo mutation testing (see `qa-mutation-audit`). |
 | `make qa-release-gate` | `qa-deep` + semver | ~15 min | The automatable subset of Tier 3. Non-automatable: security audit + dogfood + migration validation (see strategy doc §7) |
 | `make qa-mutation-audit` | `cargo-mutants --full` on 6 critical crates | ~10-18 hrs | Deliberate test-quality audit, not every nightly |
 | `make qa-examples` | `scripts/smoke-all.sh` -- all smoke-eligible example dataflows end-to-end (skips CUDA/ROS2/webcam/C++/interactive) | ~15-20 min | When you want actual dataflows exercised. Orthogonal to ladder -- qa-fast/full/deep all `--exclude dora-examples`. Pass `ARGS="--rust-only"` etc. |
@@ -242,12 +242,15 @@ rustup component add miri --toolchain nightly
 **Run**:
 
 ```bash
-# metadata.rs — known-good target with focused unit tests
-cargo +nightly miri test -p dora-core metadata::tests
-
-# Add more targets as they gain focused unit tests:
-# cargo +nightly miri test -p dora-coordinator-store
-# cargo +nightly miri test -p dora-arrow-convert
+# No miri-runnable target at present. The former one — dora-core's
+# `metadata::tests`, exercising the unsafe pointer arithmetic in
+# `ArrowTypeInfoExt::from_array` — was removed when the `ArrowTypeInfo`
+# sidecar was dropped for Arrow-IPC framing; dora-core now has zero unsafe.
+# The miri-worthy unsafe moved to dora-node-api's IPC encode/decode paths
+# (`arrow_utils/ipc_encode.rs`, `event_stream`), but that crate links zenoh +
+# shared-memory-server (`shm_open`), which miri cannot run wholesale. Add a
+# tightly-scoped, FFI-free filter here once it has been verified to run clean:
+# cargo +nightly miri test -p dora-node-api <ffi-free-ipc-test-filter>
 ```
 
 **Do NOT** run miri on `shared-memory-server` — its tests call libc's `shm_open` which miri does not support. Every test aborts with "unsupported operation". See `plan-agentic-qa-strategy.md` Section T2.3 for the explanation and the long-term fix (Zenoh SHM migration).

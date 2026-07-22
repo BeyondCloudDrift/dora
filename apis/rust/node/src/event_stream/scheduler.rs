@@ -64,14 +64,14 @@ fn select_eviction(queue: &VecDeque<EventItem>, incoming: &EventItem) -> Evictio
 /// everything in the queue is also correlated. Identifies the correlation
 /// keys so operators can trace the affected request/goal.
 fn log_correlation_drop(event_id: &DataId, dropped: &EventItem) {
-    let EventItem::NodeEvent {
-        event: NodeEvent::Input { metadata, .. },
-        ..
-    } = dropped
-    else {
-        return;
+    let params = match dropped {
+        EventItem::NodeEvent {
+            event: NodeEvent::Input { metadata, .. },
+            ..
+        } => &metadata.parameters,
+        EventItem::ZenohInput { metadata, .. } => &metadata.parameters,
+        _ => return,
     };
-    let params = &metadata.parameters;
     let request_id = get_string_param(params, REQUEST_ID);
     let goal_id = get_string_param(params, GOAL_ID);
     let goal_status = get_string_param(params, GOAL_STATUS);
@@ -248,17 +248,24 @@ impl Scheduler {
             }
         }
 
-        // Enforce queue size limit
-        let (size, queue) = self
-            .event_queues
-            .entry(event_id.clone())
-            .or_insert_with(|| {
-                tracing::warn!(
-                    "no queue config for input `{event_id}`, using default size {DEFAULT_QUEUE_SIZE}"
-                );
-                self.last_used.push_back(event_id.clone());
-                (DEFAULT_QUEUE_SIZE, Default::default())
-            });
+        // Enforce queue size limit.
+        //
+        // The queue is normally preconfigured for every input at construction
+        // (see `with_policies`), so look it up by reference first to avoid
+        // cloning the `DataId` key on every event. Only the rare unconfigured
+        // input path needs to allocate an owned key for insertion.
+        if !self.event_queues.contains_key(event_id) {
+            tracing::warn!(
+                "no queue config for input `{event_id}`, using default size {DEFAULT_QUEUE_SIZE}"
+            );
+            self.last_used.push_back(event_id.clone());
+            self.event_queues
+                .insert(event_id.clone(), (DEFAULT_QUEUE_SIZE, Default::default()));
+        }
+        let Some((size, queue)) = self.event_queues.get_mut(event_id) else {
+            // Unreachable: the entry was just inserted above when missing.
+            return;
+        };
 
         let policy = self
             .queue_policies
@@ -332,26 +339,14 @@ impl Scheduler {
 mod tests {
     use super::*;
     use crate::uhlc;
-    use arrow_schema::DataType;
     use dora_message::{
         daemon_to_node::NodeEvent,
-        metadata::{ArrowTypeInfo, FLUSH, Metadata, MetadataParameters, Parameter},
+        metadata::{FLUSH, Metadata, MetadataParameters, Parameter},
     };
 
     fn make_input(id: &str, params: MetadataParameters) -> EventItem {
-        let type_info = ArrowTypeInfo {
-            data_type: DataType::Null,
-            len: 0,
-            null_count: 0,
-            validity: None,
-            offset: 0,
-            buffer_offsets: vec![],
-            child_data: vec![],
-            field_names: None,
-            schema_hash: None,
-        };
         let ts = uhlc::HLC::default().new_timestamp();
-        let metadata = Metadata::from_parameters(ts, type_info, params);
+        let metadata = Metadata::from_parameters(ts, params);
         EventItem::NodeEvent {
             event: NodeEvent::Input {
                 id: DataId::from(id.to_string()),
@@ -688,5 +683,67 @@ mod tests {
         // Zero drops
         let counts = sched.drain_drop_counts();
         assert!(counts.is_empty());
+    }
+
+    // ---- issue #2212: log_correlation_drop must also fire for ZenohInput ----
+
+    fn make_zenoh_input(id: &str, params: MetadataParameters) -> EventItem {
+        let ts = uhlc::HLC::default().new_timestamp();
+        let metadata = Metadata::from_parameters(ts, params);
+        use dora_arrow_convert::IntoArrow;
+        EventItem::ZenohInput {
+            id: DataId::from(id.to_string()),
+            metadata: std::sync::Arc::new(metadata),
+            data: ().into_arrow().into(),
+        }
+    }
+
+    /// Helper: extract request_id from a ZenohInput event's metadata, if any.
+    fn request_id_of_zenoh(event: &EventItem) -> Option<String> {
+        let EventItem::ZenohInput { metadata, .. } = event else {
+            return None;
+        };
+        get_string_param(&metadata.parameters, REQUEST_ID).map(|s| s.to_string())
+    }
+
+    #[test]
+    fn zenoh_drop_oldest_drops_front_loudly_when_both_queue_and_incoming_are_correlated() {
+        // Mirrors `drop_oldest_drops_front_loudly_when_both_queue_and_incoming_are_correlated`
+        // but uses ZenohInput items, exercising the second match arm of
+        // `log_correlation_drop` (issue #2212).
+        //
+        // Queue: [req-1, req-2] (both ZenohInput + correlated). Incoming is req-3.
+        // Unavoidable drop — the oldest correlation (req-1) is evicted.
+        let (mut sched, id) = make_scheduler(2);
+
+        sched.add_event(make_zenoh_input("audio", with_request_id("req-1")));
+        sched.add_event(make_zenoh_input("audio", with_request_id("req-2")));
+        sched.add_event(make_zenoh_input("audio", with_request_id("req-3")));
+
+        let queue = &sched.event_queues[&id].1;
+        assert_eq!(queue.len(), 2);
+        let ids: Vec<_> = queue.iter().filter_map(request_id_of_zenoh).collect();
+        assert_eq!(ids, vec!["req-2".to_string(), "req-3".to_string()]);
+    }
+
+    #[test]
+    fn zenoh_drop_oldest_preserves_correlated_when_non_correlated_present() {
+        // ZenohInput mirror of `drop_oldest_preserves_correlated_when_non_correlated_present`.
+        // A correlated ZenohInput must not be evicted when non-correlated items are available.
+        let (mut sched, id) = make_scheduler(3);
+
+        sched.add_event(make_zenoh_input("audio", with_request_id("req-1")));
+        sched.add_event(make_zenoh_input("audio", MetadataParameters::new()));
+        sched.add_event(make_zenoh_input("audio", MetadataParameters::new()));
+        sched.add_event(make_zenoh_input("audio", MetadataParameters::new()));
+
+        let queue = &sched.event_queues[&id].1;
+        assert_eq!(queue.len(), 3);
+        assert!(
+            queue
+                .iter()
+                .any(|e| request_id_of_zenoh(e).as_deref() == Some("req-1")),
+            "correlated ZenohInput was dropped even though non-correlated events were available"
+        );
     }
 }

@@ -200,14 +200,16 @@ out/
 # MacOS DS_Store
 .DS_Store
 
-# Claude Code local settings (machine-specific)
+# Claude Code local settings and temporary agent worktrees (machine-specific)
 .claude/settings.local.json
+.claude/worktrees/
 
 # macOS debug symbol bundles
 *.dSYM/
 
 # Dora auth token (generated at runtime)
 .dora-token
+.adora-token
 .daemon-id
 
 #Miscellaneous
@@ -227,3 +229,4 @@ yolo.yml
 # Session-local working notes (per-session handoff docs, run findings,
 # upstream PR drafts). Not part of the source.
 .project_notes/
+.idea/

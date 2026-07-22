@@ -11,6 +11,7 @@
 //!   - Multiple `dora run` calls can execute in parallel.
 
 use super::Executable;
+use crate::common::parse_duration;
 use crate::{
     BuildConfig, build as build_dataflow,
     common::{handle_dataflow_result, resolve_dataflow, write_events_to},
@@ -21,7 +22,6 @@ use crate::{
 };
 use dora_core::build::LogLevelOrStdout;
 use dora_daemon::{Daemon, LogDestination, flume};
-use duration_str::parse as parse_duration_str;
 use eyre::Context;
 use std::{path::PathBuf, time::Duration};
 use tokio::runtime::Builder;
@@ -51,7 +51,7 @@ pub struct Run {
     ///   --stop-after 30s     # 30 seconds
     ///   --stop-after 5m      # 5 minutes
     #[clap(long, value_name = "DURATION", verbatim_doc_comment)]
-    #[arg(value_parser = parse_duration_str)]
+    #[arg(value_parser = parse_duration)]
     pub stop_after: Option<Duration>,
     /// Minimum log level to display
     ///
@@ -240,6 +240,11 @@ impl Executable for Run {
         let result = rt
             .block_on(handle)
             .context("dora-run daemon task panicked")??;
+        // Bound runtime shutdown to prevent hanging on blocking Drop impls
+        // (e.g. zenoh::Session::drop blocks tokio workers on macOS during
+        // TCP teardown). Without this, `rt` drops implicitly at end of scope
+        // and waits indefinitely for all worker threads to exit (#2287).
+        rt.shutdown_timeout(Duration::from_secs(10));
         handle_dataflow_result(result, None)
     }
 }

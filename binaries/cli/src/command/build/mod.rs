@@ -268,7 +268,7 @@ pub fn build(cfg: BuildConfig) -> eyre::Result<()> {
         .wrap_err_with(|| {
             format!(
                 "failed to read dataflow at `{}`\n\n  \
-                 hint: check the file exists and is valid YAML",
+                 hint: check the file exists, is valid YAML, and matches the dataflow schema (see details below)",
                 dataflow_path.display()
             )
         })?
@@ -344,11 +344,15 @@ pub fn build(cfg: BuildConfig) -> eyre::Result<()> {
     // Desugar hub: nodes into concrete git nodes (spec §10.1) — after module
     // expansion, before type-checking
     let hub_pins = build_lockfile.as_ref().map(|l| l.git_sources.clone());
+    let hub_binary_pins = build_lockfile.as_ref().map(|l| l.binary_sources.clone());
     let hub_resolution = hub::resolve_hub_nodes(
         &mut dataflow_descriptor,
         &mut registry,
         offline,
         hub_pins.as_ref(),
+        hub_binary_pins.as_ref(),
+        // `dora build --locked` is the strict reproducible path.
+        locked,
         &hub_override_dirs,
     )?;
     let hub_override_node_dirs = hub_resolution.override_dirs.clone();
@@ -459,13 +463,18 @@ pub fn build(cfg: BuildConfig) -> eyre::Result<()> {
         }
     }
     if write_lockfile {
-        BuildLockfile::write_git_sources(&lockfile_path, &git_sources, &descriptor_fingerprint)
-            .with_context(|| {
-                format!(
-                    "failed to write build lockfile to `{}`",
-                    lockfile_path.display()
-                )
-            })?;
+        BuildLockfile::write_git_sources(
+            &lockfile_path,
+            &git_sources,
+            &hub_resolution.binary_sources,
+            &descriptor_fingerprint,
+        )
+        .with_context(|| {
+            format!(
+                "failed to write build lockfile to `{}`",
+                lockfile_path.display()
+            )
+        })?;
         log::info!("wrote build lockfile to {}", lockfile_path.display());
     }
 

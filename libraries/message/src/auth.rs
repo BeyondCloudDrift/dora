@@ -56,7 +56,7 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// Generate a cryptographically random 32-byte token.
 pub fn generate_token() -> AuthToken {
     let mut buf = [0u8; TOKEN_BYTES];
-    getrandom::getrandom(&mut buf).expect("failed to generate random bytes");
+    getrandom::fill(&mut buf).expect("failed to generate random bytes");
     let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
     AuthToken(hex)
 }
@@ -167,14 +167,6 @@ fn read_token_from_path(path: &Path) -> std::io::Result<Option<AuthToken>> {
     }
 }
 
-/// Remove the token file if it exists (from both working dir and config dir).
-pub fn remove_token(working_dir: &Path) {
-    let _ = fs::remove_file(token_path(working_dir));
-    if let Some(config_path) = config_token_path() {
-        let _ = fs::remove_file(config_path);
-    }
-}
-
 /// Attempt to read the auth token from (in order):
 /// 1. `DORA_AUTH_TOKEN` environment variable
 /// 2. `<cwd>/.dora-token` file
@@ -206,6 +198,37 @@ pub fn discover_token() -> Option<AuthToken> {
     None
 }
 
+/// Kani proof harnesses (`make qa-kani`). Compiled only under `cargo kani`,
+/// never in normal builds or tests. See `docs/formal-verification.md`.
+#[cfg(kani)]
+mod verification {
+    use super::constant_time_eq;
+
+    /// Maximum slice length explored by the proofs. Token comparison inputs
+    /// are attacker-controlled strings of arbitrary length, but the loop
+    /// body is length-uniform, so a small bound suffices to cover all
+    /// control-flow paths (equal/unequal lengths, differing byte positions).
+    const MAX_LEN: usize = 8;
+
+    /// Functional correctness: `constant_time_eq` agrees with `==` on all
+    /// slice pairs up to `MAX_LEN`, including length mismatches and the
+    /// empty slice. Also proves the function never panics on these inputs.
+    #[kani::proof]
+    #[kani::unwind(9)] // MAX_LEN + 1
+    fn constant_time_eq_matches_slice_equality() {
+        let a: [u8; MAX_LEN] = kani::any();
+        let b: [u8; MAX_LEN] = kani::any();
+        let a_len: usize = kani::any();
+        let b_len: usize = kani::any();
+        kani::assume(a_len <= MAX_LEN);
+        kani::assume(b_len <= MAX_LEN);
+        assert_eq!(
+            constant_time_eq(&a[..a_len], &b[..b_len]),
+            a[..a_len] == b[..b_len]
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,9 +256,6 @@ mod tests {
 
         let read_back = read_token(dir.path()).unwrap().unwrap();
         assert_eq!(token.as_hex(), read_back.as_hex());
-
-        remove_token(dir.path());
-        assert!(read_token(dir.path()).unwrap().is_none());
     }
 
     #[test]
