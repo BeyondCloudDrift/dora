@@ -9,7 +9,10 @@ use dora_core::config::InputMapping;
 use dora_message::{common::Timestamped, daemon_to_daemon::InterDaemonEvent};
 
 use crate::{
-    command::{Executable, default_tracing, topic::selector::TopicSelector},
+    command::{
+        Executable, default_tracing,
+        topic::selector::{TopicSelector, node_topic_inputs},
+    },
     common::CoordinatorOptions,
 };
 
@@ -21,7 +24,7 @@ use crate::{
 /// Topic inspection requires debug mode on the dataflow:
 ///
 /// ```yaml
-/// _unstable_debug:
+/// debug:
 ///   enable_debug_inspection: true
 /// ```
 ///
@@ -146,7 +149,7 @@ fn info(
     // Find subscribers
     let mut subscribers = Vec::new();
     for node in &descriptor.nodes {
-        for (input_id, input) in &node.inputs {
+        for (input_id, input) in node_topic_inputs(node) {
             if let InputMapping::User(user) = &input.mapping
                 && user.source == topic.node_id
                 && user.output == topic.data_id
@@ -178,8 +181,15 @@ fn info(
                         }
                     };
                     match event.inner {
-                        InterDaemonEvent::Output { data, .. } => {
-                            let data_size = data.as_ref().map(|d| d.len()).unwrap_or(0);
+                        InterDaemonEvent::Output { data, metadata, .. } => {
+                            // Charge the real on-wire size, not the rebuilt
+                            // self-describing `data` (which re-prepends the schema
+                            // a schema-once output ships only once) — see
+                            // `debug_frame_wire_size` (#2584).
+                            let data_size = dora_message::metadata::debug_frame_wire_size(
+                                &metadata.parameters,
+                                data.as_deref(),
+                            );
                             // The payload is a self-describing Arrow IPC stream;
                             // read its data type from the decoded array (best
                             // effort — a malformed stream just leaves it unknown).
@@ -188,6 +198,8 @@ fn info(
                             stats_clone.record(data_size, data_type, Instant::now());
                         }
                         InterDaemonEvent::OutputClosed { .. } => break,
+                        // `InterDaemonEvent` is `#[non_exhaustive]`: skip events this build predates.
+                        _ => continue,
                     }
                 }
                 Ok(Err(_)) => continue,

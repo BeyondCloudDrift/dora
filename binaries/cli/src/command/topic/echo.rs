@@ -1,4 +1,4 @@
-use std::{ptr::NonNull, sync::Arc, time::SystemTime};
+use std::{collections::HashMap, ptr::NonNull, sync::Arc, time::SystemTime};
 
 use arrow::{buffer::OffsetBuffer, datatypes::Field};
 use clap::Args;
@@ -7,7 +7,10 @@ use dora_message::{common::Timestamped, daemon_to_daemon::InterDaemonEvent, meta
 use eyre::{Context, eyre};
 
 use crate::{
-    command::{Executable, default_tracing, topic::selector::TopicSelector},
+    command::{
+        Executable, default_tracing,
+        topic::selector::{TopicSelector, public_topic_output_id},
+    },
     common::CoordinatorOptions,
     formatting::OutputFormat,
 };
@@ -20,7 +23,7 @@ use crate::{
 /// Topic inspection requires debug mode on the dataflow:
 ///
 /// ```yaml
-/// _unstable_debug:
+/// debug:
 ///   enable_debug_inspection: true
 /// ```
 ///
@@ -42,6 +45,9 @@ pub struct Echo {
     selector: TopicSelector,
 
     /// Output format
+    ///
+    /// `json` emits JSON Lines (one object per decoded message);
+    /// diagnostics go to stderr.
     #[clap(long, value_name = "FORMAT", default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
 
@@ -73,6 +79,31 @@ impl Executable for Echo {
     }
 }
 
+/// Compute the `recv_timeout` for one iteration of the echo loop, or `None`
+/// when the `--duration` window has elapsed and the loop should stop.
+///
+/// Taking the already-computed `elapsed` (rather than an absolute deadline)
+/// keeps the caller off `Instant + Duration`, which overflows and panics for a
+/// large-but-valid `--duration`. A remaining wait is capped at `hint` so the
+/// loop still wakes periodically to show the "enable debug inspection" hint.
+fn echo_recv_timeout(
+    duration: Option<std::time::Duration>,
+    elapsed: std::time::Duration,
+    hint: std::time::Duration,
+) -> Option<std::time::Duration> {
+    match duration {
+        Some(d) => {
+            let remaining = d.saturating_sub(elapsed);
+            if remaining.is_zero() {
+                None
+            } else {
+                Some(remaining.min(hint))
+            }
+        }
+        None => Some(hint),
+    }
+}
+
 fn inspect(
     coordinator: CoordinatorOptions,
     selector: TopicSelector,
@@ -81,7 +112,10 @@ fn inspect(
     duration: Option<u64>,
 ) -> eyre::Result<()> {
     let session = coordinator.connect()?;
-    let (dataflow_id, topics) = selector.resolve(&session)?;
+    let (dataflow_id, topics, descriptor) = selector.resolve_with_descriptor(&session)?;
+    // Frames report the daemon's wire output id; label them with the public id
+    // the user typed and `topic list`/`info` display (dora-rs/dora#2893).
+    let nodes: HashMap<_, _> = descriptor.nodes.iter().map(|n| (&n.id, n)).collect();
 
     let ws_topics: Vec<_> = topics
         .iter()
@@ -95,7 +129,13 @@ fn inspect(
     let mut hint_shown = false;
     let mut buf = Vec::with_capacity(1024);
     let mut emitted: u64 = 0;
-    let deadline = duration.map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s));
+    // Track the run window as a start instant plus `elapsed()` rather than an
+    // absolute `Instant::now() + Duration::from_secs(seconds)`: `--duration` is
+    // bounded only from below (`range(1..)`), so a large-but-valid `u64` would
+    // make `Instant + Duration` overflow the monotonic clock and panic. See
+    // `echo_recv_timeout`, and the sibling `topic hz` sampler.
+    let start = std::time::Instant::now();
+    let duration = duration.map(std::time::Duration::from_secs);
     loop {
         // Stop conditions: --count reached or --duration elapsed.
         if let Some(max) = count
@@ -103,27 +143,21 @@ fn inspect(
         {
             break;
         }
-        let recv_timeout = match deadline {
-            Some(d) => {
-                let remaining = d.saturating_duration_since(std::time::Instant::now());
-                if remaining.is_zero() {
-                    break;
-                }
-                remaining.min(HINT_TIMEOUT)
-            }
-            None => HINT_TIMEOUT,
+        let recv_timeout = match echo_recv_timeout(duration, start.elapsed(), HINT_TIMEOUT) {
+            Some(timeout) => timeout,
+            None => break,
         };
         let result = match data_rx.recv_timeout(recv_timeout) {
             Ok(result) => result,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if let Some(d) = deadline
-                    && std::time::Instant::now() >= d
+                if let Some(d) = duration
+                    && start.elapsed() >= d
                 {
                     break;
                 }
                 if !hint_shown {
                     eprintln!(
-                        "{}: no topic data received during the wait window. Ensure `_unstable_debug.enable_debug_inspection: true` is enabled on the dataflow.",
+                        "{}: no topic data received during the wait window. Ensure `debug.enable_debug_inspection: true` is enabled on the dataflow.",
                         "hint".yellow().bold(),
                     );
                     hint_shown = true;
@@ -159,11 +193,20 @@ fn inspect(
             } => {
                 use std::fmt::Write;
 
-                let output_name = format!("{node_id}/{output_id}");
+                let display_output = nodes
+                    .get(&node_id)
+                    .map(|node| public_topic_output_id(node, &output_id))
+                    .unwrap_or_else(|| output_id.clone());
+                let output_name = format!("{node_id}/{display_output}");
 
+                // `duration_since(UNIX_EPOCH)` errors when the wall clock is set
+                // before 1970 (e.g. an embedded target booting with an unset RTC
+                // before NTP sync). Fall back to a zero timestamp rather than
+                // panicking a live `dora topic echo`, mirroring the daemon's
+                // `current_millis()` helper.
                 let timestamp = SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or_default()
                     .as_millis();
 
                 let data_str = if let Some(data) = data {
@@ -240,6 +283,8 @@ fn inspect(
             } => {
                 eprintln!("Output {node_id}/{output_id} closed");
             }
+            // `InterDaemonEvent` is `#[non_exhaustive]`: skip events this build predates.
+            _ => {}
         }
     }
 
@@ -428,5 +473,35 @@ mod tests {
         let err =
             decode_arrow_ipc_zero_copy(arrow::buffer::Buffer::from_vec(vec![0u8; 16])).unwrap_err();
         assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn echo_recv_timeout_does_not_panic_on_oversized_duration() {
+        use std::time::Duration;
+        let hint = Duration::from_secs(5);
+
+        // No `--duration`: always wait a hint-length window.
+        assert_eq!(echo_recv_timeout(None, Duration::ZERO, hint), Some(hint));
+
+        // A huge-but-valid `--duration` (10^19 s) must not panic: previously the
+        // loop formed `Instant::now() + Duration::from_secs(seconds)`, which
+        // overflowed the monotonic clock. The remaining wait is capped at `hint`.
+        let huge = Duration::from_secs(10_000_000_000_000_000_000);
+        assert_eq!(
+            echo_recv_timeout(Some(huge), Duration::from_secs(1), hint),
+            Some(hint),
+        );
+
+        // Once the window has elapsed, the loop is told to stop (`None`).
+        assert_eq!(
+            echo_recv_timeout(Some(Duration::from_secs(2)), Duration::from_secs(2), hint),
+            None,
+        );
+
+        // A remaining window shorter than the hint is returned as-is.
+        assert_eq!(
+            echo_recv_timeout(Some(Duration::from_secs(3)), Duration::from_secs(1), hint),
+            Some(Duration::from_secs(2)),
+        );
     }
 }

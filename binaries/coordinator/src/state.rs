@@ -77,6 +77,30 @@ impl DaemonConnections {
         self.daemons.get(daemon_id).map(|c| c.connection_id)
     }
 
+    /// Zenoh endpoints of every connected daemon except `joining`, for a
+    /// daemon that is registering now to dial.
+    ///
+    /// `joining` is excluded so a re-registering daemon is not told to dial
+    /// its own previous listener: `add` has not replaced its entry yet at the
+    /// point the register reply is built, and that endpoint is either its own
+    /// (a self-dial) or dead (the process restarted with a fresh ephemeral
+    /// port).
+    pub(crate) fn zenoh_endpoints_for(&self, joining: &DaemonId) -> Vec<String> {
+        self.daemons
+            .iter()
+            .filter(|(id, _)| *id != joining)
+            .filter_map(|(_, conn)| conn.zenoh_listen_endpoint.clone())
+            .collect()
+    }
+
+    /// Record (or, with `None`, withdraw) a daemon's zenoh endpoint after it
+    /// verified its listener. Unknown daemon → no-op.
+    pub(crate) fn set_zenoh_endpoint(&mut self, id: &DaemonId, endpoint: Option<String>) {
+        if let Some(conn) = self.daemons.get_mut(id) {
+            conn.zenoh_listen_endpoint = endpoint;
+        }
+    }
+
     pub(crate) fn unnamed(&self) -> impl Iterator<Item = &DaemonId> {
         self.daemons.keys().filter(|id| id.machine_id().is_none())
     }
@@ -98,6 +122,10 @@ pub(crate) struct DaemonConnection {
     pub(crate) sender: mpsc::Sender<String>,
     /// Shared with the ws_daemon handler task to resolve correlation-based replies.
     pub(crate) pending_replies: Arc<Mutex<HashMap<Uuid, oneshot::Sender<String>>>>,
+    /// The daemon's WS peer address as seen by the coordinator (set at
+    /// registration). Lets other daemons reach this daemon's direct-TCP
+    /// memory-pool data listener.
+    pub(crate) peer_addr: Option<std::net::SocketAddr>,
     pub(crate) last_heartbeat: Instant,
     pub(crate) labels: BTreeMap<String, String>,
     /// Latest fault tolerance stats from this daemon (updated on each heartbeat).
@@ -111,6 +139,30 @@ pub(crate) struct DaemonConnection {
     /// connection's `DaemonExit` from a freshly re-registered connection
     /// that reused the same `DaemonId` (daemon reconnect race, #2392).
     pub(crate) connection_id: Uuid,
+    /// The zenoh endpoint this daemon reported as bound, handed to daemons
+    /// that register later so they can dial it.
+    ///
+    /// `None` until the daemon reports one, and it only reports a listener it
+    /// verified as bound — so an entry here always has something behind it.
+    /// Lives on the connection rather than in a side map so it is pruned with
+    /// the connection: a daemon that dropped must not keep being advertised,
+    /// and a restarted one replaces its own stale entry on re-register.
+    pub(crate) zenoh_listen_endpoint: Option<String>,
+    /// Consecutive coordinator→daemon heartbeat-send timeouts (the bounded
+    /// command channel was full when the 500 ms heartbeat deadline elapsed).
+    /// Reset to 0 on any completed send. A transient streak is tolerated as
+    /// backpressure; a persistent one escalates to a disconnect (see
+    /// `MAX_CONSECUTIVE_HEARTBEAT_SEND_TIMEOUTS`).
+    pub(crate) consecutive_heartbeat_send_timeouts: u32,
+}
+
+/// The envelope `handle_daemon_response` (see `ws_daemon.rs`) produces when a
+/// daemon replies with a WS-level `error` instead of a result. `deny_unknown_fields`
+/// keeps it from ever matching a real `DaemonCoordinatorReply` payload.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WsErrorEnvelope {
+    ws_error: String,
 }
 
 impl DaemonConnection {
@@ -122,6 +174,7 @@ impl DaemonConnection {
         Self {
             sender,
             pending_replies,
+            peer_addr: None,
             last_heartbeat: Instant::now(),
             labels,
             ft_stats: None,
@@ -129,6 +182,8 @@ impl DaemonConnection {
             // conservative default keeps non-registration constructors safe
             supports_hub_sources: false,
             connection_id: Uuid::new_v4(),
+            zenoh_listen_endpoint: None,
+            consecutive_heartbeat_send_timeouts: 0,
         }
     }
 
@@ -141,8 +196,8 @@ impl DaemonConnection {
 
     /// Send a message to the daemon and wait for a reply.
     ///
-    /// Embeds raw JSON bytes directly to preserve u128 fidelity
-    /// for uhlc::ID inside timestamps.
+    /// `message` is already-serialized JSON, so it is embedded into the envelope
+    /// verbatim rather than re-parsed into a `serde_json::Value` first.
     pub(crate) async fn send_and_receive(&self, message: &[u8]) -> eyre::Result<Vec<u8>> {
         let id = Uuid::new_v4();
         let params_str =
@@ -180,13 +235,25 @@ impl DaemonConnection {
                 }
             };
 
+        // A WS-level failure on the daemon side arrives as a `{"ws_error": ...}`
+        // envelope (see `handle_daemon_response` in `ws_daemon.rs`). It matches
+        // no `DaemonCoordinatorReply` variant, so returning it verbatim would
+        // make every caller fail with an opaque "failed to deserialize ... reply"
+        // and drop the daemon's real error text (it would survive only in a log
+        // line). Surface it as an `Err` carrying that text instead.
+        if let Ok(WsErrorEnvelope { ws_error }) =
+            serde_json::from_str::<WsErrorEnvelope>(&response_json)
+        {
+            return Err(eyre!("daemon returned error: {ws_error}"));
+        }
+
         Ok(response_json.into_bytes())
     }
 
     /// Send a message to the daemon without waiting for a reply (fire-and-forget).
     ///
-    /// Embeds raw JSON bytes directly to preserve u128 fidelity
-    /// for uhlc::ID inside timestamps.
+    /// `message` is already-serialized JSON, so it is embedded into the envelope
+    /// verbatim rather than re-parsed into a `serde_json::Value` first.
     pub(crate) async fn send(&self, message: &[u8]) -> eyre::Result<()> {
         let params_str =
             std::str::from_utf8(message).map_err(|e| eyre!("outgoing message not UTF-8: {e}"))?;
@@ -228,6 +295,22 @@ pub(crate) struct RunningDataflow {
     /// IDs of daemons that are waiting until all nodes are started.
     pub(crate) pending_daemons: BTreeSet<DaemonId>,
     pub(crate) exited_before_subscribe: Vec<NodeId>,
+    /// Whether the ready barrier has already been broadcast for this
+    /// dataflow.
+    ///
+    /// The broadcast goes to `daemons` at the moment it fires, so a daemon
+    /// that is disconnected then never receives it — and nothing replays it
+    /// on reconnect, leaving every node it owns parked in `init_from_env()`
+    /// forever (dora-rs/dora#2998). Remembering the release lets the
+    /// reconnect path re-send it to just that daemon.
+    ///
+    /// Mirrored into the persisted record (`make_record`) and restored by
+    /// [`RunningDataflow::recovered`], because this entry does not survive
+    /// orphan reclaim or a coordinator restart. It cannot be left in memory
+    /// only and reconstructed later from a fresh `ReadyOnDaemon`: the daemon
+    /// never sends one, since `PendingNodes::reported_init_to_coordinator` is
+    /// set once and never reset.
+    pub(crate) ready_barrier_released: bool,
     pub(crate) nodes: BTreeMap<NodeId, ResolvedNode>,
     /// Maps each node to the daemon it's running on
     pub(crate) node_to_daemon: BTreeMap<NodeId, DaemonId>,
@@ -348,11 +431,7 @@ pub(crate) fn truncate_str(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
         return s;
     }
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
+    &s[..s.floor_char_boundary(max_bytes)]
 }
 
 /// Maximum number of entries in the replication log before pruning.
@@ -379,10 +458,19 @@ impl RunningDataflow {
 
     /// Prune log entries that all daemons have acknowledged.
     pub(crate) fn prune_state_log(&mut self) {
+        // Gate pruning on the acks of *live* daemons only. A daemon that
+        // disconnects is removed from `self.daemons`, but its (now frozen)
+        // `daemon_ack_sequence` entry is deliberately retained for a possible
+        // reclaim. Counting that stale entry here would pin `min_ack` at the
+        // disconnected daemon's last ack forever, so the log could never shrink
+        // — it would grow until the `MAX_STATE_LOG_ENTRIES` hard cap, forcing a
+        // full param replay for *every* daemon (including healthy ones). If a
+        // disconnected daemon reconnects after its missed entries were pruned,
+        // `state_log_delta` already falls back to a full replay for it.
         let min_ack = self
-            .daemon_ack_sequence
-            .values()
-            .copied()
+            .daemons
+            .iter()
+            .map(|daemon| self.daemon_ack_sequence.get(daemon).copied().unwrap_or(0))
             .min()
             .unwrap_or(0);
         self.state_log.retain(|entry| entry.sequence > min_ack);
@@ -393,6 +481,18 @@ impl RunningDataflow {
     /// should fall back to a full param replay).
     pub(crate) fn state_log_delta(&self, last_ack: u64) -> Option<Vec<StateCatchUpEntry>> {
         if self.state_log.is_empty() {
+            // An empty log only means "up to date" when nothing newer than
+            // `last_ack` ever existed. If `last_ack < state_log_sequence`, the
+            // entries the daemon still needs (`last_ack+1..=state_log_sequence`)
+            // were pruned away — the daemon must fall back to a full replay,
+            // not be told it is current. This happens on relink: a daemon that
+            // was never seeded into `daemon_ack_sequence` queries with
+            // `last_ack == 0` after peers acked and drained the log
+            // (dora-rs/dora#2601). It also covers a disconnected daemon whose
+            // stale ack is now excluded from pruning (see `prune_state_log`).
+            if last_ack < self.state_log_sequence {
+                return None;
+            }
             return Some(Vec::new());
         }
         let oldest = self.state_log[0].sequence;
@@ -436,7 +536,17 @@ impl RunningDataflow {
             descriptor,
             daemons: daemons.clone(),
             pending_daemons: BTreeSet::new(),
-            exited_before_subscribe: Vec::new(),
+            // Restored, not reset: the live entry is destroyed by orphan
+            // reclaim and by coordinator restart, and the daemon cannot prompt
+            // a fresh broadcast because its `reported_init_to_coordinator` is
+            // never reset. Dropping the verdict here is what left a
+            // reconnecting daemon hanging forever (dora-rs/dora#2998).
+            exited_before_subscribe: record
+                .barrier_exited_before_subscribe
+                .iter()
+                .map(|n| NodeId::from(n.clone()))
+                .collect(),
+            ready_barrier_released: record.ready_barrier_released,
             nodes,
             node_to_daemon,
             node_metrics: BTreeMap::new(),
@@ -444,7 +554,9 @@ impl RunningDataflow {
             node_stopped_at: BTreeMap::new(),
             network_metrics: None,
             spawn_result: CachedResult::Cached {
-                result: Ok(ControlRequestReply::DataflowSpawned { uuid: record.uuid }),
+                result: Box::new(Ok(ControlRequestReply::DataflowSpawned {
+                    uuid: record.uuid,
+                })),
             },
             stop_reply_senders: Vec::new(),
             buffered_log_messages: Vec::new(),
@@ -488,6 +600,12 @@ impl RunningDataflow {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
             uv: self.uv,
+            ready_barrier_released: self.ready_barrier_released,
+            barrier_exited_before_subscribe: self
+                .exited_before_subscribe
+                .iter()
+                .map(|n| n.to_string())
+                .collect(),
             generation: self.store_generation,
             created_at: self.created_at,
             updated_at: now_millis(),
@@ -499,8 +617,11 @@ pub(crate) enum CachedResult {
     Pending {
         result_senders: Vec<oneshot::Sender<eyre::Result<ControlRequestReply>>>,
     },
+    // Boxed because `ControlRequestReply` is large: without the box the
+    // `Cached` variant dwarfs `Pending`, which trips clippy's
+    // `large_enum_variant` on some targets (e.g. Windows) but not others (#2979).
     Cached {
-        result: eyre::Result<ControlRequestReply>,
+        result: Box<eyre::Result<ControlRequestReply>>,
     },
 }
 
@@ -531,7 +652,9 @@ impl CachedResult {
                 for sender in result_senders.drain(..) {
                     Self::send_result_to(&result, sender);
                 }
-                *self = CachedResult::Cached { result };
+                *self = CachedResult::Cached {
+                    result: Box::new(result),
+                };
             }
             CachedResult::Cached { .. } => {}
         }
@@ -550,7 +673,7 @@ impl CachedResult {
     /// the spawn-timeout watchdog (or any other terminal-failure path)
     /// has already marked as failed.
     pub(crate) fn is_terminal_error(&self) -> bool {
-        matches!(self, CachedResult::Cached { result: Err(_) })
+        matches!(self, CachedResult::Cached { result } if result.is_err())
     }
 
     /// Returns `true` if a successful result has been cached, i.e. the dataflow
@@ -559,7 +682,7 @@ impl CachedResult {
     /// that are past spawn — spawn-pending ones remain the spawn-timeout
     /// watchdog's domain. See #2028.
     pub(crate) fn is_cached_ok(&self) -> bool {
-        matches!(self, CachedResult::Cached { result: Ok(_) })
+        matches!(self, CachedResult::Cached { result } if result.is_ok())
     }
 
     fn send_result_to(
@@ -587,14 +710,6 @@ impl From<&RunningDataflow> for ArchivedDataflow {
         }
     }
 }
-
-impl PartialEq for RunningDataflow {
-    fn eq(&self, other: &Self) -> bool {
-        self.name == other.name && self.uuid == other.uuid && self.daemons == other.daemons
-    }
-}
-
-impl Eq for RunningDataflow {}
 
 #[cfg(test)]
 mod hub_capability_tests {
@@ -646,5 +761,168 @@ mod send_and_receive_tests {
             pending.lock().await.is_empty(),
             "pending reply leaked after send failure"
         );
+    }
+
+    #[tokio::test]
+    async fn ws_error_envelope_surfaces_as_err() {
+        // The daemon-side WS error path delivers a `{"ws_error": ...}` string to
+        // the pending reply (see `handle_daemon_response` in `ws_daemon.rs`).
+        // `send_and_receive` must turn that into an `Err` carrying the daemon's
+        // text — not return an envelope its callers cannot deserialize, which
+        // would surface as an opaque "failed to deserialize ... reply".
+        let (tx, mut rx) = mpsc::channel::<String>(1);
+        let pending: Arc<Mutex<HashMap<Uuid, oneshot::Sender<String>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let conn = DaemonConnection::new(tx, pending.clone(), BTreeMap::new());
+
+        let pending_bg = pending.clone();
+        tokio::spawn(async move {
+            let outgoing = rx.recv().await.expect("request should be sent");
+            let value: serde_json::Value =
+                serde_json::from_str(&outgoing).expect("outgoing request is JSON");
+            let id: Uuid = value["id"]
+                .as_str()
+                .expect("request carries an id")
+                .parse()
+                .expect("id is a UUID");
+            let sender = pending_bg
+                .lock()
+                .await
+                .remove(&id)
+                .expect("pending reply is registered before the send");
+            let _ = sender.send(r#"{"ws_error":"daemon blew up"}"#.to_string());
+        });
+
+        let err = conn
+            .send_and_receive(b"{}")
+            .await
+            .expect_err("ws_error envelope must be surfaced as an error");
+        assert!(
+            err.to_string().contains("daemon blew up"),
+            "error should carry the daemon's message, got: {err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod zenoh_endpoint_registry_tests {
+    use super::*;
+
+    fn connection() -> DaemonConnection {
+        let (tx, _rx) = mpsc::channel(1);
+        DaemonConnection::new(tx, Arc::new(Mutex::new(HashMap::new())), BTreeMap::new())
+    }
+
+    fn daemon(machine: &str) -> DaemonId {
+        DaemonId::new(Some(machine.to_string()))
+    }
+
+    /// The joining daemon is handed every *other* daemon's endpoint. This is
+    /// the whole mechanism: without it a multi-machine deployment has to name
+    /// each daemon's address on every other daemon's command line.
+    #[test]
+    fn a_joining_daemon_is_given_the_endpoints_of_the_daemons_before_it() {
+        let mut connections = DaemonConnections::default();
+        let (a, b) = (daemon("A"), daemon("B"));
+        connections.add(a.clone(), connection());
+        connections.add(b.clone(), connection());
+        connections.set_zenoh_endpoint(&a, Some("tcp/10.0.2.100:5456".into()));
+        connections.set_zenoh_endpoint(&b, Some("tcp/10.0.2.101:5456".into()));
+
+        let mut given = connections.zenoh_endpoints_for(&daemon("C"));
+        given.sort();
+        assert_eq!(given, ["tcp/10.0.2.100:5456", "tcp/10.0.2.101:5456"]);
+    }
+
+    /// A daemon must never be told to dial itself. On re-registration its old
+    /// connection is still in the map when the reply is built, and that
+    /// endpoint is either its own or a dead one from the previous process.
+    #[test]
+    fn a_re_registering_daemon_is_not_told_to_dial_itself() {
+        let mut connections = DaemonConnections::default();
+        let a = daemon("A");
+        connections.add(a.clone(), connection());
+        connections.set_zenoh_endpoint(&a, Some("tcp/10.0.2.100:5456".into()));
+
+        assert!(connections.zenoh_endpoints_for(&a).is_empty());
+    }
+
+    /// The ordering the whole mechanism rests on: a daemon's endpoint is set on
+    /// its connection *before* that connection is added, so it is already
+    /// visible to the next daemon's register reply. The coordinator's event
+    /// loop handles registrations one at a time, so two daemons starting
+    /// simultaneously are ordered by it and the later one always sees the
+    /// earlier — there is no window in which both see nothing.
+    #[test]
+    fn an_endpoint_registered_with_the_connection_is_visible_to_the_next_daemon() {
+        let mut connections = DaemonConnections::default();
+
+        // What the register handler does for daemon A.
+        let mut conn_a = connection();
+        conn_a.zenoh_listen_endpoint = Some("tcp/10.0.2.100:5456".into());
+        connections.add(daemon("A"), conn_a);
+
+        // B registers immediately afterwards, before A has confirmed anything.
+        assert_eq!(
+            connections.zenoh_endpoints_for(&daemon("B")),
+            ["tcp/10.0.2.100:5456"],
+        );
+    }
+
+    /// A daemon whose listener failed to bind withdraws its endpoint, so it
+    /// stops being handed to daemons that register later. Without this the
+    /// coordinator would keep advertising a port with nothing behind it.
+    #[test]
+    fn a_withdrawn_endpoint_is_no_longer_handed_out() {
+        let mut connections = DaemonConnections::default();
+        let a = daemon("A");
+        let mut conn_a = connection();
+        conn_a.zenoh_listen_endpoint = Some("tcp/10.0.2.100:5456".into());
+        connections.add(a.clone(), conn_a);
+
+        connections.set_zenoh_endpoint(&a, None);
+
+        assert!(connections.zenoh_endpoints_for(&daemon("B")).is_empty());
+    }
+
+    /// A daemon that has not reported an endpoint contributes none. It has
+    /// either not opened its session yet or bound loopback, and advertising a
+    /// loopback endpoint would point a remote peer at its own machine.
+    #[test]
+    fn a_daemon_without_a_reported_endpoint_contributes_nothing() {
+        let mut connections = DaemonConnections::default();
+        let (a, b) = (daemon("A"), daemon("B"));
+        connections.add(a.clone(), connection());
+        connections.add(b.clone(), connection());
+        connections.set_zenoh_endpoint(&b, Some("tcp/10.0.2.101:5456".into()));
+
+        assert_eq!(
+            connections.zenoh_endpoints_for(&daemon("C")),
+            ["tcp/10.0.2.101:5456"]
+        );
+    }
+
+    /// A dropped daemon stops being advertised, because the endpoint lives on
+    /// the connection rather than in a side map that would have to be pruned
+    /// separately.
+    #[test]
+    fn removing_a_daemon_withdraws_its_endpoint() {
+        let mut connections = DaemonConnections::default();
+        let a = daemon("A");
+        connections.add(a.clone(), connection());
+        connections.set_zenoh_endpoint(&a, Some("tcp/10.0.2.100:5456".into()));
+        connections.remove(&a);
+
+        assert!(connections.zenoh_endpoints_for(&daemon("C")).is_empty());
+    }
+
+    /// Setting an endpoint for a daemon that is not connected is a no-op
+    /// rather than an insertion: a late report from a connection the
+    /// coordinator has already dropped must not resurrect it.
+    #[test]
+    fn reporting_an_endpoint_for_an_unknown_daemon_is_ignored() {
+        let mut connections = DaemonConnections::default();
+        connections.set_zenoh_endpoint(&daemon("ghost"), Some("tcp/10.0.2.100:5456".into()));
+        assert!(connections.zenoh_endpoints_for(&daemon("C")).is_empty());
     }
 }

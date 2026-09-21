@@ -8,10 +8,44 @@ use serde::{Deserialize, Serialize};
 /// Includes a timestamp and additional user-provided parameters. The payload is
 /// a self-describing Arrow IPC stream, so the message carries no separate type
 /// descriptor.
+///
+/// A node receives a `Metadata` alongside every input. The [`timestamp`] and
+/// [`metadata_version`] are read through accessors, while [`parameters`] — the
+/// user-provided key/value pairs — is a public field read and written directly.
+///
+/// [`timestamp`]: Self::timestamp
+/// [`metadata_version`]: Self::metadata_version
+/// [`parameters`]: Self::parameters
+///
+/// # Examples
+///
+/// ```
+/// use dora_message::metadata::{get_integer_param, Metadata, Parameter};
+///
+/// let timestamp = uhlc::HLC::default().new_timestamp();
+/// let mut metadata = Metadata::new(timestamp);
+///
+/// // A fresh `Metadata` carries the current wire-format version and no
+/// // user parameters.
+/// assert_eq!(metadata.metadata_version(), Metadata::CURRENT_VERSION);
+/// assert!(metadata.parameters.is_empty());
+///
+/// // Attach a typed parameter and read it back with the matching getter.
+/// metadata
+///     .parameters
+///     .insert("frame".to_string(), Parameter::Integer(7));
+/// assert_eq!(get_integer_param(&metadata.parameters, "frame"), Some(7));
+/// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Metadata {
     metadata_version: u16,
     timestamp: uhlc::Timestamp,
+    /// User-provided key/value parameters carried alongside the payload.
+    ///
+    /// A [`BTreeMap`] of [`Parameter`] values keyed by name. Read the common
+    /// scalar cases through the type-checked [`get_string_param`],
+    /// [`get_integer_param`], and [`get_bool_param`] helpers rather than
+    /// matching on the [`Parameter`] variant directly.
     pub parameters: MetadataParameters,
 }
 
@@ -19,16 +53,72 @@ impl Metadata {
     /// Current metadata wire-format version, stamped on every outgoing message.
     ///
     /// Bumped from 0 to 1 when the `ArrowTypeInfo` sidecar was dropped and the
-    /// wire format became Arrow-IPC-only. A receiver can compare
+    /// wire format became Arrow-IPC-only, and from 1 to 2 when the binary
+    /// encoding moved from bincode to postcard (varint integers and length
+    /// prefixes, so the byte layout differs even though the field order does
+    /// not). A receiver can compare
     /// [`metadata_version`](Self::metadata_version) against this to detect a peer
     /// speaking an incompatible format and report it clearly instead of failing
     /// with a cryptic positional-deserialization error.
-    pub const CURRENT_VERSION: u16 = 1;
+    pub const CURRENT_VERSION: u16 = 2;
 
+    /// Create metadata with the given timestamp and no user parameters.
     pub fn new(timestamp: uhlc::Timestamp) -> Self {
         Self::from_parameters(timestamp, Default::default())
     }
 
+    /// Metadata for a startup route-probe marker (see [`STARTUP_MARKER_PARAM`]).
+    pub fn startup_marker(timestamp: uhlc::Timestamp) -> Self {
+        Self::from_parameters(
+            timestamp,
+            BTreeMap::from([(STARTUP_MARKER_PARAM.to_owned(), Parameter::Bool(true))]),
+        )
+    }
+
+    /// Whether this message is a startup route-probe marker rather than node
+    /// data. Markers are consumed by the receiving node's startup barrier and
+    /// must never be decoded or surfaced to user code — see
+    /// [`STARTUP_MARKER_PARAM`].
+    pub fn is_startup_marker(&self) -> bool {
+        get_bool_param(&self.parameters, STARTUP_MARKER_PARAM).unwrap_or(false)
+    }
+
+    /// Metadata for a startup route-probe **ack**: the consumer-side reply to a
+    /// startup marker, identifying which consumer input received it (see
+    /// [`STARTUP_ACK_PARAM`]).
+    pub fn startup_ack(timestamp: uhlc::Timestamp, consumer_node: &str, input_id: &str) -> Self {
+        Self::from_parameters(
+            timestamp,
+            BTreeMap::from([
+                (STARTUP_ACK_PARAM.to_owned(), Parameter::Bool(true)),
+                (
+                    STARTUP_ACK_CONSUMER_PARAM.to_owned(),
+                    Parameter::String(consumer_node.to_owned()),
+                ),
+                (
+                    STARTUP_ACK_INPUT_PARAM.to_owned(),
+                    Parameter::String(input_id.to_owned()),
+                ),
+            ]),
+        )
+    }
+
+    /// `Some((consumer_node, input_id))` iff this message is a well-formed
+    /// startup route-probe ack — see [`STARTUP_ACK_PARAM`]. Malformed acks
+    /// (missing or wrongly-typed identity parameters) return `None` and are
+    /// ignored by producers, which keeps the affected output on the reliable
+    /// daemon path instead of switching on bad evidence.
+    pub fn startup_ack_identity(&self) -> Option<(&str, &str)> {
+        if !get_bool_param(&self.parameters, STARTUP_ACK_PARAM).unwrap_or(false) {
+            return None;
+        }
+        let consumer = get_string_param(&self.parameters, STARTUP_ACK_CONSUMER_PARAM)?;
+        let input = get_string_param(&self.parameters, STARTUP_ACK_INPUT_PARAM)?;
+        Some((consumer, input))
+    }
+
+    /// Create metadata with the given timestamp and user parameters, stamping
+    /// the current wire-format version ([`CURRENT_VERSION`](Self::CURRENT_VERSION)).
     pub fn from_parameters(timestamp: uhlc::Timestamp, parameters: MetadataParameters) -> Self {
         Self {
             metadata_version: Self::CURRENT_VERSION,
@@ -44,30 +134,113 @@ impl Metadata {
         self.metadata_version
     }
 
+    /// The hybrid-logical-clock timestamp assigned when this message was sent.
     pub fn timestamp(&self) -> uhlc::Timestamp {
         self.timestamp
     }
 
+    /// The serialized OpenTelemetry propagation context carried in the
+    /// `open_telemetry_context` parameter, or an empty string if absent.
     pub fn open_telemetry_context(&self) -> String {
-        get_string_param(&self.parameters, "open_telemetry_context")
+        get_string_param(&self.parameters, OPEN_TELEMETRY_CONTEXT)
             .unwrap_or("")
             .to_string()
     }
 }
 
+/// Reserved [`MetadataParameters`] key marking a message as a **startup
+/// route-probe marker** rather than node data.
+///
+/// The zenoh data plane is direct node-to-node pub/sub, so a producer that
+/// publishes before a consumer's subscription has propagated would drop those
+/// early samples. Rather than infer route-readiness from zenoh declarations,
+/// each producer publishes markers on its real output topic while an output is
+/// still on the reliable daemon path, and each consumer answers every received
+/// marker with an ack (see [`STARTUP_ACK_PARAM`]): an ack arriving back at the
+/// producer is end-to-end proof that the route pair carries data. The producer
+/// stops marking an output — and switches it to the direct zenoh path — once
+/// all its required consumers have acked, but only within a bounded startup
+/// window: an output still un-acked when the window closes is pinned to the
+/// daemon path for the rest of the run, so a topic's messages never straddle a
+/// path switch (dora-rs/dora#2891). A route that never proves itself just keeps
+/// the output on the daemon path.
+///
+/// The `__dora_` prefix is reserved; user parameters must not use it. Receivers
+/// filter markers before decoding the payload, so they never reach user code.
+pub const STARTUP_MARKER_PARAM: &str = "__dora_startup_marker";
+
+/// Reserved [`MetadataParameters`] key marking a message as a **startup
+/// route-probe ack**: the consumer-side half of the startup handshake.
+///
+/// When a consumer's data subscriber receives a startup marker (see
+/// [`STARTUP_MARKER_PARAM`]) for an input, it replies with an ack on the
+/// output's dedicated `@ack` topic. An ack arriving back at the producer is
+/// end-to-end proof that the route works in *both* directions; once every
+/// required consumer of an output has acked, the producer switches that output
+/// from the reliable daemon path to the direct node-to-node zenoh path. Ack
+/// timing is load-bearing: the switch can only happen inside the producer's
+/// bounded startup window (see [`STARTUP_MARKER_PARAM`]), so a consumer that
+/// acks late costs that output the fast path for the whole run. A missing or
+/// late ack never fails anything — the output simply stays on the daemon path.
+///
+/// Acks travel as an empty-payload message whose attachment carries this flag
+/// plus the acking consumer's identity under [`STARTUP_ACK_CONSUMER_PARAM`] and
+/// [`STARTUP_ACK_INPUT_PARAM`] — the identity rides in the attachment rather
+/// than the zenoh key so consumer/input ids never need key escaping.
+pub const STARTUP_ACK_PARAM: &str = "__dora_startup_ack";
+
+/// Reserved key carrying the acking consumer's node id as a
+/// [`Parameter::String`] — see [`STARTUP_ACK_PARAM`].
+pub const STARTUP_ACK_CONSUMER_PARAM: &str = "__dora_startup_ack_consumer";
+
+/// Reserved key carrying the acking consumer's input id as a
+/// [`Parameter::String`] — see [`STARTUP_ACK_PARAM`].
+pub const STARTUP_ACK_INPUT_PARAM: &str = "__dora_startup_ack_input";
+
 /// Additional metadata that can be sent as part of output messages.
 pub type MetadataParameters = BTreeMap<String, Parameter>;
 
-/// A metadata parameter that can be sent as part of output messages.
+/// A typed metadata parameter sent as part of output messages.
+///
+/// Parameters are stored by key in [`MetadataParameters`]. The `get_*_param`
+/// helpers ([`get_string_param`], [`get_integer_param`], [`get_bool_param`])
+/// are type-checked: they return the value only when the stored variant matches
+/// the requested type, and `None` both for a missing key **and** for a key whose
+/// stored value has a different type. Callers therefore never need to match on
+/// the variant themselves for the common scalar cases.
+///
+/// ```
+/// use dora_message::metadata::{
+///     get_integer_param, get_string_param, MetadataParameters, Parameter,
+/// };
+///
+/// let mut params = MetadataParameters::new();
+/// params.insert("frame".to_string(), Parameter::Integer(7));
+///
+/// // Matching type -> the value.
+/// assert_eq!(get_integer_param(&params, "frame"), Some(7));
+/// // Wrong requested type -> None (not a panic, not a coercion).
+/// assert_eq!(get_string_param(&params, "frame"), None);
+/// // Missing key -> None.
+/// assert_eq!(get_integer_param(&params, "absent"), None);
+/// ```
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub enum Parameter {
+    /// A boolean value.
     Bool(bool),
+    /// A signed 64-bit integer value.
     Integer(i64),
+    /// A UTF-8 string value.
     String(String),
+    /// A list of signed 64-bit integers.
     ListInt(Vec<i64>),
+    /// A 64-bit floating-point value.
     Float(f64),
+    /// A list of 64-bit floating-point values.
     ListFloat(Vec<f64>),
+    /// A list of UTF-8 strings.
     ListString(Vec<String>),
+    /// A UTC timestamp.
     Timestamp(DateTime<Utc>),
 }
 
@@ -121,6 +294,17 @@ pub const GOAL_STATUS_ABORTED: &str = "aborted";
 pub const GOAL_STATUS_CANCELED: &str = "canceled";
 
 // ---------------------------------------------------------------------------
+// Well-known metadata parameter key for distributed tracing
+// ---------------------------------------------------------------------------
+
+/// Metadata key carrying the serialized OpenTelemetry propagation context, so a
+/// trace can be continued across a dora message hop. Read via
+/// [`Metadata::open_telemetry_context`]; stamped by the node and runtime send
+/// paths when tracing is enabled. Keep this the single source of truth so the
+/// write and read sides can never drift.
+pub const OPEN_TELEMETRY_CONTEXT: &str = "open_telemetry_context";
+
+// ---------------------------------------------------------------------------
 // Well-known metadata parameter keys for the streaming pattern
 // ---------------------------------------------------------------------------
 
@@ -152,6 +336,38 @@ pub const FRAMING_ARROW_IPC: &str = "arrow-ipc";
 /// changes. Absent on messages a receiver should decode as a standalone full
 /// stream (large/SHM and daemon-path payloads).
 pub const SCHEMA_HASH: &str = "_schema_hash";
+
+/// Metadata key carrying the true on-wire byte size (as an `i64`) of a
+/// `dora topic` debug frame's data sample.
+///
+/// The daemon rebuilds a self-describing Arrow IPC stream for inspection by
+/// prepending the retained schema block to each schema-once batch, so the
+/// rebuilt stream the CLI receives is larger than what actually travelled on
+/// the wire (the schema-less batch — the schema is published only once on the
+/// `@schema` subtopic). To keep `dora topic info`'s bandwidth accounting
+/// accurate, the daemon stamps the original data-sample length here; the CLI
+/// measures this instead of the rebuilt stream length (dora-rs/dora#2584).
+///
+/// Debug/inspection path only — never set on real node→node outputs.
+pub const WIRE_SIZE: &str = "_wire_size";
+
+/// Byte size to charge for a `dora topic` debug frame when accounting bandwidth.
+///
+/// Prefers the daemon-stamped [`WIRE_SIZE`] (the real on-wire data-sample
+/// length): the `data` the CLI receives is a rebuilt self-describing stream
+/// whose schema was re-prepended for inspection, so for a schema-once output
+/// `data.len()` over-reports what actually travelled. Falls back to the buffer
+/// length when the key is absent — an older daemon, or a non-debug frame that
+/// never carried it (dora-rs/dora#2584). A present-but-out-of-range stamp (a
+/// negative `i64` that can't be a byte count) also falls back rather than
+/// silently counting zero. Keep this the single reader of [`WIRE_SIZE`] so the
+/// daemon stamp and the CLI accounting can never disagree on the fallback rule.
+pub fn debug_frame_wire_size(params: &MetadataParameters, data: Option<&[u8]>) -> usize {
+    get_integer_param(params, WIRE_SIZE)
+        .and_then(|n| usize::try_from(n).ok())
+        .or_else(|| data.map(|d| d.len()))
+        .unwrap_or(0)
+}
 
 /// Returns `true` if the given parameters carry any pattern-correlation key
 /// ([`REQUEST_ID`], [`GOAL_ID`], or [`GOAL_STATUS`]).
@@ -209,6 +425,154 @@ mod tests {
         assert_eq!(fnv1a(b"a"), 0xaf63dc4c8601ec8c);
     }
 
+    fn test_timestamp() -> uhlc::Timestamp {
+        uhlc::HLC::default().new_timestamp()
+    }
+
+    #[test]
+    fn startup_marker_is_detected_and_survives_the_wire() {
+        // A marker is recognized only via the reserved parameter, and the flag
+        // must survive postcard round-tripping — it travels as the zenoh
+        // attachment, and a receiver that failed to recognize it would decode
+        // the marker as node data and surface it to user code.
+        let marker = Metadata::startup_marker(test_timestamp());
+        assert!(marker.is_startup_marker());
+
+        let bytes = crate::encode(&marker).expect("serialize");
+        let decoded: Metadata = crate::decode(&bytes).expect("deserialize");
+        assert!(decoded.is_startup_marker());
+    }
+
+    #[test]
+    fn ordinary_metadata_is_not_a_startup_marker() {
+        // Guard the other direction: real data must never be mistaken for a
+        // marker (it would be silently dropped instead of delivered).
+        assert!(!Metadata::new(test_timestamp()).is_startup_marker());
+
+        // Wrong type under the reserved key must not count as a marker.
+        let wrong_type = Metadata::from_parameters(
+            test_timestamp(),
+            BTreeMap::from([(
+                STARTUP_MARKER_PARAM.to_owned(),
+                Parameter::String("true".into()),
+            )]),
+        );
+        assert!(!wrong_type.is_startup_marker());
+
+        // Explicit `false` is not a marker either.
+        let explicit_false = Metadata::from_parameters(
+            test_timestamp(),
+            BTreeMap::from([(STARTUP_MARKER_PARAM.to_owned(), Parameter::Bool(false))]),
+        );
+        assert!(!explicit_false.is_startup_marker());
+    }
+
+    #[test]
+    fn startup_marker_key_is_reserved_and_distinct() {
+        // The `__dora_` prefix keeps it out of the user parameter namespace, and
+        // it must not collide with any well-known protocol key.
+        assert_eq!(STARTUP_MARKER_PARAM, "__dora_startup_marker");
+        assert!(STARTUP_MARKER_PARAM.starts_with("__dora_"));
+        for key in [
+            REQUEST_ID,
+            GOAL_ID,
+            GOAL_STATUS,
+            SESSION_ID,
+            SEGMENT_ID,
+            SEQ,
+            FIN,
+            FLUSH,
+        ] {
+            assert_ne!(STARTUP_MARKER_PARAM, key);
+        }
+    }
+
+    #[test]
+    fn startup_ack_round_trips_and_extracts_identity() {
+        // The ack travels as a postcard attachment on the `@ack` topic; the
+        // producer must recover exactly the (consumer, input) identity it needs
+        // to tick off a required acker.
+        let ack = Metadata::startup_ack(test_timestamp(), "camera-consumer", "image/depth");
+        assert_eq!(
+            ack.startup_ack_identity(),
+            Some(("camera-consumer", "image/depth"))
+        );
+        // An ack is not a marker (and vice versa, checked below): the two
+        // travel on different topics but share the filtering code path.
+        assert!(!ack.is_startup_marker());
+
+        let bytes = crate::encode(&ack).expect("serialize");
+        let decoded: Metadata = crate::decode(&bytes).expect("deserialize");
+        assert_eq!(
+            decoded.startup_ack_identity(),
+            Some(("camera-consumer", "image/depth"))
+        );
+    }
+
+    #[test]
+    fn malformed_startup_acks_are_rejected() {
+        // Ordinary metadata and markers are not acks.
+        assert_eq!(Metadata::new(test_timestamp()).startup_ack_identity(), None);
+        assert_eq!(
+            Metadata::startup_marker(test_timestamp()).startup_ack_identity(),
+            None
+        );
+
+        // Flag present but identity missing → not a valid ack: a producer must
+        // never count an acker it cannot identify.
+        let flag_only = Metadata::from_parameters(
+            test_timestamp(),
+            BTreeMap::from([(STARTUP_ACK_PARAM.to_owned(), Parameter::Bool(true))]),
+        );
+        assert_eq!(flag_only.startup_ack_identity(), None);
+
+        // Wrongly-typed identity parameters are rejected too.
+        let wrong_types = Metadata::from_parameters(
+            test_timestamp(),
+            BTreeMap::from([
+                (STARTUP_ACK_PARAM.to_owned(), Parameter::Bool(true)),
+                (STARTUP_ACK_CONSUMER_PARAM.to_owned(), Parameter::Integer(1)),
+                (STARTUP_ACK_INPUT_PARAM.to_owned(), Parameter::Integer(2)),
+            ]),
+        );
+        assert_eq!(wrong_types.startup_ack_identity(), None);
+
+        // `Bool(false)` under the flag key is not an ack.
+        let explicit_false = Metadata::from_parameters(
+            test_timestamp(),
+            BTreeMap::from([
+                (STARTUP_ACK_PARAM.to_owned(), Parameter::Bool(false)),
+                (
+                    STARTUP_ACK_CONSUMER_PARAM.to_owned(),
+                    Parameter::String("c".into()),
+                ),
+                (
+                    STARTUP_ACK_INPUT_PARAM.to_owned(),
+                    Parameter::String("i".into()),
+                ),
+            ]),
+        );
+        assert_eq!(explicit_false.startup_ack_identity(), None);
+    }
+
+    #[test]
+    fn startup_ack_keys_are_reserved_and_distinct() {
+        let ack_keys = [
+            STARTUP_ACK_PARAM,
+            STARTUP_ACK_CONSUMER_PARAM,
+            STARTUP_ACK_INPUT_PARAM,
+        ];
+        for key in ack_keys {
+            assert!(key.starts_with("__dora_"));
+            assert_ne!(key, STARTUP_MARKER_PARAM);
+        }
+        for (i, a) in ack_keys.iter().enumerate() {
+            for b in &ack_keys[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+    }
+
     #[test]
     fn well_known_keys_have_stable_values() {
         // These string values are part of the cross-language protocol
@@ -261,10 +625,10 @@ mod tests {
 
     #[test]
     fn outgoing_metadata_is_stamped_with_current_version() {
-        // The wire format is positional (bincode) and carries no separate type
+        // The wire format is positional (postcard) and carries no separate type
         // descriptor, so `metadata_version` is the only in-band signal of an
         // incompatible layout. Every constructor must stamp `CURRENT_VERSION`.
-        assert_eq!(Metadata::CURRENT_VERSION, 1);
+        assert_eq!(Metadata::CURRENT_VERSION, 2);
         let ts = uhlc::HLC::default().new_timestamp();
         assert_eq!(
             Metadata::new(ts).metadata_version(),
@@ -319,5 +683,37 @@ mod tests {
         let mut params = MetadataParameters::default();
         params.insert("n".to_string(), Parameter::Integer(1));
         assert_eq!(get_bool_param(&params, "n"), None);
+    }
+
+    #[test]
+    fn debug_frame_wire_size_prefers_stamped_value() {
+        // The stamped size wins over the (larger, schema-inflated) buffer: a
+        // schema-once frame's rebuilt `data` is bigger than what travelled.
+        let mut params = MetadataParameters::default();
+        params.insert(WIRE_SIZE.to_string(), Parameter::Integer(17));
+        assert_eq!(debug_frame_wire_size(&params, Some(&[0u8; 42])), 17);
+    }
+
+    #[test]
+    fn debug_frame_wire_size_falls_back_to_buffer_len() {
+        // No stamp (older daemon / non-debug frame) ⇒ use the buffer length.
+        let params = MetadataParameters::default();
+        assert_eq!(debug_frame_wire_size(&params, Some(&[0u8; 42])), 42);
+    }
+
+    #[test]
+    fn debug_frame_wire_size_falls_back_on_out_of_range_stamp() {
+        // A negative i64 can't be a byte count; fall back rather than count 0.
+        let mut params = MetadataParameters::default();
+        params.insert(WIRE_SIZE.to_string(), Parameter::Integer(-1));
+        assert_eq!(debug_frame_wire_size(&params, Some(&[0u8; 42])), 42);
+    }
+
+    #[test]
+    fn debug_frame_wire_size_zero_without_stamp_or_buffer() {
+        assert_eq!(
+            debug_frame_wire_size(&MetadataParameters::default(), None),
+            0
+        );
     }
 }

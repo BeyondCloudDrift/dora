@@ -49,7 +49,7 @@
 //!    );
 //!
 //!    // send the node's outputs to a channel so we can verify them later
-//!    let (tx, rx) = flume::unbounded();
+//!    let (tx, mut rx) = dora_node_api::integration_testing::output_channel();
 //!    let outputs = dora_node_api::integration_testing::TestingOutput::ToChannel(tx);
 //!
 //!    // don't include time offsets in the outputs to make them deterministic
@@ -65,7 +65,7 @@
 //!     crate::main()?;
 //!
 //!     // collect the nodes's outputs and compare them
-//!     let outputs = rx.try_iter().collect::<Vec<_>>();
+//!     let outputs = dora_node_api::integration_testing::drain_outputs(&mut rx);
 //!     assert_eq!(outputs, expected_outputs);
 //!
 //!     Ok(())
@@ -167,6 +167,49 @@ use std::cell::Cell;
 
 pub use dora_message::integration_testing_format::{self, IntegrationTestInput};
 
+/// A single node output, encoded as a JSON object.
+pub type OutputJson = serde_json::Map<String, serde_json::Value>;
+
+/// Sending half of a testing output channel, built by [`output_channel`] and
+/// handed to [`TestingOutput::ToChannel`].
+///
+/// Deliberately an opaque newtype rather than a re-exported channel type. The
+/// point is the same as the old `pub use tokio::sync::mpsc::…` — a test should
+/// not need its own channel dependency — but wrapping it also keeps the choice
+/// of channel out of dora's public API, so it is not frozen by the 1.0
+/// guarantee and can be swapped without a breaking change.
+#[derive(Debug, Clone)]
+pub struct OutputSender(tokio::sync::mpsc::UnboundedSender<OutputJson>);
+
+impl OutputSender {
+    pub(crate) fn send(&self, output: OutputJson) -> Result<(), eyre::Report> {
+        self.0
+            .send(output)
+            .map_err(|_| eyre::eyre!("testing output channel is closed"))
+    }
+}
+
+/// Receiving half of a testing output channel. Read it with [`drain_outputs`].
+#[derive(Debug)]
+pub struct OutputReceiver(tokio::sync::mpsc::UnboundedReceiver<OutputJson>);
+
+/// Creates the channel pair for [`TestingOutput::ToChannel`].
+///
+/// The channel is unbounded — see [`TestingOutput::ToChannel`] for why a
+/// bounded one would deadlock.
+pub fn output_channel() -> (OutputSender, OutputReceiver) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    (OutputSender(tx), OutputReceiver(rx))
+}
+
+/// Collects every output queued on a [`TestingOutput::ToChannel`] receiver
+/// without blocking.
+///
+/// Call this once the node has finished; anything it sent is already queued.
+pub fn drain_outputs(rx: &mut OutputReceiver) -> Vec<OutputJson> {
+    std::iter::from_fn(|| rx.0.try_recv().ok()).collect()
+}
+
 thread_local! {
     static TESTING_ENV: Cell<Option<Box<TestingCommunication>>> = const { Cell::new(None) };
 }
@@ -266,10 +309,17 @@ pub enum TestingOutput {
     ToFile(std::path::PathBuf),
     /// Writes the output as JSONL file to the given writer.
     ToWriter(Box<dyn std::io::Write + Send>),
-    /// Sends each output as a JSON object to the given [`flume::Receiver`].
+    /// Sends each output as a JSON object to the paired [`OutputReceiver`].
     ///
-    /// Note: When using a bounded channel, the node may block when the channel is full.
-    ToChannel(flume::Sender<serde_json::Map<String, serde_json::Value>>),
+    /// Create the pair with [`output_channel`] and read it with
+    /// [`drain_outputs`] once the node has finished.
+    ///
+    /// The channel is unbounded because nothing consumes it while the node
+    /// runs. A bounded channel would deadlock as soon as a node emitted more
+    /// outputs than its capacity: the node blocks waiting for the daemon's
+    /// reply to that very output, and the reply cannot be produced until the
+    /// output is accepted.
+    ToChannel(OutputSender),
 }
 
 /// Options for integration testing.

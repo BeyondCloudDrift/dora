@@ -32,6 +32,7 @@ mod validate;
 
 pub use build::{BuildConfig, build};
 pub use run::{Run, run};
+pub(crate) use up::set_python_executable_path;
 
 use build::Build;
 use clean::CleanArgs;
@@ -244,6 +245,74 @@ mod tests {
         Args::try_parse_from(args).unwrap_or_else(|e| panic!("failed to parse {args:?}: {e}"));
     }
 
+    /// Every `--format` flag must state its JSON output shape in `--help`,
+    /// so scripters learn whether to parse line-wise (JSON Lines) or as a
+    /// single document without reading the source (#2922).
+    #[test]
+    fn help_documents_json_output_shape_for_every_format_flag() {
+        let cases: &[(&[&str], &str)] = &[
+            (
+                &["dora", "list", "--help"],
+                "JSON Lines (one object per line)",
+            ),
+            (
+                &["dora", "clean", "--help"],
+                "JSON Lines (one object per line)",
+            ),
+            (
+                &["dora", "topic", "list", "--help"],
+                "JSON Lines (one object per line)",
+            ),
+            (
+                &["dora", "topic", "echo", "--help"],
+                "JSON Lines (one object per decoded message)",
+            ),
+            (
+                &["dora", "logs", "--help"],
+                "JSON Lines (one object per log message)",
+            ),
+            (
+                &["dora", "run", "--help"],
+                "JSON Lines (one object per log message)",
+            ),
+            (
+                // top-level alias of `dora system status`
+                &["dora", "status", "--help"],
+                "a single pretty-printed JSON document",
+            ),
+            (
+                // `ps` alias resolves to `dora list`
+                &["dora", "ps", "--help"],
+                "JSON Lines (one object per line)",
+            ),
+            (
+                &["dora", "node", "list", "--help"],
+                "JSON Lines (one object per line)",
+            ),
+            (
+                &["dora", "node", "info", "--help"],
+                "a single pretty-printed JSON document",
+            ),
+            (
+                &["dora", "system", "status", "--help"],
+                "a single pretty-printed JSON document",
+            ),
+            (
+                &["dora", "param", "list", "--help"],
+                "a single pretty-printed JSON document",
+            ),
+        ];
+        for (args, expected) in cases {
+            let error = Args::try_parse_from(*args).expect_err("--help should stop parsing");
+            assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+            let help = error.to_string();
+            assert!(
+                help.contains(expected),
+                "help for {args:?} must contain {expected:?}, got:\n{help}"
+            );
+        }
+    }
+
     fn parse_err(args: &[&str]) {
         assert!(
             Args::try_parse_from(args).is_err(),
@@ -269,6 +338,7 @@ mod tests {
     #[test]
     fn parse_up() {
         parse_ok(&["dora", "up"]);
+        parse_ok(&["dora", "up", "--recreate-store"]);
     }
 
     #[test]
@@ -314,6 +384,20 @@ mod tests {
     fn parse_logs_node_flag() {
         parse_ok(&["dora", "logs", "--node", "sensor"]);
         parse_ok(&["dora", "logs", "-n", "sensor"]);
+    }
+
+    #[test]
+    fn parse_daemon_worker_threads() {
+        parse_ok(&["dora", "daemon", "--worker-threads", "4"]);
+        parse_ok(&["dora", "daemon", "--worker-threads", "1"]);
+    }
+
+    #[test]
+    fn reject_daemon_worker_threads_zero() {
+        // `tokio::runtime::Builder::worker_threads` asserts `val > 0`, so
+        // `--worker-threads 0` used to abort the daemon with a raw panic.
+        // clap must reject it with a normal usage error instead.
+        parse_err(&["dora", "daemon", "--worker-threads", "0"]);
     }
 
     #[test]
@@ -481,6 +565,9 @@ mod tests {
     #[test]
     fn parse_node_list() {
         parse_ok(&["dora", "node", "list"]);
+        parse_ok(&["dora", "node", "list", "--format", "json"]);
+        // --quiet and --format conflict (documented in the flag table)
+        parse_err(&["dora", "node", "list", "-q", "--format", "json"]);
     }
 
     #[test]
@@ -550,6 +637,35 @@ mod tests {
     #[test]
     fn reject_node_restart_no_node() {
         parse_err(&["dora", "node", "restart"]);
+    }
+
+    #[test]
+    fn parse_node_replace() {
+        parse_ok(&[
+            "dora",
+            "node",
+            "replace",
+            "filter",
+            "--from-yaml",
+            "filter-node.yml",
+        ]);
+        parse_ok(&[
+            "dora",
+            "node",
+            "replace",
+            "-d",
+            "my-flow",
+            "filter",
+            "--from-yaml",
+            "filter-node.yml",
+            "--grace",
+            "5s",
+        ]);
+    }
+
+    #[test]
+    fn reject_node_replace_without_yaml() {
+        parse_err(&["dora", "node", "replace", "filter"]);
     }
 
     #[test]
@@ -643,6 +759,33 @@ mod tests {
             "dataflow.yml",
             "--output-yaml",
             "modified.yml",
+        ]);
+    }
+
+    #[test]
+    fn parse_record_queue_size() {
+        parse_ok(&["dora", "record", "dataflow.yml", "--queue-size", "1000"]);
+    }
+
+    #[test]
+    fn reject_record_zero_queue_size() {
+        // A zero-depth input is clamped to 1 by `effective_cap`, i.e. it would
+        // not do what it says. Reject it at parse time rather than silently.
+        parse_err(&["dora", "record", "dataflow.yml", "--queue-size", "0"]);
+    }
+
+    #[test]
+    fn reject_record_queue_size_with_proxy() {
+        // `--proxy` records over the WebSocket and injects no node, so there is
+        // no input queue for this to size. Say so instead of accepting a flag
+        // that does nothing.
+        parse_err(&[
+            "dora",
+            "record",
+            "dataflow.yml",
+            "--proxy",
+            "--queue-size",
+            "1000",
         ]);
     }
 

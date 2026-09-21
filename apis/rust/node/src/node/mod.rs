@@ -11,16 +11,17 @@ use self::{arrow_utils::ipc_encode, control_channel::ControlChannel};
 use aligned_vec::{AVec, ConstAlign};
 use arrow::array::{Array, ArrayData};
 use colored::Colorize;
+use dora_arrow_convert::{DoraArray, IntoArrow};
 use dora_core::{
     config::{DataId, NodeId, NodeRunConfig},
-    descriptor::{Descriptor, DescriptorExt},
+    descriptor::Descriptor,
     topics::{DORA_DAEMON_LOCAL_LISTEN_PORT_DEFAULT, DORA_DAEMON_LOCAL_LISTEN_PORT_ENV, LOCALHOST},
     types::TypeRegistry,
     uhlc,
 };
 use dora_message::{
     DataflowId,
-    daemon_to_node::{DaemonCommunication, DaemonReply, NodeConfig},
+    daemon_to_node::{DaemonCommunication, DaemonReply, NodeConfig, OutputRouting},
     metadata::{
         FIN, FLUSH, FRAMING, FRAMING_ARROW_IPC, Metadata, MetadataParameters, Parameter,
         SCHEMA_HASH, SEGMENT_ID, SEQ, SESSION_ID,
@@ -30,12 +31,13 @@ use dora_message::{
 use eyre::WrapErr;
 use is_terminal::IsTerminal;
 
-#[cfg(feature = "tracing")]
-use std::sync::Mutex;
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 #[cfg(feature = "tracing")]
@@ -43,7 +45,7 @@ use tokio::runtime::Handle;
 
 #[cfg(feature = "tracing")]
 use dora_tracing::{OtelGuard, TracingBuilder};
-use tracing::{info, warn};
+use tracing::{debug, error, info, warn};
 
 pub mod arrow_utils;
 mod control_channel;
@@ -61,11 +63,19 @@ enum RuntimeTypeCheck {
 
 impl RuntimeTypeCheck {
     fn from_env() -> Self {
-        match std::env::var("DORA_RUNTIME_TYPE_CHECK").as_deref() {
-            Ok("error") => Self::Error,
-            Ok("1" | "warn" | "true") => Self::Warn,
-            Ok("") | Err(_) => Self::Off,
-            Ok(other) => {
+        Self::from_value(std::env::var("DORA_RUNTIME_TYPE_CHECK").ok().as_deref())
+    }
+
+    /// Parse the `DORA_RUNTIME_TYPE_CHECK` value (`None` when the var is unset).
+    fn from_value(value: Option<&str>) -> Self {
+        match value {
+            Some("error") => Self::Error,
+            Some("1" | "warn" | "true" | "on") => Self::Warn,
+            // Accept the natural "disable" spellings without a warning: a user
+            // who sets `=0`/`=false`/`=off` to turn the feature off means to
+            // disable it, not to type an unrecognized value.
+            Some("" | "0" | "false" | "off") | None => Self::Off,
+            Some(other) => {
                 tracing::warn!(
                     "unknown DORA_RUNTIME_TYPE_CHECK value \"{other}\", \
                      expected \"warn\" or \"error\"; disabling runtime type check"
@@ -73,6 +83,41 @@ impl RuntimeTypeCheck {
                 Self::Off
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod runtime_type_check_tests {
+    use super::RuntimeTypeCheck;
+
+    #[test]
+    fn parses_enable_spellings() {
+        for v in ["1", "warn", "true", "on"] {
+            assert_eq!(
+                RuntimeTypeCheck::from_value(Some(v)),
+                RuntimeTypeCheck::Warn
+            );
+        }
+        assert_eq!(
+            RuntimeTypeCheck::from_value(Some("error")),
+            RuntimeTypeCheck::Error
+        );
+    }
+
+    #[test]
+    fn disable_spellings_and_unset_are_off() {
+        for v in ["", "0", "false", "off"] {
+            assert_eq!(RuntimeTypeCheck::from_value(Some(v)), RuntimeTypeCheck::Off);
+        }
+        assert_eq!(RuntimeTypeCheck::from_value(None), RuntimeTypeCheck::Off);
+    }
+
+    #[test]
+    fn unknown_value_falls_back_to_off() {
+        assert_eq!(
+            RuntimeTypeCheck::from_value(Some("maybe")),
+            RuntimeTypeCheck::Off
+        );
     }
 }
 
@@ -84,51 +129,584 @@ impl RuntimeTypeCheck {
 ///
 /// Using shared memory for messages smaller than the page size still requires
 /// sharing a full page, so we have some memory overhead. We also have some
-/// performance overhead because we need to issue multiple syscalls. For small
-/// messages it is faster to send them over a traditional TCP stream (or similar).
+/// performance overhead because setting up a shared segment is not free. For
+/// small messages it is cheaper to copy them into a heap-buffered publish.
 ///
-/// This hardcoded threshold value specifies which messages are sent through
-/// shared memory. Messages that are smaller than this threshold are sent through
-/// TCP.
+/// On the zenoh data plane this threshold selects *how* an output is
+/// published: payloads at or above it go through zenoh shared memory
+/// (zero-copy for local subscribers), while smaller payloads are published via
+/// zenoh with a heap-buffered `put`. A large payload that did not get a
+/// shared-memory buffer takes the reliable daemon path instead of the zenoh
+/// one, because a fragmented express publish would be silently dropped
+/// (dora-rs/dora#2366). See [`DoraNode::zero_copy_threshold`] for the runtime
+/// value (overridable via `DORA_ZERO_COPY_THRESHOLD`).
 pub const ZERO_COPY_THRESHOLD: usize = 4096;
 
-/// Per-output data-plane readiness for the startup no-loss barrier.
+/// How many large outbound sends are traced hop-by-hop
+/// (dora-rs/dora#2742 diagnostic; see [`DoraNode::send_output_sample`]).
 ///
-/// The zenoh data plane is direct node-to-node pub/sub, so a producer that
-/// starts publishing before a consumer's subscription has propagated drops those
-/// early samples. Until every expected subscriber has announced its subscription
-/// (via a liveliness readiness token — see
-/// [`dora_core::topics::zenoh_input_ready_liveliness_topic`]), the producer keeps
-/// delivering over the reliable daemon path and only switches this output to the
-/// fast zenoh path once all subscribers are confirmed wired. Over-counting keeps
-/// an output on the (lossless) daemon path; it never drops messages.
-struct ZenohOutputReadiness {
-    /// Number of subscriber input-links this output has in the dataflow.
-    expected: usize,
-    /// Latches `true` once all expected subscribers are confirmed wired. Never
-    /// reverts — once switched to the fast path we stay on it.
-    ready: bool,
-    /// Distinct readiness-token key expressions currently seen for this output
-    /// (deduped). Maintained by the liveliness subscriber callback.
-    alive: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
-    /// Liveliness subscriber counting readiness tokens for this output. Kept
-    /// alive so its callback keeps `alive` current; dropped with the node.
-    _liveliness_sub: zenoh::pubsub::Subscriber<()>,
+/// The Windows nightly wedge happens on a node's *first* large output, so a
+/// handful of traced sends is enough to name the blocked call while keeping a
+/// healthy run's logs clean.
+const LARGE_SEND_DIAG_LIMIT: u32 = 3;
+
+/// How often a starting node re-publishes its startup route-probe markers.
+///
+/// See [`StartupHandshake`]. Markers stop per output as soon as that output's
+/// required acks have arrived (or the grace boundary froze it on the daemon
+/// path), so this rate only applies while the handshake is in flight.
+const ZENOH_STARTUP_MARKER_INTERVAL: Duration = Duration::from_millis(5);
+
+/// The whole budget the startup handshake gets, measured from the daemon's
+/// "all nodes ready" barrier: `init` waits this long for the handshake, and
+/// whatever is still un-acked at the end is frozen on the daemon path for the
+/// run (see [`wait_for_grace`] for why the freeze is unconditional).
+///
+/// The window starts at the barrier, not at spawn: by then every static
+/// consumer has declared its subscribers and ack publishers, so a consumer
+/// that is merely slow to *start* (a Python node importing heavy libraries for
+/// a minute) cannot burn it. The healthy case completes in one marker→ack
+/// round-trip (single-digit milliseconds); half a second of 5 ms markers with
+/// no ack means the route is broken, not slow. Nothing fails at the boundary —
+/// a frozen output just keeps riding the lossless daemon path, trading the
+/// fast path for ordering. This is the single knob for that trade: raising it
+/// gives slow-to-establish routes more chance at direct zenoh, at the cost of
+/// delaying every node whose routes are genuinely broken.
+///
+/// For a **dynamic or restarted** producer the barrier releases immediately —
+/// its consumers have long been running — so this window instead starts a few
+/// milliseconds after the zenoh session opens, while the peer links it needs
+/// may still be dialing. Such a producer is therefore the most likely to end
+/// up frozen on the daemon path; if that shows up as a measurable regression,
+/// this constant (not a late upgrade) is the thing to raise.
+const ZENOH_STARTUP_GRACE: Duration = Duration::from_millis(500);
+
+/// Poll interval for the post-barrier grace wait.
+const ZENOH_STARTUP_GRACE_POLL_INTERVAL: Duration = Duration::from_millis(2);
+
+/// A declared direct-zenoh data publisher plus its startup-handshake state.
+struct DirectOutput {
+    publisher: zenoh::pubsub::Publisher<'static>,
+    /// `false` until the startup handshake proves this output's routes — every
+    /// required consumer acked one of its markers (see [`StartupHandshake`]).
+    /// Settled by [`wait_for_grace`] before `init` returns and immutable from
+    /// then on, so every send of a given output takes the same path: direct
+    /// zenoh when `true`, the reliable daemon path when `false`.
+    ready: Arc<AtomicBool>,
 }
 
-/// How long [`DoraNode::init`] waits for the direct-zenoh routes of this node's
-/// outputs to connect before handing control to user code.
+type ZenohPublishers = HashMap<DataId, DirectOutput>;
+
+/// Declare a direct-zenoh data publisher for every output that may ever take
+/// the direct path, plus the per-output ack state the startup handshake needs.
 ///
-/// The daemon "all nodes ready" barrier already guarantees every subscriber is
-/// *declared* before any node runs; this only waits out the residual zenoh
-/// propagation between two already-declared endpoints, so it is normally
-/// sub-second. On timeout (e.g. a zenoh data plane that can't connect while the
-/// control plane can) the un-connected outputs simply start on the reliable
-/// daemon path and upgrade to direct zenoh once their subscribers appear — the
-/// dataflow is never blocked, and nothing is dropped.
-const ZENOH_OUTPUT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// Poll interval while waiting for output routes to connect at startup.
-const ZENOH_OUTPUT_CONNECT_POLL_INTERVAL: Duration = Duration::from_millis(5);
+/// Outputs the daemon pinned `daemon_only` — a consumer only inter-daemon
+/// forwarding can reach (a dynamic node on another daemon, or a remote static
+/// one with no dialable endpoint for this node; forwarding is fed solely by
+/// daemon-path sends, #2738), or a consumer declaring `queue_policy:
+/// backpressure`, which the lossy direct-zenoh ingress cannot honor — get no
+/// publisher and no markers: they stay on the daemon path for the node's
+/// lifetime (see the daemon's `output_routing` module for the full policy).
+/// Every other output gets a publisher declared eagerly
+/// at init (rather than on first send) for two reasons: zenoh starts wiring
+/// routes immediately, and [`StartupHandshake`] needs the publishers to probe
+/// those routes before the node's first real send. An output with no required
+/// ackers (no consumers, or only dynamic local ones) is `ready` immediately.
+///
+/// QoS is set at declare time so it applies to every put: `express(true)` bypasses
+/// zenoh's adaptive batch timer (the single biggest small-message latency win —
+/// without it, per-put delivery on the bare local config collapses to a few
+/// msg/s), `Priority::RealTime` keeps data-plane messages off the bulk-data
+/// queues, and `CongestionControl::Drop` prevents a stalled subscriber from
+/// back-pressuring the publishing node.
+///
+/// An output whose publisher fails to declare is simply absent from the map; its
+/// sends then fall back to the reliable daemon path.
+fn declare_output_publishers(
+    session: &zenoh::Session,
+    dataflow_id: DataflowId,
+    node_id: &NodeId,
+    outputs: &BTreeSet<DataId>,
+    routing: &BTreeMap<DataId, OutputRouting>,
+) -> (ZenohPublishers, Vec<Arc<AckState>>) {
+    use zenoh::Wait;
+    use zenoh::qos::{CongestionControl, Priority};
+
+    let mut publishers = HashMap::new();
+    let mut ack_states = Vec::new();
+    for output_id in outputs {
+        let Some(output_routing) = routing.get(output_id) else {
+            // Defensive: the daemon computes an entry for every declared
+            // output. An output it doesn't know stays on the daemon path.
+            warn!(output = %output_id, "no routing entry for output; staying on the daemon path");
+            continue;
+        };
+        if output_routing.daemon_only {
+            debug!(
+                output = %output_id,
+                "output pinned to the daemon path by consumer routing requirements"
+            );
+            continue;
+        }
+        let topic = dora_core::topics::zenoh_output_publish_topic(dataflow_id, node_id, output_id);
+        let key_expr = match zenoh::key_expr::KeyExpr::new(topic) {
+            Ok(key) => key.into_owned(),
+            Err(e) => {
+                warn!(output = %output_id, "invalid zenoh key ({e}); falling back to daemon path");
+                continue;
+            }
+        };
+        match session
+            .declare_publisher(key_expr)
+            .congestion_control(CongestionControl::Drop)
+            .express(true)
+            .priority(Priority::RealTime)
+            .wait()
+        {
+            Ok(publisher) => {
+                let ready = Arc::new(AtomicBool::new(output_routing.required_ackers.is_empty()));
+                if !output_routing.required_ackers.is_empty() {
+                    ack_states.push(Arc::new(AckState::new(
+                        output_id.clone(),
+                        &output_routing.required_ackers,
+                        ready.clone(),
+                    )));
+                }
+                publishers.insert(output_id.clone(), DirectOutput { publisher, ready });
+            }
+            Err(e) => {
+                warn!(output = %output_id, "failed to declare zenoh publisher ({e}); falling back to daemon path");
+            }
+        }
+    }
+    (publishers, ack_states)
+}
+
+/// Ack bookkeeping for one output whose startup handshake is in flight.
+///
+/// Shared between the output's ack-subscriber callback (which records incoming
+/// acks) and the [`StartupHandshake`] thread (which publishes markers until
+/// completion or the freeze).
+struct AckState {
+    output_id: DataId,
+    /// The (consumer node, input) identities that must ack before the output
+    /// may switch to the direct zenoh path — the daemon's required-acker set,
+    /// derived from actual placement (local static consumers only).
+    required: BTreeSet<(String, String)>,
+    /// Identities that have acked so far.
+    received: Mutex<BTreeSet<(String, String)>>,
+    /// The same flag as the output's [`DirectOutput::ready`]; flipped exactly
+    /// once, when `received` covers `required` before the freeze.
+    ready: Arc<AtomicBool>,
+    /// Set once the grace boundary passed with this output still un-acked: the
+    /// output is pinned to the daemon path and can never upgrade (see
+    /// [`Self::freeze`]).
+    frozen: AtomicBool,
+}
+
+impl AckState {
+    fn new(
+        output_id: DataId,
+        required: &BTreeSet<dora_message::daemon_to_node::RequiredAcker>,
+        ready: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            output_id,
+            required: required
+                .iter()
+                .map(|acker| (acker.node_id.to_string(), acker.input_id.to_string()))
+                .collect(),
+            received: Mutex::new(BTreeSet::new()),
+            ready,
+            frozen: AtomicBool::new(false),
+        }
+    }
+
+    /// The ack lock, recovered from poisoning: a panicking callback leaves the
+    /// set intact and losing acks would silently cost the fast path.
+    ///
+    /// Holding this guard is what makes [`Self::record`] and [`Self::freeze`]
+    /// atomic against each other, so every method that touches `received` or
+    /// `frozen` goes through here.
+    fn received(&self) -> std::sync::MutexGuard<'_, BTreeSet<(String, String)>> {
+        self.received
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Records one ack. Identities outside the required set — a dynamic or
+    /// debug consumer may ack too — are ignored; they must never count toward
+    /// completion. Flips `ready` once the required set is covered, unless the
+    /// output was already frozen on the daemon path.
+    fn record(&self, consumer_node: &str, input_id: &str) {
+        let identity = (consumer_node.to_owned(), input_id.to_owned());
+        if !self.required.contains(&identity) {
+            return;
+        }
+        let mut received = self.received();
+        // Read under the same lock `freeze` takes, so the two can't interleave
+        // into a `ready` flip that outlives the freeze.
+        if self.frozen.load(Ordering::Relaxed) {
+            return;
+        }
+        received.insert(identity);
+        if received.len() == self.required.len() {
+            self.ready.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Pins this output to the daemon path for the rest of the run: no later
+    /// ack may flip `ready`. Called once, at the grace boundary — see
+    /// [`wait_for_grace`].
+    ///
+    /// Returns whether the output was actually frozen — `false` means it had
+    /// already completed its handshake and keeps the direct-zenoh path. The
+    /// `received` lock makes that decision atomic against a concurrent
+    /// [`Self::record`]: either the ack completed the set before the freeze, or
+    /// it is ignored.
+    fn freeze(&self) -> bool {
+        let _guard = self.received();
+        if self.ready.load(Ordering::Relaxed) {
+            return false;
+        }
+        self.frozen.store(true, Ordering::Relaxed);
+        true
+    }
+
+    /// Whether this output was frozen on the daemon path (marker-thread view;
+    /// no lock needed, a stale `false` just costs one more marker).
+    fn is_frozen(&self) -> bool {
+        self.frozen.load(Ordering::Relaxed)
+    }
+
+    /// The required identities that have not acked (for the freeze warning).
+    fn missing(&self) -> Vec<String> {
+        let received = self.received();
+        self.required
+            .difference(&received)
+            .map(|(node, input)| format!("{node}/{input}"))
+            .collect()
+    }
+}
+
+/// Declare one exact-key ack subscriber per awaited output.
+///
+/// The callback records acks into the output's [`AckState`]. An output whose
+/// ack subscriber fails to declare can never complete its handshake, so it is
+/// removed from the awaited set right away (its `ready` flag stays `false`
+/// and it keeps riding the daemon path) instead of publishing markers no ack
+/// could ever answer.
+fn declare_ack_subscribers(
+    session: &zenoh::Session,
+    dataflow_id: DataflowId,
+    node_id: &NodeId,
+    ack_states: &mut Vec<Arc<AckState>>,
+) -> Vec<zenoh::pubsub::Subscriber<()>> {
+    use zenoh::Wait;
+
+    let mut subscribers = Vec::new();
+    let mut awaited = Vec::new();
+    for state in ack_states.drain(..) {
+        let topic =
+            dora_core::topics::zenoh_output_ack_topic(dataflow_id, node_id, &state.output_id);
+        let state_cb = state.clone();
+        let subscriber = session
+            .declare_subscriber(topic)
+            .callback(move |sample| {
+                let Some(attachment) = sample.attachment() else {
+                    return;
+                };
+                let Ok(metadata) = dora_message::decode::<Metadata>(&attachment.to_bytes()) else {
+                    // Not a dora ack (foreign publisher on the ack key): ignore.
+                    return;
+                };
+                if metadata.metadata_version() != Metadata::CURRENT_VERSION {
+                    // A peer speaking another wire format cannot be attributed
+                    // reliably; never count its acks.
+                    return;
+                }
+                if let Some((consumer, input)) = metadata.startup_ack_identity() {
+                    state_cb.record(consumer, input);
+                }
+            })
+            .wait();
+        match subscriber {
+            Ok(subscriber) => {
+                subscribers.push(subscriber);
+                awaited.push(state);
+            }
+            Err(e) => {
+                warn!(
+                    output = %state.output_id,
+                    "failed to declare startup-ack subscriber ({e}); output stays on the daemon path"
+                );
+            }
+        }
+    }
+    *ack_states = awaited;
+    subscribers
+}
+
+/// The producer half of the startup handshake: publishes route-probe markers
+/// per output until that output's required consumers have acked, then lets the
+/// send path switch it from the reliable daemon path to direct zenoh.
+///
+/// The zenoh data plane is direct node-to-node pub/sub: zenoh drops samples for
+/// a subscription that hasn't propagated to this publisher yet, so a fast
+/// source could otherwise lose its first messages. Rather than infer
+/// route-readiness from zenoh declarations, the handshake proves it end to end
+/// and in both directions: a marker rides the output's *real* topic, and the
+/// consumer's ack rides the output's `@ack` topic back — an arrived ack is
+/// evidence that the route pair carries data. Until then every send takes the
+/// daemon path, so nothing is ever lost; a route that never proves itself only
+/// costs the fast path, never correctness ([`ZENOH_STARTUP_GRACE`]).
+///
+/// The handshake is over by the time `init` returns: [`Self::settle`] either
+/// sees an output acked or freezes it on the daemon path.
+///
+/// Runs on its own thread because the node blocks inside the daemon's "all
+/// nodes ready" barrier while markers must already be flowing: consumers ack
+/// from their subscriber callbacks (also while parked in the barrier), which is
+/// what makes cycles (`a -> b -> a`, and self-loops) resolve rather than
+/// deadlock — no node ever waits on another node's post-barrier progress.
+///
+/// Markers carry an empty payload (so they never touch shared memory) and are
+/// tagged with [`dora_message::metadata::STARTUP_MARKER_PARAM`], which
+/// consumers filter out before decoding — they never reach user code. This
+/// works for late producers too: a dynamic node or a restarted producer runs
+/// the same handshake at join time against consumers that are already running
+/// (their ack publishers answer markers for the consumer's whole lifetime).
+struct StartupHandshake {
+    stop: Arc<AtomicBool>,
+    /// The outputs whose handshake is (or was) in flight.
+    ack_states: Vec<Arc<AckState>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    /// Per-output ack subscribers. Kept for the node's lifetime (idle once the
+    /// handshake resolves) and dropped before the session in `DoraNode::drop`.
+    ack_subscribers: Vec<zenoh::pubsub::Subscriber<()>>,
+}
+
+impl StartupHandshake {
+    fn start(
+        session: &zenoh::Session,
+        dataflow_id: DataflowId,
+        node_id: &NodeId,
+        publishers: &Arc<ZenohPublishers>,
+        mut ack_states: Vec<Arc<AckState>>,
+        clock: Arc<uhlc::HLC>,
+    ) -> Self {
+        use zenoh::Wait;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let ack_subscribers =
+            declare_ack_subscribers(session, dataflow_id, node_id, &mut ack_states);
+        if ack_states.is_empty() {
+            // Nothing awaits acks (no consumers, or every ack subscriber
+            // failed): no markers to publish, nothing to stop.
+            return Self {
+                stop,
+                ack_states,
+                handle: None,
+                ack_subscribers,
+            };
+        }
+
+        let thread_stop = stop.clone();
+        let thread_states = ack_states.clone();
+        let thread_publishers = publishers.clone();
+        let handle = std::thread::Builder::new()
+            .name("dora-startup-handshake".into())
+            .spawn(move || {
+                loop {
+                    if thread_stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let mut awaiting = false;
+                    for state in &thread_states {
+                        // A frozen output can never upgrade, so its markers can
+                        // only cost bandwidth; `wait_for_grace` already logged
+                        // why it stays on the daemon path.
+                        if state.ready.load(Ordering::Relaxed) || state.is_frozen() {
+                            continue;
+                        }
+                        awaiting = true;
+                        let Some(output) = thread_publishers.get(&state.output_id) else {
+                            continue;
+                        };
+                        let metadata = Metadata::startup_marker(clock.new_timestamp());
+                        let attachment = match dora_message::encode(&metadata) {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                debug!(output = %state.output_id, "failed to serialize startup marker ({e})");
+                                continue;
+                            }
+                        };
+                        if let Err(e) = output
+                            .publisher
+                            .put(&[][..])
+                            .attachment(&attachment[..])
+                            .wait()
+                        {
+                            // Expected while the route is still coming up.
+                            tracing::trace!(output = %state.output_id, "startup marker put failed ({e})");
+                        }
+                    }
+                    if !awaiting {
+                        // Every output is acked or frozen: the handshake is over.
+                        return;
+                    }
+                    std::thread::sleep(ZENOH_STARTUP_MARKER_INTERVAL);
+                }
+            });
+        match handle {
+            Ok(handle) => Self {
+                stop,
+                ack_states,
+                handle: Some(handle),
+                ack_subscribers,
+            },
+            Err(e) => {
+                // Without markers no consumer will ack, so the awaited outputs
+                // simply stay on the reliable daemon path. Loud because the
+                // fast path is silently lost for this node.
+                error!(
+                    "failed to spawn startup-handshake thread ({e}); outputs stay on the daemon path"
+                );
+                Self {
+                    stop,
+                    ack_states,
+                    handle: None,
+                    ack_subscribers,
+                }
+            }
+        }
+    }
+
+    /// Settle every output's transport: wait out `grace`, then freeze whatever
+    /// has not proven its routes. See [`wait_for_grace`].
+    ///
+    /// `DoraNode::init` **must** call this before returning to user code —
+    /// that is what makes an output's path constant for the run
+    /// (dora-rs/dora#2891). It is a method (rather than only the free function
+    /// the tests drive) so the requirement is discoverable from the type.
+    fn settle(&self, grace: Duration) {
+        wait_for_grace(&self.ack_states, grace);
+    }
+
+    /// Signal the handshake thread to stop and wait for it to exit, so its
+    /// `Arc` clone of the publishers is released. Idempotent.
+    fn shutdown(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for StartupHandshake {
+    fn drop(&mut self) {
+        // Safety net for error paths that return before `DoraNode::drop` (e.g.
+        // a failed `EventStream::init`). Without this the handshake thread
+        // would keep publishing and keep the publishers (and session) alive.
+        self.shutdown();
+    }
+}
+
+/// Post-barrier grace wait: give the handshake `grace` to complete, then freeze
+/// whatever is left. This is the boundary that settles every output's transport
+/// before user code runs.
+///
+/// Returns as soon as every awaited output is ready. Anything still un-acked
+/// when `grace` expires is pinned to the daemon path for the rest of the run
+/// ([`AckState::freeze`]) rather than left to upgrade later. Upgrading later is
+/// the bug in dora-rs/dora#2891: user code sends from the moment this returns,
+/// so *any* subsequent upgrade is mid-stream, and the direct-zenoh path has
+/// fewer hops than the daemon-relay path — a message sent just after the switch
+/// can overtake an earlier one still in flight on the daemon path, which the
+/// consumer merges into a single arrival-ordered channel with no cross-path
+/// resequencing. Freezing keeps a topic's per-input FIFO order unconditional;
+/// the cost is the fast path for routes that fail to establish within `grace`.
+///
+/// A free function taking the states (rather than a `StartupHandshake` method)
+/// so tests can exercise the boundary without zenoh, with a `grace` shorter
+/// than [`ZENOH_STARTUP_GRACE`].
+fn wait_for_grace(ack_states: &[Arc<AckState>], grace: Duration) {
+    let grace_deadline = Instant::now() + grace;
+    loop {
+        // Vacuously true when nothing awaits acks (no consumers, or every ack
+        // subscriber failed to declare): there is nothing to wait for.
+        if ack_states
+            .iter()
+            .all(|state| state.ready.load(Ordering::Relaxed))
+        {
+            break;
+        }
+        if Instant::now() >= grace_deadline {
+            break;
+        }
+        std::thread::sleep(ZENOH_STARTUP_GRACE_POLL_INTERVAL);
+    }
+
+    for state in ack_states {
+        // `freeze` re-checks readiness under the ack lock, so an ack landing
+        // right now either completes the handshake or is ignored — never a
+        // half-applied upgrade.
+        if state.freeze() {
+            warn!(
+                output = %state.output_id,
+                missing = ?state.missing(),
+                "startup handshake incomplete after {}ms; output stays on the \
+                 reliable daemon path for the rest of the run",
+                grace.as_millis()
+            );
+        } else {
+            // The positive half of the same decision, and the only signal that
+            // an output is *off* the daemon path — which for a consumer on
+            // another machine means its data no longer crosses two daemons.
+            // Logged per output, once, at the moment it is settled for the run.
+            debug!(
+                output = %state.output_id,
+                "startup handshake complete; output takes the direct zenoh path"
+            );
+        }
+    }
+}
+
+/// The per-output routing the daemon computed for this node, or the safe
+/// all-daemon-path fallback when it provided none.
+///
+/// A missing map means the node was spawned by an older daemon (or an
+/// interactive/manual setup) that doesn't know about the startup handshake.
+/// Without required-acker sets no route can be proven, so every output stays
+/// on the reliable daemon path — correct, just without the zenoh fast path.
+fn normalize_output_routing(
+    routing: Option<BTreeMap<DataId, OutputRouting>>,
+    outputs: &BTreeSet<DataId>,
+) -> BTreeMap<DataId, OutputRouting> {
+    match routing {
+        Some(routing) => routing,
+        None => {
+            if !outputs.is_empty() {
+                warn!(
+                    "node config carries no output routing (spawned by an older daemon?); \
+                     all outputs stay on the reliable daemon path"
+                );
+            }
+            outputs
+                .iter()
+                .map(|output_id| {
+                    (
+                        output_id.clone(),
+                        OutputRouting {
+                            daemon_only: true,
+                            required_ackers: Default::default(),
+                        },
+                    )
+                })
+                .collect()
+        }
+    }
+}
 
 /// Per-phase deadline for tearing down zenoh state on node shutdown (subscribers,
 /// liveliness tokens, and the session/publishers — see [`DoraNode::drop`] and
@@ -150,6 +728,12 @@ const ZENOH_OUTPUT_CONNECT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 /// waiting out the 10s only to be force-killed anyway yields a worse (unclean) exit.
 pub(crate) const ZENOH_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Capacity of the testing-mode daemon request channel. Kept comfortably above
+/// the number of concurrent requesters (event stream + close channel + control
+/// channel) so Drop's CloseOutputs send does not block on a full queue while
+/// the daemon thread is busy inside `next_event` (dora-rs/dora#2855).
+const TESTING_DAEMON_CHANNEL_CAPACITY: usize = 256;
+
 /// Allows sending outputs and retrieving node information.
 ///
 /// The main purpose of this struct is to send outputs via Dora. There are also functions available
@@ -165,12 +749,25 @@ pub struct DoraNode {
     /// `None` in interactive/testing mode.
     zenoh_session: Option<zenoh::Session>,
     /// Zenoh shared memory provider for zero-copy publishing.
-    zenoh_shm_provider: Option<zenoh::shm::ShmProvider<zenoh::shm::PosixShmProviderBackend>>,
-    /// Per-output zenoh publishers (lazily created on first send).
+    /// Owns the SHM provider and the zero-copy threshold. Cloned out by
+    /// [`DoraNode::sample_allocator`] so an operator thread can build output
+    /// samples without reaching into the node (dora-rs/dora#2742).
+    sample_allocator: SampleAllocator,
+    /// Per-output zenoh publishers with their handshake state, declared eagerly
+    /// at init (see [`declare_output_publishers`]) so zenoh wires routes
+    /// immediately and [`StartupHandshake`] can probe them before the first
+    /// real send. An output missing here (declaration failed, or pinned to the
+    /// daemon path by the daemon's routing) falls back to the daemon path; one
+    /// whose `ready` flag is still `false` (handshake in flight or frozen)
+    /// does too. Shared with the handshake thread via `Arc`; the thread is
+    /// joined in `drop` before the map is torn down.
     /// `'static` is sound because zenoh `Publisher` internally holds `Arc<Session>`,
     /// so it doesn't borrow from the session field on this struct.
     /// Publishers must be dropped BEFORE the session (enforced in Drop impl).
-    zenoh_publishers: HashMap<DataId, zenoh::pubsub::Publisher<'static>>,
+    zenoh_publishers: Arc<ZenohPublishers>,
+    /// The producer half of the startup handshake (marker thread + ack
+    /// subscribers). `None` without a zenoh session (interactive/testing).
+    startup_handshake: Option<StartupHandshake>,
     /// Per-output schema publishers on the `@schema` subtopic (lazily created on
     /// the first small message). Their cache retains the last schema so a
     /// late-joining subscriber fetches it via a history query, letting the data
@@ -181,11 +778,12 @@ pub struct DoraNode {
     /// the schema is only re-published when it changes or a publish failed) and
     /// the time of the last full-stream send (for the periodic in-band refresh).
     zenoh_schema_state: HashMap<DataId, SchemaOnceState>,
-    /// Threshold for using zenoh SHM vs inline bytes (default 4096).
-    zenoh_zero_copy_threshold: usize,
-    /// Per-output startup readiness for the direct zenoh data plane (lazily
-    /// created on first send). See [`ZenohOutputReadiness`].
-    zenoh_output_readiness: HashMap<DataId, ZenohOutputReadiness>,
+    /// Diagnostic (dora-rs/dora#2742): how many large sends have already been
+    /// traced hop-by-hop. The Windows nightly wedges the *runtime's* main loop
+    /// inside `send_output` on the very first large output, so tracing only the
+    /// first few large sends pins the stuck hop without spamming a healthy run.
+    /// Remove together with the runtime's stall watchdog once #2742 is closed.
+    large_send_diag_count: u32,
 
     dataflow_descriptor: serde_yaml::Result<Descriptor>,
     warned_unknown_output: BTreeSet<DataId>,
@@ -201,6 +799,14 @@ pub struct DoraNode {
     /// (which is drained explicitly at the top of [`Drop`]) so that any
     /// async cleanup triggered by session shutdown can still run.
     _owned_runtime: Option<tokio::runtime::Runtime>,
+
+    /// Join handle for the in-process testing daemon thread spawned by
+    /// [`Self::init_testing`] / the testing branch of `init_with_options`.
+    /// Joined in [`Drop`] after closing the request channel (dora-rs/dora#2855).
+    testing_daemon: Option<std::thread::JoinHandle<()>>,
+    /// Signals the testing daemon to abort a scheduled `next_event` sleep so
+    /// Drop's CloseOutputs handshake can complete.
+    testing_shutdown: Option<Arc<AtomicBool>>,
 }
 
 impl DoraNode {
@@ -483,19 +1089,13 @@ impl DoraNode {
             node_id: "test-node"
                 .parse()
                 .map_err(|e| NodeError::Init(format!("{e}")))?,
-            run_config: NodeRunConfig {
-                inputs: Default::default(),
-                outputs: Default::default(),
-                output_types: Default::default(),
-                output_framing: Default::default(),
-                input_types: Default::default(),
-                shared_memory_pool_size: None,
-            },
+            run_config: NodeRunConfig::default(),
             daemon_communication: Some(DaemonCommunication::Interactive),
             dataflow_descriptor: serde_yaml::Value::Null,
             dynamic: false,
             write_events_to: None,
             restart_count: 0,
+            output_routing: None,
         };
         let (mut node, events) = Self::init(node_config)?;
         node.interactive = true;
@@ -519,19 +1119,13 @@ impl DoraNode {
             node_id: "test-node"
                 .parse()
                 .map_err(|e| NodeError::Init(format!("{e}")))?,
-            run_config: NodeRunConfig {
-                inputs: Default::default(),
-                outputs: Default::default(),
-                output_types: Default::default(),
-                output_framing: Default::default(),
-                input_types: Default::default(),
-                shared_memory_pool_size: None,
-            },
+            run_config: NodeRunConfig::default(),
             daemon_communication: None,
             dataflow_descriptor: serde_yaml::Value::Null,
             dynamic: false,
             write_events_to: None,
             restart_count: 0,
+            output_routing: None,
         };
         let testing_comm = TestingCommunication {
             input,
@@ -555,6 +1149,11 @@ impl DoraNode {
         node_config: NodeConfig,
         testing_communication: Option<TestingCommunication>,
     ) -> NodeResult<(Self, EventStream)> {
+        // Before anything that can fail or block: a node spawned by `dora run`
+        // must not outlive the CLI even if the rest of this initialization
+        // stalls (dora-rs/dora#2856). A no-op on every other spawn path.
+        crate::orphan_guard::arm_if_run_child();
+
         let NodeConfig {
             dataflow_id,
             node_id,
@@ -564,12 +1163,13 @@ impl DoraNode {
             dynamic,
             write_events_to,
             restart_count,
+            output_routing,
         } = node_config;
         let clock = Arc::new(uhlc::HLC::default());
         let input_config = run_config.inputs.clone();
 
-        let daemon_communication = match daemon_communication {
-            Some(comm) => comm.into(),
+        let (daemon_communication, testing_daemon, testing_shutdown) = match daemon_communication {
+            Some(comm) => (comm.into(), None, None),
             None => match testing_communication {
                 Some(comm) => {
                     let TestingCommunication {
@@ -577,23 +1177,44 @@ impl DoraNode {
                         output,
                         options,
                     } = comm;
-                    let (sender, mut receiver) = tokio::sync::mpsc::channel(5);
-                    let new_communication = DaemonCommunicationWrapper::Testing { channel: sender };
-                    let mut events = IntegrationTestingEvents::new(input, output, options)?;
-                    std::thread::spawn(move || {
-                        while let Some((request, reply_sender)) = receiver.blocking_recv() {
-                            let reply = events.request(&request);
-                            if reply_sender
-                                .send(reply.unwrap_or_else(|err| {
-                                    DaemonReply::Result(Err(format!("{err:?}")))
-                                }))
-                                .is_err()
-                            {
-                                eprintln!("failed to send reply");
+                    let (sender, mut receiver) =
+                        tokio::sync::mpsc::channel(TESTING_DAEMON_CHANNEL_CAPACITY);
+                    let shutdown = Arc::new(AtomicBool::new(false));
+                    let new_communication = DaemonCommunicationWrapper::Testing {
+                        channel: sender,
+                        shutdown: shutdown.clone(),
+                    };
+                    let mut events =
+                        IntegrationTestingEvents::new(input, output, options, shutdown.clone())?;
+                    let shutdown_for_loop = shutdown.clone();
+                    let handle = std::thread::Builder::new()
+                        .name("dora-testing-daemon".into())
+                        .spawn(move || {
+                            while let Some((request, reply_sender)) = receiver.blocking_recv() {
+                                let outputs_done =
+                                    matches!(request.inner, DaemonRequest::OutputsDone);
+                                let reply = events.request(&request);
+                                if reply_sender
+                                    .send(reply.unwrap_or_else(|err| {
+                                        DaemonReply::Result(Err(format!("{err:?}")))
+                                    }))
+                                    .is_err()
+                                {
+                                    eprintln!("failed to send reply");
+                                }
+                                // Exit after OutputsDone under shutdown even if
+                                // EventStream still holds a sender clone — otherwise
+                                // node-first Drop waits forever on blocking_recv
+                                // (dora-rs/dora#2855).
+                                if outputs_done && shutdown_for_loop.load(Ordering::Relaxed) {
+                                    break;
+                                }
                             }
-                        }
-                    });
-                    new_communication
+                        })
+                        .map_err(|e| {
+                            NodeError::Init(format!("failed to spawn testing daemon thread: {e}"))
+                        })?;
+                    (new_communication, Some(handle), Some(shutdown))
                 }
                 None => {
                     return Err(NodeError::Init(
@@ -684,7 +1305,7 @@ impl DoraNode {
 
                 match layout {
                     Some(layout) => match ShmProviderBuilder::default_backend(layout).wait() {
-                        Ok(provider) => Some(provider),
+                        Ok(provider) => Some(Arc::new(provider)),
                         Err(e) => {
                             warn!(
                                 "failed to create zenoh SHM provider ({e}); \
@@ -705,6 +1326,37 @@ impl DoraNode {
             (Some(session), provider, owned_runtime)
         };
 
+        // Declare output publishers and start the startup handshake *before*
+        // `EventStream::init`, which blocks in the daemon's "all nodes ready"
+        // barrier: markers must be in flight while we are parked there so that
+        // consumers (whose subscriber callbacks ack them, also while parked)
+        // can prove the routes. This ordering is what keeps cycles
+        // (`a -> b -> a`) and self-loops from deadlocking — every node emits
+        // markers before it waits on anyone, and no one blocks on acks.
+        let (zenoh_publishers, startup_handshake) = match zenoh_session.as_ref() {
+            Some(session) => {
+                let routing = normalize_output_routing(output_routing, &run_config.outputs);
+                let (publishers, ack_states) = declare_output_publishers(
+                    session,
+                    dataflow_id,
+                    &node_id,
+                    &run_config.outputs,
+                    &routing,
+                );
+                let publishers = Arc::new(publishers);
+                let handshake = StartupHandshake::start(
+                    session,
+                    dataflow_id,
+                    &node_id,
+                    &publishers,
+                    ack_states,
+                    clock.clone(),
+                );
+                (publishers, Some(handshake))
+            }
+            None => (Arc::new(HashMap::new()), None),
+        };
+
         let event_stream = EventStream::init(
             dataflow_id,
             &node_id,
@@ -714,9 +1366,16 @@ impl DoraNode {
             clock.clone(),
             write_events_to,
             zenoh_session.as_ref(),
-            dynamic,
         )
         .wrap_err("failed to init event stream")?;
+
+        // The barrier has released: every static consumer is subscribed and
+        // acking, so the handshake now gets its bounded window. This settles
+        // every output's transport — acked onto direct zenoh, or frozen on the
+        // daemon path — before user code sends its first message.
+        if let Some(handshake) = &startup_handshake {
+            handshake.settle(ZENOH_STARTUP_GRACE);
+        }
         let control_channel =
             ControlChannel::init(dataflow_id, &node_id, &daemon_communication, clock.clone())
                 .wrap_err("failed to init control channel")?;
@@ -747,25 +1406,30 @@ impl DoraNode {
             }
         };
 
-        let mut node = Self {
+        let node = Self {
             id: node_id,
             dataflow_id,
             node_config: run_config.clone(),
             control_channel,
             clock,
             zenoh_session,
-            zenoh_shm_provider,
-            zenoh_publishers: HashMap::new(),
+            zenoh_publishers,
+            startup_handshake,
             zenoh_schema_publishers: HashMap::new(),
             zenoh_schema_state: HashMap::new(),
-            zenoh_zero_copy_threshold,
-            zenoh_output_readiness: HashMap::new(),
+            sample_allocator: SampleAllocator {
+                shm_provider: zenoh_shm_provider,
+                zero_copy_threshold: zenoh_zero_copy_threshold,
+            },
+            large_send_diag_count: 0,
             dataflow_descriptor: serde_yaml::from_value(dataflow_descriptor),
             warned_unknown_output: BTreeSet::new(),
             interactive: false,
             restart_count,
             runtime_type_checks,
             _owned_runtime: owned_runtime,
+            testing_daemon,
+            testing_shutdown,
         };
 
         if dynamic {
@@ -795,13 +1459,6 @@ impl DoraNode {
                 }
             }
         }
-
-        // Warm up the direct-zenoh data plane before handing control to user
-        // code: declare output publishers and wait (bounded) until their
-        // subscribers are wired, so the first `send_output` on a connected output
-        // hits an established route. Fail-safe — un-connected outputs start on the
-        // daemon path and upgrade later (see `warm_up_direct_outputs`).
-        node.warm_up_direct_outputs();
 
         Ok((node, event_stream))
     }
@@ -868,10 +1525,13 @@ impl DoraNode {
         // place: pre-write the UInt8 IPC header into the (shared-memory) sample,
         // then let the caller write their bytes straight into the data region —
         // zero payload copies (and the SHM sample is moved into zenoh's `put`).
-        let total = ipc_encode::uint8_ipc_len(data_len)
+        // Prepare the UInt8 IPC header once, then size and fill the sample from
+        // it — avoids rebuilding the layout + IPC headers for the length query.
+        let prepared = ipc_encode::PreparedUint8Ipc::new(data_len)
             .map_err(|e| NodeError::Output(format!("Arrow IPC encode: {e}")))?;
-        let mut sample = self.allocate_data_sample(total)?;
-        let offset = ipc_encode::encode_uint8_ipc_header(&mut sample, data_len)
+        let mut sample = self.allocate_data_sample(prepared.byte_len())?;
+        let offset = prepared
+            .encode_header_into(&mut sample)
             .map_err(|e| NodeError::Output(format!("Arrow IPC encode: {e}")))?;
         data(&mut sample[offset..offset + data_len]);
 
@@ -883,42 +1543,125 @@ impl DoraNode {
         self.send_output_sample(output_id, parameters, Some(sample))
     }
 
-    /// Sends the give Arrow array as an output message.
+    /// Sends the given Arrow array as an output message.
     ///
-    /// Uses shared memory for efficient data transfer if suitable.
+    /// This is the recommended way to emit data from a node: pass any value that
+    /// implements [`IntoArrow`] (primitives, `Vec<T>`, `&str`, an Arrow array,
+    /// …) and dora moves it into shared memory for an efficient, near-zero-copy
+    /// transfer to downstream nodes.
     ///
-    /// This method might copy the message once to move it to shared memory.
+    /// Uses shared memory for efficient data transfer if suitable. This method
+    /// might copy the message once to move it to shared memory.
     ///
     /// Ignores the output if the given `output_id` is not specified as node output in the dataflow
     /// configuration file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeError::Output`] if the payload cannot be Arrow-IPC encoded, or if runtime type
+    /// checking is enabled in error mode (`DORA_RUNTIME_TYPE_CHECK=error`) and the array's Arrow
+    /// type does not match the output's declared type. An `output_id` that is not declared as an
+    /// output is *not* an error — the call is ignored and returns `Ok`.
+    ///
+    /// ```no_run
+    /// use dora_node_api::{DoraNode, MetadataParameters};
+    /// use dora_core::config::DataId;
+    ///
+    /// let (mut node, _events) = DoraNode::init_from_env()?;
+    ///
+    /// let output = DataId::from("output_id".to_owned());
+    /// let parameters = MetadataParameters::default();
+    ///
+    /// node.send_output(output, parameters, vec![1.0f32, 2.0, 3.0])?;
+    /// # Ok::<(), eyre::Report>(())
+    /// ```
     pub fn send_output(
         &mut self,
         output_id: DataId,
         parameters: MetadataParameters,
-        data: impl Array,
+        data: impl IntoArrow,
     ) -> NodeResult<()> {
         if !self.validate_output(&output_id) {
             return Ok(());
         };
 
-        let arrow_array = data.to_data();
+        let data = data.into_arrow();
+        let arrow_array = dora_arrow_convert::internal::array_ref(&data).to_data();
+        self.check_output_type(&output_id, arrow_array.data_type(), &parameters)?;
 
-        // Runtime type check (only when DORA_RUNTIME_TYPE_CHECK is set).
-        //
-        // Skip the check when this message carries pattern metadata
-        // (`request_id`, `goal_id`, or `goal_status`). Service, action,
-        // and streaming patterns legitimately multiplex multiple Arrow
-        // schemas through a single output — a service server may reply
-        // with different response shapes for different request types —
-        // so a single declared Arrow type cannot cover all variants.
-        // Non-pattern messages still get full validation
-        // (dora-rs/adora#150).
+        let encoded = self.sample_allocator.encode_arrow_data(&arrow_array)?;
+        self.send_encoded_unchecked(output_id, parameters, encoded.sample)
+    }
+
+    /// Send a payload that has already been IPC-encoded into a dora-owned
+    /// [`EncodedSample`] by [`SampleAllocator::encode_arrow`].
+    ///
+    /// This is the entry point the runtime uses for operator outputs: the
+    /// operator thread does the encoding so that no memory owned by the
+    /// operator's language runtime is ever released on the node's thread — see
+    /// [`SampleAllocator`] (dora-rs/dora#2742).
+    ///
+    /// Like [`send_output`](Self::send_output), an `output_id` that is not a
+    /// declared output is ignored (returns `Ok`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeError::Output`] if runtime type checking is enabled in error mode
+    /// (`DORA_RUNTIME_TYPE_CHECK=error`) and the sample's Arrow type does not match the output's
+    /// declared type.
+    pub fn send_output_encoded(
+        &mut self,
+        output_id: DataId,
+        parameters: MetadataParameters,
+        encoded: EncodedSample,
+    ) -> NodeResult<()> {
+        if !self.validate_output(&output_id) {
+            return Ok(());
+        };
+        self.check_output_type(&output_id, &encoded.data_type, &parameters)?;
+        self.send_encoded_unchecked(output_id, parameters, encoded.sample)
+    }
+
+    /// Tag an already-encoded sample as an Arrow IPC stream and send it. The
+    /// caller has already run `validate_output` and `check_output_type`.
+    fn send_encoded_unchecked(
+        &mut self,
+        output_id: DataId,
+        mut parameters: MetadataParameters,
+        sample: DataSample,
+    ) -> NodeResult<()> {
+        parameters.insert(
+            FRAMING.to_string(),
+            Parameter::String(FRAMING_ARROW_IPC.to_string()),
+        );
+
+        self.send_output_sample(output_id, parameters, Some(sample))
+            .wrap_err("failed to send output")?;
+
+        Ok(())
+    }
+
+    /// Runtime type check (only when `DORA_RUNTIME_TYPE_CHECK` is set).
+    ///
+    /// Skips the check when this message carries pattern metadata
+    /// (`request_id`, `goal_id`, or `goal_status`). Service, action, and
+    /// streaming patterns legitimately multiplex multiple Arrow schemas through
+    /// a single output — a service server may reply with different response
+    /// shapes for different request types — so a single declared Arrow type
+    /// cannot cover all variants. Non-pattern messages still get full
+    /// validation (dora-rs/adora#150).
+    fn check_output_type(
+        &self,
+        output_id: &DataId,
+        actual: &arrow_schema::DataType,
+        parameters: &MetadataParameters,
+    ) -> NodeResult<()> {
+        // `is_output_type_mismatch` decides whether to flag; the `mode` here
+        // decides whether a flagged mismatch errors or only warns.
         if let Some((mode, checks)) = &self.runtime_type_checks
-            && let Some(expected) = checks.get(&output_id)
-            && !carries_pattern_correlation(&parameters)
+            && let Some(expected) = checks.get(output_id)
         {
-            let actual = arrow_array.data_type();
-            if actual != expected {
+            if is_output_type_mismatch(actual, expected, parameters) {
                 let msg = format!(
                     "output \"{output_id}\": expected Arrow type {expected:?}, got {actual:?}"
                 );
@@ -931,58 +1674,33 @@ impl DoraNode {
                     }
                     RuntimeTypeCheck::Off => unreachable!(),
                 }
+            } else if *actual == arrow_schema::DataType::Null
+                && *expected != arrow_schema::DataType::Null
+            {
+                // The `Null` carve-out is intentional (timer ticks, empty
+                // metadata-only sends, stream flushes), but log it so relaxing
+                // an `=error` check for this send is not entirely silent.
+                debug!(
+                    "output \"{output_id}\": skipping runtime type check for Null \
+                     payload on a typed output (expected {expected:?})"
+                );
             }
         }
-
-        self.send_output_array(output_id, parameters, arrow_array)
-    }
-
-    /// IPC-encode `arrow_array` into a (shared-memory) sample and send it.
-    ///
-    /// Every data-plane payload is a self-describing Arrow IPC stream. Uses the
-    /// hand-rolled 1-copy fast path when the array type is eligible, falling
-    /// back to the official writer (one extra copy) otherwise. The shared send
-    /// path for [`send_output`](Self::send_output) and
-    /// [`send_output_raw`](Self::send_output_raw).
-    fn send_output_array(
-        &mut self,
-        output_id: DataId,
-        mut parameters: MetadataParameters,
-        arrow_array: ArrayData,
-    ) -> NodeResult<()> {
-        parameters.insert(
-            FRAMING.to_string(),
-            Parameter::String(FRAMING_ARROW_IPC.to_string()),
-        );
-
-        let sample = match ipc_encode::ipc_fast_path_len(&arrow_array) {
-            Some(len) => {
-                let mut s = self.allocate_data_sample(len)?;
-                ipc_encode::encode_ipc_into(&arrow_array, &mut s)
-                    .map_err(|e| NodeError::Output(format!("Arrow IPC encode: {e}")))?;
-                s
-            }
-            None => {
-                let bytes = ipc_encode::encode_ipc_to_vec(&arrow_array)
-                    .map_err(|e| NodeError::Output(format!("Arrow IPC encode: {e}")))?;
-                let mut s = self.allocate_data_sample(bytes.len())?;
-                s.copy_from_slice(&bytes);
-                s
-            }
-        };
-
-        self.send_output_sample(output_id, parameters, Some(sample))
-            .wrap_err("failed to send output")?;
-
         Ok(())
     }
 
     /// Send the given raw byte data as output.
     ///
-    /// Might copy the data once to move it into shared memory.
+    /// Might copy the data once to move it into shared memory. `data_len` must equal `data.len()`;
+    /// the allocated sample is sized from `data_len` and the payload is copied from `data`.
     ///
     /// Ignores the output if the given `output_id` is not specified as node output in the dataflow
     /// configuration file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeError::Output`] if `data_len` does not equal `data.len()` (which would
+    /// otherwise panic in the internal `copy_from_slice`).
     pub fn send_output_bytes(
         &mut self,
         output_id: DataId,
@@ -1038,12 +1756,12 @@ impl DoraNode {
         // OTel Baggage is NOT propagated to avoid leaking sensitive data across
         // node boundaries. If a user explicitly provides this key, it wins.
         #[cfg(feature = "tracing")]
-        if !parameters.contains_key("open_telemetry_context") {
+        if !parameters.contains_key(crate::OPEN_TELEMETRY_CONTEXT) {
             let cx = opentelemetry::Context::current();
             let serialized = dora_tracing::telemetry::serialize_context(&cx);
             if !serialized.is_empty() {
                 parameters.insert(
-                    "open_telemetry_context".to_string(),
+                    crate::OPEN_TELEMETRY_CONTEXT.to_string(),
                     crate::Parameter::String(serialized),
                 );
             }
@@ -1052,6 +1770,21 @@ impl DoraNode {
         let metadata = Metadata::from_parameters(self.clock.new_timestamp(), parameters);
 
         let finalized = sample.map(|sample| sample.finalize());
+
+        // Diagnostic (dora-rs/dora#2742): the Windows nightly wedges a runtime's
+        // main loop inside this function on the first large output and is
+        // force-killed at the daemon's grace period, so nothing that only logs
+        // *after* a hop returns can ever show where it parked. Log on entry to
+        // each hop instead: the last line printed names the blocked call. Capped
+        // at the first few large sends (the wedge is on the first), so a healthy
+        // run pays one comparison per send and prints a handful of lines.
+        // `warn!` so it survives the default stdout filter and reaches CI logs.
+        let diag_bytes = finalized.as_ref().map_or(0, |f| f.byte_len());
+        let diag = diag_bytes >= self.sample_allocator.zero_copy_threshold
+            && self.large_send_diag_count < LARGE_SEND_DIAG_LIMIT;
+        if diag {
+            self.large_send_diag_count += 1;
+        }
 
         // How a data-plane message should be delivered.
         enum Delivery {
@@ -1063,20 +1796,33 @@ impl DoraNode {
             Daemon(Option<DataMessage>),
         }
 
-        // Always publish data-plane messages via zenoh when a session is
-        // available. The daemon control channel is only used as a fallback when
-        // the zenoh session could not be opened (e.g. interactive/testing mode)
-        // or when no subscriber matched in time. An SHM-backed sample is moved
-        // straight into zenoh's `put` (no extra copy); only the daemon fallback
+        // Publish via direct zenoh only when the output may take the direct
+        // path: its publisher exists and the startup handshake has proven its
+        // routes — every required consumer acked a marker (see
+        // `StartupHandshake`). Everything else takes the reliable daemon path:
+        // no zenoh session (interactive/testing mode), an output the daemon
+        // pinned there (see `OutputRouting::daemon_only`: a consumer on another
+        // daemon needs inter-daemon forwarding, which only daemon-path sends
+        // feed — #2738 — or a consumer's `queue_policy: backpressure` needs the
+        // lossless daemon ingress), or an output
+        // whose handshake did not complete before `init` returned and is
+        // therefore frozen there for the run. An SHM-backed sample is moved
+        // straight into zenoh's `put` (no extra copy); only the daemon path
         // copies it out into a `DataMessage::Vec`.
         let delivery = match finalized {
-            Some(finalized) if self.zenoh_session.is_some() => {
+            Some(finalized) if self.output_direct_ready(&output_id) => {
                 tracing::trace!(
                     output = %output_id,
                     size = finalized.byte_len(),
                     "publishing via zenoh"
                 );
-                match self.zenoh_publish(&output_id, &metadata, finalized) {
+                if diag {
+                    warn!(
+                        "output `{output_id}`: {diag_bytes} B -> zenoh direct path \
+                         (dora-rs/dora#2742 diagnostic)"
+                    );
+                }
+                match self.zenoh_publish(&output_id, &metadata, finalized, diag) {
                     Ok(PublishOutcome::Published) => Delivery::Zenoh,
                     Ok(PublishOutcome::NotPublished(sample)) => {
                         Delivery::Daemon(Some(sample.into_data_message()))
@@ -1090,7 +1836,15 @@ impl DoraNode {
                     }
                 }
             }
-            Some(finalized) => Delivery::Daemon(Some(finalized.into_data_message())),
+            Some(finalized) => {
+                if diag {
+                    warn!(
+                        "output `{output_id}`: {diag_bytes} B -> daemon path \
+                         (dora-rs/dora#2742 diagnostic)"
+                    );
+                }
+                Delivery::Daemon(Some(finalized.into_data_message()))
+            }
             None => Delivery::Daemon(None),
         };
 
@@ -1099,6 +1853,12 @@ impl DoraNode {
                 // Keep the daemon's control-plane state in sync (input
                 // deadlines, circuit-breaker recovery) without duplicating the
                 // data payload that zenoh already delivered.
+                if diag {
+                    warn!(
+                        "output `{output_id}`: entering report_output_sent \
+                         (dora-rs/dora#2742 diagnostic)"
+                    );
+                }
                 self.control_channel
                     .report_output_sent(output_id.clone(), metadata)
                     .wrap_err_with(|| format!("failed to report output {output_id}"))?;
@@ -1114,11 +1874,19 @@ impl DoraNode {
                 {
                     return Err(NodeError::Output(format!(
                         "output \"{output_id}\": IPC-encoded message is {} bytes, exceeding \
-                         the {}-byte daemon transport limit (no matching zenoh subscriber to \
-                         take the large payload)",
+                         the {}-byte daemon transport limit (the output is on the daemon \
+                         path: pinned for a consumer only forwarding can reach or one \
+                         declaring `queue_policy: backpressure`, its startup handshake \
+                         did not complete, or no zenoh route is available)",
                         v.len(),
                         dora_message::MAX_MESSAGE_BYTES,
                     )));
+                }
+                if diag {
+                    warn!(
+                        "output `{output_id}`: entering control_channel.send_message \
+                         (dora-rs/dora#2742 diagnostic)"
+                    );
                 }
                 self.control_channel
                     .send_message(output_id.clone(), metadata, data)
@@ -1134,6 +1902,12 @@ impl DoraNode {
     /// The node is not allowed to send more outputs with the closed IDs.
     ///
     /// Closing outputs early can be helpful to receivers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeError::Output`] if any id is not a declared output of this node. Unlike
+    /// [`send_output`](Self::send_output), which silently ignores unknown outputs, this validates
+    /// the whole batch *before* closing any output, so on error none of them are closed.
     pub fn close_outputs(&mut self, outputs_ids: Vec<DataId>) -> NodeResult<()> {
         // Validate the whole batch before mutating any local state. Removing
         // outputs eagerly would leave the node's local output set out of sync
@@ -1156,281 +1930,37 @@ impl DoraNode {
         Ok(())
     }
 
-    /// Whether the direct zenoh data plane is safe to use for `output_id` — i.e.
-    /// every subscriber this output has in the dataflow has announced its
-    /// subscription. Returns `false` while any expected subscriber is still
-    /// missing, so the caller keeps using the reliable daemon path (no message is
-    /// dropped during the startup subscription-establishment window).
+    /// Whether `output_id` may take the direct zenoh path: its publisher exists
+    /// (declared at init, not pinned to the daemon path) and the startup
+    /// handshake proved its routes — see [`StartupHandshake`].
     ///
-    /// Lazily declares the per-output liveliness counter on first use. Once all
-    /// subscribers are confirmed the result latches `true` and later calls are a
-    /// cheap map lookup. If readiness tracking cannot be set up (no zenoh session
-    /// or an invalid key) this returns `true` so the data plane is not stalled.
-    fn ensure_output_ready(&mut self, output_id: &DataId) -> bool {
-        use zenoh::Wait;
-
-        if self
-            .zenoh_output_readiness
+    /// Constant for the node's lifetime — see [`wait_for_grace`].
+    fn output_direct_ready(&self, output_id: &DataId) -> bool {
+        self.zenoh_publishers
             .get(output_id)
-            .is_some_and(|r| r.ready)
-        {
-            return true;
-        }
-
-        if !self.zenoh_output_readiness.contains_key(output_id) {
-            match self.declare_output_readiness(output_id) {
-                Some(readiness) => {
-                    self.zenoh_output_readiness
-                        .insert(output_id.clone(), readiness);
-                }
-                // Tracking unavailable — don't stall the data plane.
-                None => return true,
-            }
-        }
-
-        let (expected, count) = {
-            let readiness = self
-                .zenoh_output_readiness
-                .get(output_id)
-                .expect("readiness entry just ensured");
-            let count = readiness.alive.lock().map(|alive| alive.len()).unwrap_or(0);
-            (readiness.expected, count)
-        };
-
-        // No subscribers to wait for: nothing can be lost, use the fast path.
-        if expected == 0 {
-            self.mark_output_ready(output_id);
-            return true;
-        }
-
-        if count < expected {
-            return false;
-        }
-
-        // Every readiness token is visible (all subscribers declared their
-        // subscriptions). Confirm zenoh has actually forwarded a matching
-        // subscription to this publisher before switching, so the very first
-        // zenoh sample isn't published into a not-yet-wired route.
-        let matched = self
-            .zenoh_publishers
-            .get(output_id)
-            .and_then(|publisher| publisher.matching_status().wait().ok())
-            .is_some_and(|status| status.matching());
-        if matched {
-            self.mark_output_ready(output_id);
-            return true;
-        }
-
-        false
-    }
-
-    /// Latch the output's data plane as ready (idempotent).
-    fn mark_output_ready(&mut self, output_id: &DataId) {
-        if let Some(readiness) = self.zenoh_output_readiness.get_mut(output_id) {
-            if !readiness.ready {
-                tracing::debug!(
-                    output = %output_id,
-                    subscribers = readiness.expected,
-                    "all subscribers wired; switching output to direct zenoh data plane"
-                );
-            }
-            readiness.ready = true;
-        }
-    }
-
-    /// Build the per-output readiness counter: resolve how many subscribers the
-    /// output has (from the dataflow descriptor) and declare a liveliness
-    /// subscriber that counts their readiness tokens. Returns `None` if there is
-    /// no zenoh session or the counting subscription could not be declared.
-    fn declare_output_readiness(&self, output_id: &DataId) -> Option<ZenohOutputReadiness> {
-        use zenoh::Wait;
-
-        let session = self.zenoh_session.as_ref()?;
-
-        // Expected subscriber count from the global topology. A descriptor that
-        // failed to parse (never the case for a daemon-spawned node) yields 0,
-        // which just means "no barrier" — the pre-existing behaviour.
-        let expected = match &self.dataflow_descriptor {
-            Ok(descriptor) => descriptor
-                .output_subscriber_count(&self.id, output_id)
-                .unwrap_or_else(|e| {
-                    tracing::warn!(
-                        output = %output_id,
-                        "failed to count subscribers ({e}); not gating the zenoh data plane"
-                    );
-                    0
-                }),
-            Err(_) => 0,
-        };
-
-        let prefix = dora_core::topics::zenoh_output_ready_liveliness_prefix(
-            self.dataflow_id,
-            &self.id,
-            output_id,
-        );
-        let key_expr = match zenoh::key_expr::KeyExpr::new(prefix) {
-            Ok(key) => key.into_owned(),
-            Err(e) => {
-                tracing::warn!(output = %output_id, "invalid readiness key ({e}); not gating the zenoh data plane");
-                return None;
-            }
-        };
-
-        let alive = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
-        let alive_cb = alive.clone();
-        // `history(true)` replays tokens that were declared before this
-        // subscriber, so subscribers that wired up early are still counted.
-        let subscriber = session
-            .liveliness()
-            .declare_subscriber(key_expr)
-            .history(true)
-            .callback(move |sample| {
-                let key = sample.key_expr().as_str().to_string();
-                if let Ok(mut alive) = alive_cb.lock() {
-                    match sample.kind() {
-                        zenoh::sample::SampleKind::Put => {
-                            alive.insert(key);
-                        }
-                        zenoh::sample::SampleKind::Delete => {
-                            alive.remove(&key);
-                        }
-                    }
-                }
-            })
-            .wait();
-
-        match subscriber {
-            Ok(subscriber) => Some(ZenohOutputReadiness {
-                expected,
-                ready: false,
-                alive,
-                _liveliness_sub: subscriber,
-            }),
-            Err(e) => {
-                tracing::warn!(output = %output_id, "failed to declare readiness subscriber ({e}); not gating the zenoh data plane");
-                None
-            }
-        }
-    }
-
-    /// Ensure a direct-zenoh data publisher is declared for `output_id`.
-    ///
-    /// Idempotent: returns `true` if a publisher exists after the call (already
-    /// present or freshly declared), `false` if there is no zenoh session or the
-    /// declaration failed (the caller then falls back to the daemon path).
-    ///
-    /// QoS is configured at declare time so it applies to every put:
-    /// `express(true)` bypasses zenoh's adaptive batch timer (the single biggest
-    /// small-message latency win — without it, per-put delivery on the bare local
-    /// config collapses to a few msg/s), `Priority::RealTime` keeps data-plane
-    /// messages off the bulk-data queues, and `CongestionControl::Drop` prevents a
-    /// stalled subscriber from back-pressuring the publishing node.
-    fn ensure_zenoh_publisher(&mut self, output_id: &DataId) -> bool {
-        use zenoh::Wait;
-        use zenoh::qos::{CongestionControl, Priority};
-
-        if self.zenoh_publishers.contains_key(output_id) {
-            return true;
-        }
-        let Some(session) = self.zenoh_session.as_ref() else {
-            return false;
-        };
-        let topic =
-            dora_core::topics::zenoh_output_publish_topic(self.dataflow_id, &self.id, output_id);
-        let key_expr = match zenoh::key_expr::KeyExpr::new(topic) {
-            Ok(key) => key.into_owned(),
-            Err(e) => {
-                tracing::warn!(output = %output_id, "invalid zenoh key ({e}); falling back to daemon path");
-                return false;
-            }
-        };
-        let publisher = match session
-            .declare_publisher(key_expr)
-            .congestion_control(CongestionControl::Drop)
-            .express(true)
-            .priority(Priority::RealTime)
-            .wait()
-        {
-            Ok(publisher) => publisher,
-            Err(e) => {
-                tracing::warn!(output = %output_id, "failed to declare zenoh publisher ({e}); falling back to daemon path");
-                return false;
-            }
-        };
-        self.zenoh_publishers.insert(output_id.clone(), publisher);
-        true
-    }
-
-    /// Eagerly declare this node's direct-zenoh output publishers and readiness
-    /// counters, then wait (bounded) until every output's subscribers are wired
-    /// up — so the user's first `send_output` on a connected output is guaranteed
-    /// to hit an established route rather than dropping startup samples.
-    ///
-    /// Runs once, at the end of [`Self::init`], *after* the daemon "all nodes
-    /// ready" barrier. By then every subscriber in the dataflow has already
-    /// declared its data subscriber and readiness token (the barrier releases
-    /// only once all nodes have subscribed), so this merely waits out zenoh route
-    /// propagation between already-declared endpoints — normally milliseconds.
-    ///
-    /// Fail-safe: outputs that don't connect within
-    /// [`ZENOH_OUTPUT_CONNECT_TIMEOUT`] (an unreachable remote subscriber, or a
-    /// zenoh data plane that can't connect while the control plane can) are left
-    /// on the reliable daemon path and upgrade to direct zenoh on a later send
-    /// once their subscribers appear. The dataflow is never blocked from starting
-    /// and nothing is dropped.
-    fn warm_up_direct_outputs(&mut self) {
-        if self.zenoh_session.is_none() {
-            return;
-        }
-        let outputs: Vec<DataId> = self.node_config.outputs.iter().cloned().collect();
-        if outputs.is_empty() {
-            return;
-        }
-
-        // Declare publishers up front so zenoh starts wiring routes immediately
-        // and `ensure_output_ready` (which reads `matching_status`) can observe
-        // them. `ensure_output_ready` lazily declares the readiness counter.
-        for output_id in &outputs {
-            self.ensure_zenoh_publisher(output_id);
-        }
-
-        let deadline = Instant::now() + ZENOH_OUTPUT_CONNECT_TIMEOUT;
-        loop {
-            let all_ready = outputs
-                .iter()
-                .all(|output_id| self.ensure_output_ready(output_id));
-            if all_ready {
-                break;
-            }
-            if Instant::now() >= deadline {
-                let pending: Vec<&str> = outputs
-                    .iter()
-                    .filter(|o| !self.ensure_output_ready(o))
-                    .map(|o| o.as_str())
-                    .collect();
-                tracing::debug!(
-                    outputs = ?pending,
-                    "direct-zenoh routes not confirmed within {}s; these outputs start on the daemon path and upgrade when their subscribers connect",
-                    ZENOH_OUTPUT_CONNECT_TIMEOUT.as_secs()
-                );
-                break;
-            }
-            std::thread::sleep(ZENOH_OUTPUT_CONNECT_POLL_INTERVAL);
-        }
+            .is_some_and(|output| output.ready.load(Ordering::Relaxed))
     }
 
     /// Publish data directly via zenoh (node-to-node, bypassing daemon for data).
     /// Uses SHM for zero-copy when possible, falls back to heap buffer.
     ///
-    /// The publisher is declared (see [`Self::ensure_zenoh_publisher`]) with
+    /// The publisher was declared at init (see [`declare_output_publishers`]) with
     /// `express(true)` to bypass zenoh's adaptive batch timer and with
     /// `Priority::RealTime` so data-plane messages don't share queues with bulk
-    /// traffic.
+    /// traffic. Its routes were already proven by the startup handshake
+    /// ([`StartupHandshake`]) before [`Self::output_direct_ready`] let the send
+    /// take this path, so the first send here cannot be dropped for a
+    /// not-yet-established subscription.
+    ///
+    /// `diag` enables the per-hop entry logging described in
+    /// [`Self::send_output_sample`] (dora-rs/dora#2742); it is only ever set for
+    /// the first few large sends of a node's lifetime.
     fn zenoh_publish(
         &mut self,
         output_id: &DataId,
         metadata: &Metadata,
         finalized: FinalizedSample,
+        diag: bool,
     ) -> eyre::Result<PublishOutcome> {
         use zenoh::Wait;
 
@@ -1439,38 +1969,32 @@ impl DoraNode {
         // daemon. Only a failed `put` of an SHM buffer (which consumes it)
         // returns `Err` — that is the single non-recoverable case.
         //
-        // Get or create the publisher for this output. Normally it was already
-        // declared eagerly at startup (see [`Self::warm_up_direct_outputs`]);
-        // this covers outputs sent that weren't declared then. A missing
-        // session or a declaration failure falls back to the daemon path.
-        if !self.ensure_zenoh_publisher(output_id) {
-            return Ok(PublishOutcome::NotPublished(finalized));
-        }
-
-        // Startup no-loss barrier: until every subscriber for this output has
-        // wired up its zenoh subscription, deliver over the reliable daemon path
-        // rather than dropping early samples on the not-yet-established data
-        // plane. Once all subscribers are confirmed this latches ready and every
-        // subsequent send takes the fast zenoh path.
-        if !self.ensure_output_ready(output_id) {
-            return Ok(PublishOutcome::NotPublished(finalized));
-        }
-
-        let Some(publisher) = self.zenoh_publishers.get(output_id) else {
-            tracing::warn!(output = %output_id, "zenoh publisher missing; falling back to daemon path");
+        // No publisher means there is no zenoh session, its declaration failed
+        // at init, or the output is pinned to the daemon path: fall back to the
+        // reliable daemon path (defense in depth — `output_direct_ready`
+        // already gates the caller).
+        let Some(DirectOutput { publisher, .. }) = self.zenoh_publishers.get(output_id) else {
             return Ok(PublishOutcome::NotPublished(finalized));
         };
         let session = self
             .zenoh_session
             .as_ref()
-            .expect("zenoh session presence checked above");
+            .expect("a declared publisher implies a zenoh session");
 
-        // Serialize metadata as zenoh attachment.
-        let metadata_bytes = match bincode::serialize(metadata) {
-            Ok(bytes) => bytes,
+        // Serialize metadata as the zenoh attachment. Encode it lazily: the
+        // sub-threshold schema-once fast path below carries its own
+        // schema-tagged attachment (built in `publish_schema_once`) and never
+        // uses this blob, so encoding it eagerly would postcard-serialize the
+        // metadata twice per message on the highest-rate streaming/small-message
+        // path (the exact case schema-once exists to speed up). Compute it only
+        // on the paths that actually attach the full metadata. Returns `None`
+        // (after logging) on an encode failure so the caller can fall back to
+        // the daemon path.
+        let encode_metadata = || match dora_message::encode(metadata) {
+            Ok(bytes) => Some(bytes),
             Err(e) => {
                 tracing::warn!(output = %output_id, "failed to serialize metadata ({e}); falling back to daemon path");
-                return Ok(PublishOutcome::NotPublished(finalized));
+                None
             }
         };
 
@@ -1490,6 +2014,15 @@ impl DoraNode {
             // the deliberate, accepted trade-off for the zero-copy large-output
             // path, not an oversight.
             FinalizedSample::Shm(sbuf) => {
+                let Some(metadata_bytes) = encode_metadata() else {
+                    return Ok(PublishOutcome::NotPublished(FinalizedSample::Shm(sbuf)));
+                };
+                if diag {
+                    tracing::warn!(
+                        "output `{output_id}`: entering zenoh put of an SHM buffer \
+                         (dora-rs/dora#2742 diagnostic)"
+                    );
+                }
                 publisher
                     .put(sbuf)
                     .attachment(&metadata_bytes[..])
@@ -1503,8 +2036,8 @@ impl DoraNode {
             // The heap buffer is only borrowed, so any put error can fall back
             // to the daemon path with the payload intact.
             FinalizedSample::Vec(avec) => {
-                if avec.len() >= self.zenoh_zero_copy_threshold
-                    && let Some(provider) = &self.zenoh_shm_provider
+                if avec.len() >= self.sample_allocator.zero_copy_threshold
+                    && let Some(provider) = &self.sample_allocator.shm_provider
                 {
                     use zenoh::shm::GarbageCollect;
                     // Non-blocking: garbage-collect freed chunks and allocate, but
@@ -1515,24 +2048,61 @@ impl DoraNode {
                     // 1.8 has no alloc signalling yet), throttling throughput to
                     // ~1k msg/s. Falling back to a heap-buffered put instead keeps
                     // the producer moving (PR #2366).
+                    if diag {
+                        tracing::warn!(
+                            "output `{output_id}`: entering SHM alloc of {} B \
+                             (dora-rs/dora#2742 diagnostic)",
+                            avec.len()
+                        );
+                    }
                     match provider
                         .alloc(avec.len())
                         .with_policy::<GarbageCollect>()
                         .wait()
                     {
                         Ok(mut sbuf) => {
-                            sbuf.as_mut().copy_from_slice(&avec);
-                            return match publisher.put(sbuf).attachment(&metadata_bytes[..]).wait()
-                            {
-                                Ok(()) => Ok(PublishOutcome::Published),
-                                Err(e) => {
+                            // Mirror the guard in `allocate_data_sample`: only
+                            // copy into the SHM buffer when it is exactly the
+                            // requested size. zenoh 1.8 guarantees the logical
+                            // length matches the request, but `copy_from_slice`
+                            // requires equal lengths and would panic on the
+                            // node's send thread if a future provider ever
+                            // over-allocated. Fall through to the reliable
+                            // daemon path instead of risking that panic.
+                            if sbuf.as_mut().len() == avec.len() {
+                                let Some(metadata_bytes) = encode_metadata() else {
+                                    return Ok(PublishOutcome::NotPublished(FinalizedSample::Vec(
+                                        avec,
+                                    )));
+                                };
+                                sbuf.as_mut().copy_from_slice(&avec);
+                                if diag {
                                     tracing::warn!(
-                                        "zenoh SHM publish failed ({e}); \
-                                         falling back to daemon path"
+                                        "output `{output_id}`: entering zenoh put of a \
+                                         copied SHM buffer (dora-rs/dora#2742 diagnostic)"
                                     );
-                                    Ok(PublishOutcome::NotPublished(FinalizedSample::Vec(avec)))
                                 }
-                            };
+                                return match publisher
+                                    .put(sbuf)
+                                    .attachment(&metadata_bytes[..])
+                                    .wait()
+                                {
+                                    Ok(()) => Ok(PublishOutcome::Published),
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "zenoh SHM publish failed ({e}); \
+                                             falling back to daemon path"
+                                        );
+                                        Ok(PublishOutcome::NotPublished(FinalizedSample::Vec(avec)))
+                                    }
+                                };
+                            }
+                            tracing::debug!(
+                                "zenoh SHM alloc returned {} bytes for a {}-byte \
+                                 request; using daemon path",
+                                sbuf.as_ref().len(),
+                                avec.len()
+                            );
                         }
                         Err(e) => {
                             tracing::debug!("SHM alloc failed ({e}), using heap buffer");
@@ -1549,7 +2119,7 @@ impl DoraNode {
                 // reliable daemon path instead (TCP, up to `MAX_MESSAGE_BYTES`).
                 // Only sub-threshold payloads, which fit a single batch and never
                 // fragment, take the zenoh heap put below.
-                if avec.len() >= self.zenoh_zero_copy_threshold {
+                if avec.len() >= self.sample_allocator.zero_copy_threshold {
                     return Ok(PublishOutcome::NotPublished(FinalizedSample::Vec(avec)));
                 }
 
@@ -1594,7 +2164,7 @@ impl DoraNode {
                 // attachment bytes outlive the `put` below.
                 let schema_once = if schema_once_eligible(
                     avec.len(),
-                    self.zenoh_zero_copy_threshold,
+                    self.sample_allocator.zero_copy_threshold,
                     &metadata.parameters,
                 ) {
                     publish_schema_once(
@@ -1610,14 +2180,33 @@ impl DoraNode {
                 } else {
                     None
                 };
-                // Fall back to a full standalone stream if the batch slice can't
-                // be taken (a real IPC stream always can — defensive).
-                let (payload, attachment): (&[u8], &[u8]) = match schema_once.as_ref() {
-                    Some(att) => match arrow_utils::ipc_encode::batch_slice(&avec) {
-                        Some(slice) => (slice, att.as_slice()),
-                        None => (&avec[..], &metadata_bytes[..]),
-                    },
-                    None => (&avec[..], &metadata_bytes[..]),
+                // Schema-once fast path: send just the schema-less batch slice
+                // tagged with the schema attachment — no metadata encode. Fall
+                // back to a full standalone stream (with the metadata blob as
+                // attachment) when schema-once is not primed or the batch slice
+                // can't be taken (a real IPC stream always can — defensive). The
+                // metadata is encoded only on that fallback, keeping the fast
+                // path free of a redundant serialization. The payload/attachment
+                // pairing is chosen by `select_zenoh_put` (unit-tested pure
+                // decision) — mispairing here silently drops messages at the
+                // receiver (dora-rs/dora#2366).
+                let choice = select_zenoh_put(
+                    schema_once.as_deref(),
+                    arrow_utils::ipc_encode::batch_slice(&avec),
+                );
+                let fallback_meta;
+                let (payload, attachment): (&[u8], &[u8]) = match choice {
+                    ZenohPutChoice::SchemaOnce {
+                        payload,
+                        attachment,
+                    } => (payload, attachment),
+                    ZenohPutChoice::FullStream => {
+                        let Some(bytes) = encode_metadata() else {
+                            return Ok(PublishOutcome::NotPublished(FinalizedSample::Vec(avec)));
+                        };
+                        fallback_meta = bytes;
+                        (&avec[..], &fallback_meta[..])
+                    }
                 };
                 match publisher.put(payload).attachment(attachment).wait() {
                     Ok(()) => Ok(PublishOutcome::Published),
@@ -1667,7 +2256,7 @@ impl DoraNode {
     /// `DORA_ZERO_COPY_THRESHOLD` env var, defaulting to
     /// [`ZERO_COPY_THRESHOLD`].
     pub fn zero_copy_threshold(&self) -> usize {
-        self.zenoh_zero_copy_threshold
+        self.sample_allocator.zero_copy_threshold
     }
 
     /// Returns true if this node was restarted after a previous exit or failure.
@@ -1709,8 +2298,10 @@ impl DoraNode {
         self.log_with_fields(level, message, target, None);
     }
 
-    /// Maximum total size of log fields before they are dropped (60 KB).
-    /// Matches the downstream 64 KB parse limit with headroom for the message envelope.
+    /// Maximum serialized size of the log `fields` object before it is
+    /// dropped (60 KB). Matches the downstream 64 KB parse limit with headroom
+    /// for the message envelope. Measured on the serialized JSON (see
+    /// [`log_fields_within_budget`]), not the raw key/value byte sum.
     const MAX_LOG_FIELDS_BYTES: usize = 60 * 1024;
 
     /// Send a structured log message with optional key-value fields.
@@ -1743,12 +2334,12 @@ impl DoraNode {
             entry["target"] = serde_json::Value::String(target.to_string());
         }
         if let Some(fields) = fields {
-            let total: usize = fields.iter().map(|(k, v)| k.len() + v.len()).sum();
-            if total <= Self::MAX_LOG_FIELDS_BYTES {
-                entry["fields"] = serde_json::json!(fields);
-            } else {
-                eprintln!("dora log: fields too large ({total} bytes), dropping fields");
-                entry["fields_dropped"] = serde_json::Value::Bool(true);
+            match log_fields_within_budget(fields, Self::MAX_LOG_FIELDS_BYTES) {
+                Some(value) => entry["fields"] = value,
+                None => {
+                    eprintln!("dora log: fields too large, dropping fields");
+                    entry["fields_dropped"] = serde_json::Value::Bool(true);
+                }
             }
         }
         match serde_json::to_string(&entry) {
@@ -1790,6 +2381,25 @@ impl DoraNode {
     ///
     /// Uses a per-thread monotonic counter context to guarantee uniqueness
     /// even when multiple IDs are generated within the same clock tick.
+    ///
+    /// ```
+    /// use dora_node_api::DoraNode;
+    /// use dora_node_api::uuid::Uuid;
+    ///
+    /// let a = DoraNode::new_request_id();
+    /// let b = DoraNode::new_request_id();
+    ///
+    /// // Unique even when generated within the same clock tick.
+    /// assert_ne!(a, b);
+    /// // UUID v7 is time-ordered, so a later ID sorts after an earlier one.
+    /// assert!(b > a);
+    /// // Both are valid v7 UUIDs; `new_goal_id` is an alias returning the same shape.
+    /// assert_eq!(Uuid::parse_str(&a).unwrap().get_version_num(), 7);
+    /// assert_eq!(
+    ///     Uuid::parse_str(&DoraNode::new_goal_id()).unwrap().get_version_num(),
+    ///     7,
+    /// );
+    /// ```
     pub fn new_request_id() -> String {
         thread_local! {
             static CTX: uuid::ContextV7 = const { uuid::ContextV7::new() };
@@ -1809,11 +2419,15 @@ impl DoraNode {
     /// metadata parameters. Returns the generated request ID.
     ///
     /// Any existing `request_id` key in `parameters` is replaced.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from [`send_output`](Self::send_output).
     pub fn send_service_request(
         &mut self,
         output_id: DataId,
         mut parameters: MetadataParameters,
-        data: impl Array,
+        data: impl IntoArrow,
     ) -> NodeResult<String> {
         if parameters.contains_key(dora_message::metadata::REQUEST_ID) {
             tracing::warn!("send_service_request: caller-provided request_id will be overwritten");
@@ -1835,7 +2449,7 @@ impl DoraNode {
         &mut self,
         output_id: DataId,
         parameters: MetadataParameters,
-        data: impl Array,
+        data: impl IntoArrow,
     ) -> NodeResult<()> {
         self.send_output(output_id, parameters, data)
     }
@@ -1847,67 +2461,34 @@ impl DoraNode {
     /// Send a streaming segment chunk. Convenience wrapper around
     /// [`send_output`](Self::send_output) that builds metadata from the
     /// [`StreamSegment`] builder.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from [`send_output`](Self::send_output).
     pub fn send_stream_chunk(
         &mut self,
         output_id: DataId,
         segment: &mut StreamSegment,
         fin: bool,
-        data: impl Array,
+        data: impl IntoArrow,
     ) -> NodeResult<()> {
         self.send_output(output_id, segment.chunk(fin), data)
     }
 
     /// Allocates a [`DataSample`] of the specified size.
     ///
-    /// For payloads at or above the zero-copy threshold the buffer is allocated
-    /// directly from the zenoh SHM provider (when available), so the producer
-    /// writes straight into shared memory and publishing moves the buffer into
-    /// zenoh's `put` without a further copy. Smaller payloads — or the case
-    /// where no SHM provider exists (interactive/testing mode) — use a
-    /// heap-allocated, 128-byte-aligned buffer; the SHM provider is
-    /// page-aligned, so dedicating a full page to a small message is pure waste.
+    /// See [`SampleAllocator::allocate`] for the allocation strategy.
     pub fn allocate_data_sample(&mut self, data_len: usize) -> NodeResult<DataSample> {
-        if data_len >= self.zenoh_zero_copy_threshold
-            && let Some(provider) = &self.zenoh_shm_provider
-        {
-            use zenoh::Wait;
-            use zenoh::shm::GarbageCollect;
-            // Non-blocking (see `zenoh_publish`): GC and allocate, but fall back
-            // to a heap buffer rather than `BlockOn`-sleeping 1 ms when the pool
-            // is momentarily full under a large-message burst. The heap buffer
-            // costs one extra copy on publish but keeps the producer from
-            // stalling, which is what regressed sustained throughput (PR #2366).
-            match provider
-                .alloc(data_len)
-                .with_policy::<GarbageCollect>()
-                .wait()
-            {
-                Ok(sbuf) => {
-                    // Use the SHM buffer only when it is exactly the requested
-                    // size — zenoh 1.8 guarantees this (the logical length
-                    // matches the request even when the backing chunk is
-                    // larger). If a future provider ever over-allocates, fall
-                    // back to heap rather than expose or publish an oversized
-                    // slice (`DataSample` has no length cap of its own).
-                    if sbuf.as_ref().len() == data_len {
-                        return Ok(DataSample {
-                            storage: SampleStorage::Shm(sbuf),
-                        });
-                    }
-                    tracing::debug!(
-                        "zenoh SHM alloc returned {} bytes for a {data_len}-byte \
-                         request; using heap",
-                        sbuf.as_ref().len()
-                    );
-                }
-                Err(e) => {
-                    tracing::debug!("SHM alloc failed ({e}), using heap buffer");
-                }
-            }
-        }
+        self.sample_allocator.allocate(data_len)
+    }
 
-        let avec: AVec<u8, ConstAlign<128>> = AVec::__from_elem(128, 0, data_len);
-        Ok(avec.into())
+    /// A handle for building output samples off this node's thread.
+    ///
+    /// The runtime hands one to each operator thread so the operator can encode
+    /// its payload into a dora-owned [`DataSample`] itself — see
+    /// [`SampleAllocator`] for why that matters (dora-rs/dora#2742).
+    pub fn sample_allocator(&self) -> SampleAllocator {
+        self.sample_allocator.clone()
     }
 
     /// Returns the full dataflow descriptor that this node is part of.
@@ -1924,35 +2505,94 @@ impl DoraNode {
         }
     }
 
-    /// Register a pinned memory pool with the daemon for lifecycle tracking.
+    /// Store an opaque value in the daemon's dataflow-scoped extension table.
     ///
-    /// Send the memory pool metadata to the daemon so it can track the pool
-    /// and provide it to other nodes for zero-copy access.
-    pub fn register_pinned_memory(
+    /// This is the seam for transports that live outside the dora tree: dora
+    /// brokers the value's lifetime and nothing else — it never interprets
+    /// `namespace`, `key` or `value`. See `docs/extensions.md`.
+    ///
+    /// The daemon remembers which nodes touched a key so that dropping it
+    /// notifies them, and reclaims the entry when the dataflow ends or the
+    /// storing node exits. Drain the notifications with
+    /// [`event_stream::extensions::drain_dropped_keys`](crate::event_stream::extensions::drain_dropped_keys).
+    pub fn extension_store(
         &mut self,
-        shared_memory_id: String,
-        metadata: Metadata,
+        namespace: impl Into<String>,
+        key: impl Into<String>,
+        value: Vec<u8>,
     ) -> Result<(), eyre::Error> {
         self.control_channel
-            .register_pinned_memory(shared_memory_id, metadata)
+            .extension_store(namespace.into(), key.into(), value)
     }
 
-    /// Read pinned memory metadata from the daemon.
+    /// Read an opaque value back, optionally removing it in the same round trip.
     ///
-    /// When `free` is true, the daemon also frees the pool after reading.
-    pub fn read_pinned_memory(
+    /// Returns `None` if the key is not in the table — never stored, or
+    /// already dropped.
+    pub fn extension_load(
         &mut self,
-        shared_memory_id: String,
-        free: bool,
-    ) -> Result<Metadata, eyre::Error> {
+        namespace: impl Into<String>,
+        key: impl Into<String>,
+        remove: bool,
+    ) -> Result<Option<Vec<u8>>, eyre::Error> {
         self.control_channel
-            .read_pinned_memory(shared_memory_id, free)
+            .extension_load(namespace.into(), key.into(), remove)
     }
 
-    /// Free a pinned memory pool via the daemon.
-    pub fn free_pinned_memory(&mut self, shared_memory_id: String) -> Result<(), eyre::Error> {
-        self.control_channel.free_pinned_memory(shared_memory_id)
+    /// Drop an opaque value, notifying every node that stored or loaded it.
+    pub fn extension_drop(
+        &mut self,
+        namespace: impl Into<String>,
+        key: impl Into<String>,
+    ) -> Result<(), eyre::Error> {
+        self.control_channel
+            .extension_drop(namespace.into(), key.into())
     }
+
+    /// Send an opaque request to the extension registered under
+    /// `namespace` on this node's daemon, and return its opaque reply.
+    ///
+    /// Companion to [`DoraNode::extension_store`] / [`DoraNode::extension_load`]:
+    /// those broker a descriptor's lifetime, this one carries a call the
+    /// extension's daemon half must service. dora interprets neither the
+    /// namespace nor the bytes — see `docs/extensions.md`.
+    pub fn extension_request(
+        &mut self,
+        namespace: impl Into<String>,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, eyre::Error> {
+        self.control_channel
+            .extension_request(namespace.into(), payload)
+    }
+}
+
+/// Return the serialized log `fields` object when it fits `limit`, else `None`.
+///
+/// The budget guards a downstream JSON-line parse limit, so it must measure
+/// the *serialized* size: `"fields":{...}` adds structural bytes (quotes,
+/// colons, commas) and JSON escaping — a value full of `"`/`\` doubles and
+/// control characters expand ~6x via `\uXXXX`. Summing raw key/value byte
+/// lengths can pass a map whose serialized form is well over the limit, which
+/// the downstream parser then drops or truncates whole.
+fn log_fields_within_budget(
+    fields: &std::collections::BTreeMap<String, String>,
+    limit: usize,
+) -> Option<serde_json::Value> {
+    // Count the serialized bytes without allocating a throwaway string, then
+    // build the JSON value only when it fits.
+    struct ByteCounter(usize);
+    impl std::io::Write for ByteCounter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = ByteCounter(0);
+    serde_json::to_writer(&mut counter, fields).ok()?;
+    (counter.0 <= limit).then(|| serde_json::json!(fields))
 }
 
 /// Builder for initializing a node with custom connection parameters.
@@ -2082,18 +2722,28 @@ pub(crate) fn teardown_with_timeout(
 
 impl Drop for DoraNode {
     fn drop(&mut self) {
+        // The startup handshake's marker thread holds an `Arc` clone of the
+        // publishers, so it must be stopped and joined before the publishers
+        // are dropped for the undeclare below to see the last reference. Do
+        // that join *inside* the bounded teardown: `shutdown()` sets the stop
+        // flag but cannot interrupt an in-progress `publisher.put().wait()`, so
+        // on a wedged zenoh net runtime the join could otherwise hang node
+        // shutdown (and with it the daemon, which waits for `InputClosed`) —
+        // the exact hang `teardown_with_timeout` exists to bound (#2425). The
+        // consumer side already joins its acker thread under the same deadline.
+        let startup_handshake = self.startup_handshake.take();
         // Tear down zenoh before notifying the daemon below, so that
         // daemon-signaled `InputClosed` cannot overtake in-flight zenoh data.
         let publishers = std::mem::take(&mut self.zenoh_publishers);
         let schema_publishers = std::mem::take(&mut self.zenoh_schema_publishers);
-        // Per-output readiness counters hold liveliness subscribers on the shared
-        // session; drop them before the session (same reasoning as publishers).
-        let readiness = std::mem::take(&mut self.zenoh_output_readiness);
-        let shm_provider = self.zenoh_shm_provider.take();
+        let shm_provider = self.sample_allocator.shm_provider.take();
         let session = self.zenoh_session.take();
         let runtime = self._owned_runtime.take();
         if session.is_none() && shm_provider.is_none() && publishers.is_empty() {
-            // no zenoh state (interactive/testing mode): drop inline
+            // no zenoh state (interactive/testing mode): drop inline. A node
+            // without a zenoh session never has a handshake, but drop it here
+            // too so this branch stays self-contained.
+            drop(startup_handshake);
             drop(runtime);
         } else {
             // A wedged zenoh net runtime stalls `Session` close beyond its
@@ -2101,12 +2751,20 @@ impl Drop for DoraNode {
             // hang node shutdown (and with it the daemon, which waits for
             // `InputClosed`). Bound the teardown with a deadline instead.
             let completed = teardown_with_timeout("zenoh", ZENOH_TEARDOWN_TIMEOUT, move || {
-                // documented drop order: publishers (data + schema) and readiness
-                // subscribers before the session, owned runtime last so async
-                // cleanup can still run
+                // Stop + join the marker thread first (bounded by this
+                // deadline), which releases its publishers `Arc` clone so the
+                // `drop(publishers)` below holds the last reference and
+                // undeclares them. Then the documented drop order: subscribers
+                // (dropped with the handshake) and publishers (data + schema)
+                // before the session, owned runtime last so async cleanup can
+                // still run.
+                if let Some(mut handshake) = startup_handshake {
+                    handshake.shutdown();
+                    // Undeclare the ack subscribers before the session below.
+                    drop(std::mem::take(&mut handshake.ack_subscribers));
+                }
                 drop(publishers);
                 drop(schema_publishers);
-                drop(readiness);
                 drop(shm_provider);
                 drop(session);
                 drop(runtime);
@@ -2120,6 +2778,13 @@ impl Drop for DoraNode {
         }
 
         // close all outputs first to notify subscribers as early as possible
+        //
+        // Testing mode (dora-rs/dora#2855): signal shutdown *before* the
+        // CloseOutputs handshake so a daemon thread sleeping inside
+        // `next_event` wakes up, replies, and can then process Drop's requests.
+        if let Some(shutdown) = &self.testing_shutdown {
+            shutdown.store(true, Ordering::Relaxed);
+        }
         if let Err(err) = self
             .control_channel
             .report_closed_outputs(
@@ -2135,6 +2800,228 @@ impl Drop for DoraNode {
         if let Err(err) = self.control_channel.report_outputs_done() {
             tracing::warn!("{err:?}")
         }
+
+        // Drop our channel sender and join the testing daemon. The daemon loop
+        // exits after OutputsDone under shutdown even when EventStream still
+        // holds a sender clone (dora-rs/dora#2855).
+        if let Some(handle) = self.testing_daemon.take() {
+            self.control_channel.close_channel();
+            if handle.join().is_err() {
+                tracing::warn!("testing daemon thread panicked");
+            }
+        }
+        self.testing_shutdown = None;
+    }
+}
+
+/// A payload already encoded as an Arrow IPC stream in a dora-owned sample,
+/// together with the Arrow type it was encoded from.
+///
+/// The two travel together so a consumer can still type-check the output after
+/// the source array is gone — see [`DoraNode::send_output_encoded`].
+#[derive(Debug)]
+pub struct EncodedSample {
+    sample: DataSample,
+    data_type: arrow_schema::DataType,
+}
+
+impl EncodedSample {
+    /// A human-readable name for the Arrow type the payload was encoded from,
+    /// e.g. `"UInt8"`.
+    ///
+    /// Returned as a `String` rather than an `arrow_schema::DataType` because
+    /// `arrow-schema` is the one non-umbrella Arrow crate dora's public API
+    /// used to name, and naming it would pin 1.x to a single Arrow major.
+    /// For the real type, enable `arrow-v59` and use
+    /// [`data_type`](Self::data_type).
+    pub fn type_name(&self) -> String {
+        format!("{:?}", self.data_type)
+    }
+
+    /// The Arrow type the payload was encoded from.
+    ///
+    /// Gated on `arrow-v59` — dora's current internal Arrow major — because
+    /// `arrow_schema::DataType` is an Arrow type. It is not returned as a
+    /// dora-owned type-URN (`dora_core::types::TypeRegistry`) because the URN
+    /// catalog only covers the standard scalar/struct types: nested lists,
+    /// dictionaries, timestamps-with-timezone and unions have no URN, so a
+    /// URN-returning accessor would be lossy for exactly the outputs whose
+    /// type a caller most needs to inspect.
+    #[cfg(feature = "arrow-v59")]
+    pub fn data_type(&self) -> &arrow_schema::DataType {
+        &self.data_type
+    }
+
+    /// The encoded Arrow IPC stream.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.sample
+    }
+}
+
+/// Builds dora-owned output samples without borrowing the node.
+///
+/// ## Why this exists (dora-rs/dora#2742)
+///
+/// An operator runs on its own thread and hands its outputs to the runtime's
+/// event loop. If what crosses that boundary is an Arrow array whose buffers
+/// belong to the operator's language runtime — a `pyarrow` array wrapping a
+/// numpy buffer, say — then the *runtime* ends up freeing them. Releasing a
+/// numpy-backed buffer acquires the Python GIL (pyarrow's `NumPyBuffer`
+/// destructor does `PyAcquireGIL`), so the runtime's event loop blocks for as
+/// long as the operator holds the GIL. That made a node unable to observe
+/// `Stop`, and the daemon force-killed it at the grace period.
+///
+/// Handing the operator thread an allocator instead lets it encode into memory
+/// dora owns and release its own payload while it still holds the GIL. It is
+/// not an extra copy: the IPC encode is the same single copy the node would
+/// otherwise have made, just performed on the other side of the channel.
+#[derive(Clone)]
+pub struct SampleAllocator {
+    shm_provider: Option<Arc<zenoh::shm::ShmProvider<zenoh::shm::PosixShmProviderBackend>>>,
+    zero_copy_threshold: usize,
+}
+
+impl SampleAllocator {
+    /// Allocates a [`DataSample`] of the specified size.
+    ///
+    /// For payloads at or above the zero-copy threshold the buffer is allocated
+    /// directly from the zenoh SHM provider (when available), so the producer
+    /// writes straight into shared memory and publishing moves the buffer into
+    /// zenoh's `put` without a further copy. Smaller payloads — or the case
+    /// where no SHM provider exists (interactive/testing mode) — use a
+    /// heap-allocated, 128-byte-aligned buffer; the SHM provider is
+    /// page-aligned, so dedicating a full page to a small message is pure waste.
+    pub fn allocate(&self, data_len: usize) -> NodeResult<DataSample> {
+        if data_len >= self.zero_copy_threshold
+            && let Some(provider) = &self.shm_provider
+        {
+            use zenoh::Wait;
+            use zenoh::shm::GarbageCollect;
+            // Non-blocking (see `zenoh_publish`): GC and allocate, but fall back
+            // to a heap buffer rather than `BlockOn`-sleeping 1 ms when the pool
+            // is momentarily full under a large-message burst. The heap buffer
+            // costs one extra copy on publish but keeps the producer from
+            // stalling, which is what regressed sustained throughput (PR #2366).
+            match provider
+                .alloc(data_len)
+                .with_policy::<GarbageCollect>()
+                .wait()
+            {
+                Ok(sbuf) => {
+                    // Use the SHM buffer only when it is exactly the requested
+                    // size — zenoh 1.8 guarantees this (the logical length
+                    // matches the request even when the backing chunk is
+                    // larger). If a future provider ever over-allocates, fall
+                    // back to heap rather than expose or publish an oversized
+                    // slice (`DataSample` has no length cap of its own).
+                    if sbuf.as_ref().len() == data_len {
+                        return Ok(DataSample {
+                            storage: SampleStorage::Shm(sbuf),
+                        });
+                    }
+                    tracing::debug!(
+                        "zenoh SHM alloc returned {} bytes for a {data_len}-byte \
+                         request; using heap",
+                        sbuf.as_ref().len()
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!("SHM alloc failed ({e}), using heap buffer");
+                }
+            }
+        }
+
+        let avec: AVec<u8, ConstAlign<128>> = AVec::__from_elem(128, 0, data_len);
+        Ok(avec.into())
+    }
+
+    /// Encodes `array` as a complete Arrow IPC stream into a freshly allocated
+    /// sample. Uses the hand-rolled 1-copy fast path when the array type is
+    /// eligible, falling back to the official writer (one extra copy) otherwise.
+    ///
+    /// The returned sample shares no memory with `array`, so the caller may —
+    /// and, when the payload is owned by a foreign runtime, **must** — drop
+    /// `array` on its own thread rather than let it travel to the node.
+    ///
+    /// # Example
+    ///
+    /// The encoding needs no live node or zenoh session, so a heap allocator
+    /// ([`SampleAllocator::heap`]) is enough to encode an array and decode it
+    /// back — the sample carries a complete, self-describing Arrow IPC stream:
+    ///
+    /// ```
+    /// # fn main() -> eyre::Result<()> {
+    /// use dora_node_api::{IntoArrow, SampleAllocator};
+    /// use dora_node_api::arrow_utils::decode_arrow_ipc;
+    ///
+    /// let alloc = SampleAllocator::heap();
+    /// let encoded = alloc.encode_arrow(&vec![1u64, 2, 3].into_arrow())?;
+    ///
+    /// let decoded = decode_arrow_ipc(encoded.as_bytes())?;
+    /// let values: Vec<u64> = (&decoded).try_into()?;
+    /// assert_eq!(values, vec![1, 2, 3]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn encode_arrow(&self, array: &DoraArray) -> NodeResult<EncodedSample> {
+        self.encode_arrow_data(&dora_arrow_convert::internal::array_ref(array).to_data())
+    }
+
+    /// Same, for dora-internal callers that already hold an [`ArrayData`].
+    pub(crate) fn encode_arrow_data(&self, array: &ArrayData) -> NodeResult<EncodedSample> {
+        let sample = match ipc_encode::PreparedIpc::from_data(array) {
+            Some(prepared) => {
+                // Prepare once: size the sample from the prepared layout, then
+                // encode into it — avoids rebuilding the layout + IPC headers.
+                let mut sample = self.allocate(prepared.byte_len())?;
+                prepared
+                    .encode_into(&mut sample)
+                    .map_err(|e| NodeError::Output(format!("Arrow IPC encode: {e}")))?;
+                sample
+            }
+            None => {
+                let bytes = ipc_encode::encode_ipc_to_vec_data(array)
+                    .map_err(|e| NodeError::Output(format!("Arrow IPC encode: {e}")))?;
+                let mut sample = self.allocate(bytes.len())?;
+                sample.copy_from_slice(&bytes);
+                sample
+            }
+        };
+        Ok(EncodedSample {
+            sample,
+            data_type: array.data_type().clone(),
+        })
+    }
+
+    /// An allocator with no shared memory, so every sample is heap-backed.
+    ///
+    /// This is what a node without a zenoh session (interactive/testing mode)
+    /// uses; it also lets callers that only need the encoding — tests, most
+    /// obviously — build one without a live node.
+    ///
+    /// ```
+    /// use dora_node_api::SampleAllocator;
+    ///
+    /// // No zenoh session required — every allocation is a writable heap buffer.
+    /// let alloc = SampleAllocator::heap();
+    /// let mut sample = alloc.allocate(4).unwrap();
+    /// sample.copy_from_slice(&[1, 2, 3, 4]); // write straight into the buffer
+    /// assert_eq!(&sample[..], &[1, 2, 3, 4]);
+    /// ```
+    pub fn heap() -> Self {
+        Self {
+            shm_provider: None,
+            zero_copy_threshold: ZERO_COPY_THRESHOLD,
+        }
+    }
+}
+
+impl std::fmt::Debug for SampleAllocator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SampleAllocator")
+            .field("shm", &self.shm_provider.is_some())
+            .field("zero_copy_threshold", &self.zero_copy_threshold)
+            .finish()
     }
 }
 
@@ -2387,7 +3274,7 @@ fn publish_schema_once(
             metadata
                 .parameters
                 .insert(SCHEMA_HASH.to_string(), Parameter::Integer(hash as i64));
-            bincode::serialize(&metadata).ok()
+            dora_message::encode(&metadata).ok()
         }
     }
 }
@@ -2454,6 +3341,80 @@ fn schema_once_eligible(
     payload_len < zero_copy_threshold && !carries_pattern_correlation(params)
 }
 
+/// Which payload and attachment a sub-threshold zenoh `put` carries.
+///
+/// Split out of [`DoraNode::zenoh_publish`] as a pure decision so the
+/// attachment-selection logic is unit-testable without a live zenoh session.
+/// Pairing the wrong payload with the wrong attachment here is exactly the
+/// silent wire corruption of dora-rs/dora#2366: a schema-less batch delivered
+/// to a receiver that was never primed decodes to nothing and is dropped.
+#[derive(Debug, PartialEq, Eq)]
+enum ZenohPutChoice<'a> {
+    /// Schema-once fast path: the schema-less batch `payload` paired with the
+    /// schema-tagged `attachment` from [`publish_schema_once`]. No metadata is
+    /// re-encoded — the receiver primes its decoder from the `@schema` subtopic
+    /// and matches this batch by the schema hash carried in the attachment.
+    SchemaOnce {
+        payload: &'a [u8],
+        attachment: &'a [u8],
+    },
+    /// Fallback: send the whole IPC payload as a self-describing stream, with
+    /// the caller-encoded [`Metadata`] blob as the attachment, so the message
+    /// decodes standalone. Chosen whenever the output is not primed for
+    /// schema-once or a schema-less batch slice could not be taken.
+    FullStream,
+}
+
+/// Choose the [`ZenohPutChoice`] for a sub-threshold payload.
+///
+/// The schema-once fast path is taken only when both a schema attachment is
+/// primed (`schema_att` is `Some` — i.e. [`publish_schema_once`] emitted a
+/// schema-tagged blob for this message) and a schema-less `batch_slice` could
+/// be taken. If either is absent the message must go out as a full
+/// self-describing stream so it decodes standalone at the receiver.
+fn select_zenoh_put<'a>(
+    schema_att: Option<&'a [u8]>,
+    batch_slice: Option<&'a [u8]>,
+) -> ZenohPutChoice<'a> {
+    match (schema_att, batch_slice) {
+        (Some(attachment), Some(payload)) => ZenohPutChoice::SchemaOnce {
+            payload,
+            attachment,
+        },
+        _ => ZenohPutChoice::FullStream,
+    }
+}
+
+/// Whether a send-side runtime output type check should flag this payload.
+///
+/// A message is *not* flagged when:
+/// - it carries pattern-correlation metadata (`request_id`/`goal_id`/
+///   `goal_status`): such an output is polymorphic by design and a single
+///   declared Arrow type cannot cover every reply/feedback shape
+///   (dora-rs/adora#150); or
+/// - its payload is a `Null` array (timer ticks, metadata-only sends such as
+///   `send_output(id, params, ())`, and the documented stream flush
+///   `send_output(id, seg.flush(), empty)` in `docs/patterns.md`, whose
+///   `flush`/`session_id`/`seq` metadata is not pattern-correlation).
+///
+/// The `Null` carve-out keeps the send side consistent with the receive-side
+/// first-message check in [`EventStream::note_produced_event`], which already
+/// skips `Null`. Without it, a node emitting an empty tick on a typed output
+/// would fail under `DORA_RUNTIME_TYPE_CHECK=error` even though the identical
+/// message is accepted on the consuming node.
+fn is_output_type_mismatch(
+    actual: &arrow_schema::DataType,
+    expected: &arrow_schema::DataType,
+    parameters: &MetadataParameters,
+) -> bool {
+    // Ordered cheapest-first for short-circuiting: a matching type (the common
+    // case) and a `Null` payload are single discriminant compares, so both bail
+    // before `carries_pattern_correlation`'s three `BTreeMap` lookups.
+    actual != expected
+        && *actual != arrow_schema::DataType::Null
+        && !carries_pattern_correlation(parameters)
+}
+
 /// Init Opentelemetry Tracing
 ///
 /// This requires a tokio runtime spawning this function to be functional
@@ -2505,12 +3466,12 @@ pub fn init_tracing(
     // attempt to connect to `localhost:4317` on every node startup. Mirrors
     // the gating applied to tracing above.
     #[cfg(feature = "metrics")]
-    if std::env::var("DORA_OTLP_ENDPOINT").is_ok() {
+    if let Ok(endpoint) = std::env::var("DORA_OTLP_ENDPOINT") {
         let id = format!("{dataflow_id}/{node_id}");
         let monitor_task = async move {
             use dora_metrics::run_metrics_monitor;
 
-            if let Err(e) = run_metrics_monitor(id.clone())
+            if let Err(e) = run_metrics_monitor(id.clone(), &endpoint)
                 .await
                 .wrap_err("metrics monitor exited unexpectedly")
             {
@@ -2527,6 +3488,43 @@ pub fn init_tracing(
 ///
 /// Manages session/segment IDs and auto-incrementing sequence numbers
 /// for real-time streaming patterns (voice, video, sensor streams).
+///
+/// The state transitions are easy to get subtly wrong, so they are worth
+/// spelling out: [`chunk`](Self::chunk) stamps the current `(segment_id, seq)`
+/// and then auto-increments `seq`; [`next_segment`](Self::next_segment) bumps
+/// `segment_id` and resets `seq` to 0; and [`flush`](Self::flush) advances to a
+/// new segment and emits a chunk marked `flush = true`, `fin = false` (the
+/// prior segment is discarded, not completed, so it intentionally never gets a
+/// `fin = true`).
+///
+/// # Example
+///
+/// ```
+/// use dora_node_api::{
+///     StreamSegment,
+///     metadata::{FIN, FLUSH, SEGMENT_ID, SEQ, get_bool_param, get_integer_param},
+/// };
+///
+/// let mut seg = StreamSegment::with_session_id("session-1".to_string());
+///
+/// // `chunk` stamps the current (segment, seq), then advances seq.
+/// let first = seg.chunk(false);
+/// assert_eq!(get_integer_param(&first, SEGMENT_ID), Some(0));
+/// assert_eq!(get_integer_param(&first, SEQ), Some(0));
+/// assert_eq!(get_bool_param(&first, FIN), Some(false));
+///
+/// let second = seg.chunk(true); // mark this chunk as the end of the segment
+/// assert_eq!(get_integer_param(&second, SEQ), Some(1)); // seq auto-incremented
+/// assert_eq!(get_bool_param(&second, FIN), Some(true));
+///
+/// // `flush` starts a new segment (seq reset to 0) and marks flush=true,
+/// // fin=false: the old queued data is discarded, not completed.
+/// let flushed = seg.flush();
+/// assert_eq!(get_integer_param(&flushed, SEGMENT_ID), Some(1));
+/// assert_eq!(get_integer_param(&flushed, SEQ), Some(0));
+/// assert_eq!(get_bool_param(&flushed, FLUSH), Some(true));
+/// assert_eq!(get_bool_param(&flushed, FIN), Some(false));
+/// ```
 pub struct StreamSegment {
     session_id: String,
     segment_id: i64,
@@ -2619,7 +3617,197 @@ mod tests {
         IntegrationTestInput, TestingInput, TestingOptions, TestingOutput,
         integration_testing_format::{IncomingEvent, TimedIncomingEvent},
     };
-    use arrow::array::NullArray;
+
+    fn required_acker(node: &str, input: &str) -> dora_message::daemon_to_node::RequiredAcker {
+        dora_message::daemon_to_node::RequiredAcker {
+            node_id: NodeId::from(node.to_string()),
+            input_id: DataId::from(input.to_string()),
+        }
+    }
+
+    /// A not-yet-ready `AckState` for `output` awaiting a single `acker`.
+    fn test_ack_state(output: &str, acker: (&str, &str)) -> Arc<AckState> {
+        Arc::new(AckState::new(
+            DataId::from(output.to_string()),
+            &BTreeSet::from([required_acker(acker.0, acker.1)]),
+            Arc::new(AtomicBool::new(false)),
+        ))
+    }
+
+    #[test]
+    fn log_fields_budget_measures_serialized_json_not_raw_bytes() {
+        use std::collections::BTreeMap;
+        let limit = DoraNode::MAX_LOG_FIELDS_BYTES;
+
+        // A small map fits.
+        let mut small = BTreeMap::new();
+        small.insert("k".to_string(), "v".to_string());
+        assert!(log_fields_within_budget(&small, limit).is_some());
+
+        // A value that is 20 KB of raw bytes — comfortably under the 60 KB
+        // budget by the old raw-sum measure — but made entirely of control
+        // characters, each of which JSON-escapes to `` (6 bytes). Its
+        // serialized form is ~120 KB, over the budget, so it must be dropped.
+        // The pre-fix raw-byte check would have let it through and blown the
+        // downstream parse limit.
+        let mut big = BTreeMap::new();
+        big.insert("k".to_string(), "\u{1}".repeat(20 * 1024));
+        assert!(big.values().map(String::len).sum::<usize>() < limit);
+        assert!(log_fields_within_budget(&big, limit).is_none());
+    }
+
+    #[test]
+    fn ack_state_completes_only_when_required_set_is_covered() {
+        let ready = Arc::new(AtomicBool::new(false));
+        let required = BTreeSet::from([
+            required_acker("sink-a", "camera"),
+            required_acker("sink-b", "cam"),
+        ]);
+        let state = AckState::new(DataId::from("image".to_string()), &required, ready.clone());
+
+        // An acker outside the required set (dynamic or debug consumer) must
+        // never count toward completion.
+        state.record("stranger", "camera");
+        assert!(!ready.load(Ordering::Relaxed));
+
+        // Duplicate acks of one required identity don't complete the set.
+        state.record("sink-a", "camera");
+        state.record("sink-a", "camera");
+        assert!(!ready.load(Ordering::Relaxed));
+        assert_eq!(state.missing(), vec!["sink-b/cam".to_string()]);
+
+        // The last required identity completes it.
+        state.record("sink-b", "cam");
+        assert!(ready.load(Ordering::Relaxed));
+        assert!(state.missing().is_empty());
+    }
+
+    #[test]
+    fn ack_state_requires_exact_identity_match() {
+        // (node, input) is one identity: the right node acking the wrong input
+        // (or vice versa) must not count.
+        let ready = Arc::new(AtomicBool::new(false));
+        let required = BTreeSet::from([required_acker("sink", "camera")]);
+        let state = AckState::new(DataId::from("image".to_string()), &required, ready.clone());
+
+        state.record("sink", "other-input");
+        state.record("other-node", "camera");
+        assert!(!ready.load(Ordering::Relaxed));
+
+        state.record("sink", "camera");
+        assert!(ready.load(Ordering::Relaxed));
+    }
+
+    // Regression guard for dora-rs/dora#2891: a frozen output must never
+    // upgrade. Before the fix an ack arriving after the grace (but before the
+    // old 10s deadline) flipped `ready` while user code was already sending,
+    // so a message on the shorter direct-zenoh path could overtake an earlier
+    // one still relaying through the daemon.
+    #[test]
+    fn ack_state_freeze_blocks_a_late_upgrade() {
+        let state = test_ack_state("image", ("sink", "camera"));
+
+        assert!(state.freeze(), "an un-acked output is frozen");
+        assert!(state.is_frozen());
+
+        // The consumer's ack arrives late — it must not move the output onto
+        // the direct path mid-stream.
+        state.record("sink", "camera");
+        assert!(
+            !state.ready.load(Ordering::Relaxed),
+            "a frozen output must stay on the daemon path for the rest of the run"
+        );
+        assert_eq!(state.missing(), vec!["sink/camera".to_string()]);
+    }
+
+    #[test]
+    fn ack_state_freeze_spares_an_output_that_acked_in_time() {
+        let state = test_ack_state("image", ("sink", "camera"));
+
+        state.record("sink", "camera");
+        assert!(!state.freeze(), "a ready output is not frozen");
+        assert!(!state.is_frozen());
+        assert!(
+            state.ready.load(Ordering::Relaxed),
+            "an output that proved its routes keeps the direct zenoh path"
+        );
+    }
+
+    // dora-rs/dora#2891: whatever has not proven its routes when the grace
+    // expires is pinned to the daemon path, so every output's transport is
+    // decided before user code sends its first message.
+    #[test]
+    fn grace_boundary_freezes_unacked_outputs_only() {
+        let acked = test_ack_state("image", ("sink", "camera"));
+        let unacked = test_ack_state("status", ("sink", "state"));
+        acked.record("sink", "camera");
+
+        wait_for_grace(&[acked.clone(), unacked.clone()], Duration::from_millis(20));
+
+        assert!(acked.ready.load(Ordering::Relaxed));
+        assert!(!acked.is_frozen());
+        assert!(unacked.is_frozen());
+
+        // The straggler's ack lands after the boundary and is ignored.
+        unacked.record("sink", "state");
+        assert!(!unacked.ready.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn grace_returns_early_once_every_output_is_acked() {
+        // Also covers the no-awaited-outputs case (no consumers, or every ack
+        // subscriber failed to declare): `all` is vacuously true on an empty
+        // slice, so there is nothing to wait for and nothing to freeze.
+        let state = test_ack_state("image", ("sink", "camera"));
+        state.record("sink", "camera");
+
+        let start = Instant::now();
+        wait_for_grace(std::slice::from_ref(&state), Duration::from_secs(30));
+        wait_for_grace(&[], Duration::from_secs(30));
+
+        assert!(!state.is_frozen());
+        assert!(state.ready.load(Ordering::Relaxed));
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "a completed handshake must not wait out the grace, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn missing_output_routing_pins_every_output_to_the_daemon_path() {
+        // `None` means an older daemon spawned this node: without
+        // required-acker sets no route can be proven, so the safe result is
+        // daemon-only for every declared output.
+        let outputs = BTreeSet::from([
+            DataId::from("image".to_string()),
+            DataId::from("status".to_string()),
+        ]);
+        let routing = normalize_output_routing(None, &outputs);
+        assert_eq!(routing.len(), 2);
+        for output_id in &outputs {
+            let entry = routing.get(output_id).expect("entry per output");
+            assert!(entry.daemon_only);
+            assert!(entry.required_ackers.is_empty());
+        }
+
+        // No outputs → nothing to pin (interactive mode).
+        assert!(normalize_output_routing(None, &BTreeSet::new()).is_empty());
+    }
+
+    #[test]
+    fn provided_output_routing_is_passed_through() {
+        let outputs = BTreeSet::from([DataId::from("image".to_string())]);
+        let provided = BTreeMap::from([(
+            DataId::from("image".to_string()),
+            OutputRouting {
+                daemon_only: false,
+                required_ackers: BTreeSet::from([required_acker("sink", "camera")]),
+            },
+        )]);
+        let routing = normalize_output_routing(Some(provided.clone()), &outputs);
+        assert_eq!(routing, provided);
+    }
 
     #[test]
     fn new_request_id_returns_valid_uuid() {
@@ -2672,12 +3860,10 @@ mod tests {
         drop(events);
     }
 
+    use crate::integration_testing::{OutputReceiver, drain_outputs};
+
     /// Helper: create a minimal test node with a channel output.
-    fn test_node() -> (
-        DoraNode,
-        crate::EventStream,
-        flume::Receiver<serde_json::Map<String, serde_json::Value>>,
-    ) {
+    fn test_node() -> (DoraNode, crate::EventStream, OutputReceiver) {
         let events = vec![TimedIncomingEvent {
             time_offset_secs: 0.1,
             event: IncomingEvent::Stop,
@@ -2686,7 +3872,7 @@ mod tests {
             "test-node".parse().unwrap(),
             events,
         ));
-        let (tx, rx) = flume::unbounded();
+        let (tx, rx) = crate::integration_testing::output_channel();
         let outputs = TestingOutput::ToChannel(tx);
         let options = TestingOptions {
             skip_output_time_offsets: true,
@@ -2695,12 +3881,70 @@ mod tests {
         (node, event_stream, rx)
     }
 
+    /// Comfortably below any multi-second join/sleep budget so node-first Drop
+    /// regressions surface without waiting on an internal timeout boundary.
+    const INIT_TESTING_DROP_BUDGET: Duration = Duration::from_millis(500);
+
+    fn init_testing_node_mid_scheduled_wait() -> (DoraNode, crate::EventStream) {
+        let events = vec![TimedIncomingEvent {
+            // Long enough that a hang is obvious; the shutdown flag must
+            // interrupt well before this elapses.
+            time_offset_secs: 30.0,
+            event: IncomingEvent::Stop,
+        }];
+        let inputs = TestingInput::Input(IntegrationTestInput::new(
+            "drop-hang-node".parse().unwrap(),
+            events,
+        ));
+        let (tx, _rx) = crate::integration_testing::output_channel();
+        let outputs = TestingOutput::ToChannel(tx);
+        let (node, event_stream) =
+            DoraNode::init_testing(inputs, outputs, TestingOptions::default()).unwrap();
+
+        // Give the testing daemon a moment to enter next_event's sleep.
+        std::thread::sleep(Duration::from_millis(50));
+        (node, event_stream)
+    }
+
+    /// Regression for dora-rs/dora#2855: events-then-node Drop while the daemon
+    /// is inside a scheduled `next_event` wait must not hang.
+    #[test]
+    fn init_testing_drop_events_then_node_during_scheduled_wait_does_not_hang() {
+        let (node, event_stream) = init_testing_node_mid_scheduled_wait();
+
+        let start = Instant::now();
+        drop(event_stream);
+        drop(node);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < INIT_TESTING_DROP_BUDGET,
+            "events-then-node Drop hung for {elapsed:?}; expected interruptible testing-daemon shutdown"
+        );
+    }
+
+    /// Regression for dora-rs/dora#2855: node-then-events Drop must exit the
+    /// testing daemon after OutputsDone under shutdown even while EventStream
+    /// still holds a channel sender clone.
+    #[test]
+    fn init_testing_drop_node_then_events_during_scheduled_wait_does_not_hang() {
+        let (node, event_stream) = init_testing_node_mid_scheduled_wait();
+
+        let start = Instant::now();
+        drop(node);
+        drop(event_stream);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < INIT_TESTING_DROP_BUDGET,
+            "node-then-events Drop hung for {elapsed:?}; expected OutputsDone under shutdown to exit the testing daemon"
+        );
+    }
+
     #[test]
     fn send_service_request_returns_valid_id_and_sends_output() {
-        let (mut node, events, rx) = test_node();
+        let (mut node, events, mut rx) = test_node();
 
         let request_id = node
-            .send_service_request("request".into(), Default::default(), NullArray::new(0))
+            .send_service_request("request".into(), Default::default(), ())
             .unwrap();
 
         // Returned ID should be a valid UUID
@@ -2709,7 +3953,7 @@ mod tests {
         // Output should have been sent to the channel
         drop(node);
         drop(events);
-        let outputs: Vec<_> = rx.try_iter().collect();
+        let outputs = drain_outputs(&mut rx);
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0]["id"], "request");
     }
@@ -2719,10 +3963,10 @@ mod tests {
         let (mut node, events, _rx) = test_node();
 
         let id1 = node
-            .send_service_request("out".into(), Default::default(), NullArray::new(0))
+            .send_service_request("out".into(), Default::default(), ())
             .unwrap();
         let id2 = node
-            .send_service_request("out".into(), Default::default(), NullArray::new(0))
+            .send_service_request("out".into(), Default::default(), ())
             .unwrap();
 
         assert_ne!(id1, id2, "successive request IDs should differ");
@@ -2733,7 +3977,7 @@ mod tests {
 
     #[test]
     fn send_service_response_sends_output() {
-        let (mut node, events, rx) = test_node();
+        let (mut node, events, mut rx) = test_node();
 
         // Simulate passing through a request_id from the incoming request
         let mut params = MetadataParameters::default();
@@ -2741,12 +3985,12 @@ mod tests {
             dora_message::metadata::REQUEST_ID.to_string(),
             dora_message::metadata::Parameter::String("test-req-id".into()),
         );
-        node.send_service_response("response".into(), params, NullArray::new(0))
+        node.send_service_response("response".into(), params, ())
             .unwrap();
 
         drop(node);
         drop(events);
-        let outputs: Vec<_> = rx.try_iter().collect();
+        let outputs = drain_outputs(&mut rx);
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0]["id"], "response");
     }
@@ -2794,16 +4038,16 @@ mod tests {
     /// plane relies on (zenoh can't be smoke-tested here, so this stands in).
     #[test]
     fn send_output_ipc_roundtrip() {
-        use crate::arrow_utils::decode_arrow_ipc_zero_copy;
-        use crate::arrow_utils::ipc_encode::{encode_ipc_into, ipc_fast_path_len};
+        use crate::arrow_utils::decode_arrow_ipc_zero_copy_raw;
+        use crate::arrow_utils::ipc_encode::{encode_ipc_into_data, ipc_fast_path_len_data};
         use arrow::array::{ArrayRef, Float32Array, StringArray, StructArray, UInt64Array};
         use arrow_schema::{DataType, Field};
         use std::ptr::NonNull;
 
         fn roundtrip(data: ArrayData) {
-            let len = ipc_fast_path_len(&data).expect("array should be fast-path eligible");
+            let len = ipc_fast_path_len_data(&data).expect("array should be fast-path eligible");
             let mut buf: AVec<u8, ConstAlign<128>> = AVec::__from_elem(128, 0, len);
-            encode_ipc_into(&data, &mut buf).expect("fast-path IPC encode");
+            encode_ipc_into_data(&data, &mut buf).expect("fast-path IPC encode");
 
             // Wrap the aligned sample as an Arrow Buffer (no copy), mirroring the
             // receive path, then decode.
@@ -2812,7 +4056,7 @@ mod tests {
             // SAFETY: ptr/len describe `buf`; the Arc keeps it alive.
             let buffer =
                 unsafe { arrow::buffer::Buffer::from_custom_allocation(ptr, blen, Arc::new(buf)) };
-            let decoded = decode_arrow_ipc_zero_copy(buffer).expect("zero-copy IPC decode");
+            let decoded = decode_arrow_ipc_zero_copy_raw(buffer).expect("zero-copy IPC decode");
             assert_eq!(
                 data, decoded,
                 "IPC send->receive round-trip must preserve the array"
@@ -2965,6 +4209,97 @@ mod tests {
         );
     }
 
+    /// End-to-end through `check_output_type` (the send path's actual gate)
+    /// under `DORA_RUNTIME_TYPE_CHECK=error`: a `Null` payload on a typed output
+    /// is accepted, everything else keeps its prior behavior. This is the
+    /// user-visible contract — `send_output` calls `check_output_type`, and
+    /// before this change a `Null` payload (an empty tick, or the documented
+    /// stream flush `send_output(id, seg.flush(), empty)`) returned `Err`.
+    #[test]
+    fn check_output_type_accepts_null_payload_on_typed_output() {
+        use arrow_schema::DataType;
+
+        let (mut node, events, _rx) = test_node();
+        node.runtime_type_checks = Some((
+            RuntimeTypeCheck::Error,
+            HashMap::from([(DataId::from("out".to_string()), DataType::Float32)]),
+        ));
+        let out: DataId = "out".into();
+        let plain = MetadataParameters::default();
+
+        // Null payload on a typed output → accepted (the fix): mirrors the
+        // receive-side carve-out in `EventStream::note_produced_event`.
+        assert!(
+            node.check_output_type(&out, &DataType::Null, &plain)
+                .is_ok(),
+            "a Null payload must not be rejected under =error"
+        );
+        // Matching type → accepted.
+        assert!(
+            node.check_output_type(&out, &DataType::Float32, &plain)
+                .is_ok(),
+            "a matching type must be accepted"
+        );
+        // Genuinely wrong non-null type → still an error.
+        assert!(
+            node.check_output_type(&out, &DataType::Int64, &plain)
+                .is_err(),
+            "a mismatched non-null type must still error under =error"
+        );
+        // Pattern-correlation output stays exempt regardless of type.
+        let mut pattern = MetadataParameters::default();
+        pattern.insert(
+            dora_message::metadata::REQUEST_ID.to_string(),
+            dora_message::metadata::Parameter::String("req-1".into()),
+        );
+        assert!(
+            node.check_output_type(&out, &DataType::Int64, &pattern)
+                .is_ok(),
+            "a pattern-correlation message stays exempt from the type check"
+        );
+        // An untyped output (not in the map) is never checked.
+        assert!(
+            node.check_output_type(&"other".into(), &DataType::Int64, &plain)
+                .is_ok(),
+            "an output with no declared type must not be checked"
+        );
+
+        drop(node);
+        drop(events);
+    }
+
+    /// Unit-level coverage of the `is_output_type_mismatch` predicate itself,
+    /// including the ordering-independent cases the end-to-end test above does
+    /// not separately isolate.
+    #[test]
+    fn is_output_type_mismatch_predicate() {
+        use arrow_schema::DataType;
+        let plain = MetadataParameters::default();
+
+        assert!(
+            !is_output_type_mismatch(&DataType::Null, &DataType::Float32, &plain),
+            "a Null payload must never be flagged as a type mismatch"
+        );
+        assert!(
+            is_output_type_mismatch(&DataType::Int64, &DataType::Float32, &plain),
+            "a mismatched non-null type must be flagged"
+        );
+        assert!(
+            !is_output_type_mismatch(&DataType::Float32, &DataType::Float32, &plain),
+            "a matching type must not be flagged"
+        );
+
+        let mut pattern = MetadataParameters::default();
+        pattern.insert(
+            dora_message::metadata::REQUEST_ID.to_string(),
+            dora_message::metadata::Parameter::String("req-1".into()),
+        );
+        assert!(
+            !is_output_type_mismatch(&DataType::Int64, &DataType::Float32, &pattern),
+            "a pattern-correlation message stays exempt from the type check"
+        );
+    }
+
     #[test]
     fn schema_once_decision_covers_publish_refresh_and_schema_less() {
         let start = Instant::now();
@@ -3001,6 +4336,41 @@ mod tests {
             schema_once_decision(Some(&state), 7, later),
             SchemaOnceDecision::SendFullStreamRefresh
         ));
+    }
+
+    #[test]
+    fn select_zenoh_put_takes_fast_path_only_when_primed_and_sliceable() {
+        let schema_att: &[u8] = b"schema-tagged-attachment";
+        let batch: &[u8] = b"schema-less-batch";
+
+        // Primed (schema attachment present) AND a batch slice could be taken →
+        // schema-once fast path. The batch is the payload and the schema blob is
+        // the attachment; pinning this pairing guards against the silent-drop
+        // swap of dora-rs/dora#2366.
+        assert_eq!(
+            select_zenoh_put(Some(schema_att), Some(batch)),
+            ZenohPutChoice::SchemaOnce {
+                payload: batch,
+                attachment: schema_att,
+            }
+        );
+
+        // Not primed (no schema attachment) → full self-describing stream, even
+        // though a batch slice is available. The caller encodes metadata here.
+        assert_eq!(
+            select_zenoh_put(None, Some(batch)),
+            ZenohPutChoice::FullStream
+        );
+
+        // Primed but no batch slice could be taken → full stream (defensive: a
+        // real IPC stream always yields a slice).
+        assert_eq!(
+            select_zenoh_put(Some(schema_att), None),
+            ZenohPutChoice::FullStream
+        );
+
+        // Neither primed nor sliceable → full stream.
+        assert_eq!(select_zenoh_put(None, None), ZenohPutChoice::FullStream);
     }
 
     #[test]
@@ -3074,15 +4444,15 @@ mod tests {
 
     #[test]
     fn send_stream_chunk_sends_output() {
-        let (mut node, events, rx) = test_node();
+        let (mut node, events, mut rx) = test_node();
         let mut seg = StreamSegment::with_session_id("s1".into());
 
-        node.send_stream_chunk("audio".into(), &mut seg, false, NullArray::new(0))
+        node.send_stream_chunk("audio".into(), &mut seg, false, ())
             .unwrap();
 
         drop(node);
         drop(events);
-        let outputs: Vec<_> = rx.try_iter().collect();
+        let outputs = drain_outputs(&mut rx);
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0]["id"], "audio");
     }
@@ -3144,5 +4514,109 @@ mod tests {
              force-kill grace ({DAEMON_FORCE_KILL_GRACE:?}); raising ZENOH_TEARDOWN_TIMEOUT \
              reintroduces dora-rs/dora#2742"
         );
+    }
+}
+
+/// Ownership invariant at the operator -> runtime boundary (dora-rs/dora#2742).
+///
+/// A [`SampleAllocator`] lets an operator thread encode its payload into a
+/// dora-owned [`EncodedSample`] itself, so the runtime never holds a reference
+/// to memory whose owner lives in another language runtime. The tests below pin
+/// the properties that make the result safe to hand across a thread boundary.
+#[cfg(test)]
+mod operator_boundary_tests {
+    use super::*;
+    use arrow::buffer::Buffer;
+    use std::ptr::NonNull;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Stands in for a foreign owner of an Arrow payload buffer — a numpy array
+    /// held alive by pyarrow, or a buffer owned by an operator's `.so`. Flips
+    /// `released` when the last Arrow reference to the buffer goes away.
+    struct ForeignOwner {
+        released: Arc<AtomicBool>,
+        _backing: Vec<u8>,
+    }
+
+    impl Drop for ForeignOwner {
+        fn drop(&mut self) {
+            self.released.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A `UInt8` array whose payload buffer is owned by `ForeignOwner`.
+    fn foreign_owned_array(len: usize) -> (ArrayData, Arc<AtomicBool>) {
+        let backing = vec![0xABu8; len];
+        // A `Vec`'s heap allocation does not move when the `Vec` itself is
+        // moved into `ForeignOwner` below, so this pointer stays valid for as
+        // long as the owner is alive — which is exactly what the `Allocation`
+        // contract requires.
+        let ptr = NonNull::new(backing.as_ptr() as *mut u8).expect("non-null");
+        let released = Arc::new(AtomicBool::new(false));
+        let owner = Arc::new(ForeignOwner {
+            released: released.clone(),
+            _backing: backing,
+        });
+        let buffer = unsafe { Buffer::from_custom_allocation(ptr, len, owner) };
+        let array = ArrayData::builder(arrow::datatypes::DataType::UInt8)
+            .len(len)
+            .add_buffer(buffer)
+            .build()
+            .expect("valid UInt8 array");
+        (array, released)
+    }
+
+    /// The heart of the #2742 fix: the sample the operator hands to the runtime
+    /// must be an independent, dora-owned copy. If it kept the source buffer
+    /// alive, the runtime would be the one releasing foreign memory — and for a
+    /// Python operator that release takes the GIL (pyarrow's `NumPyBuffer`
+    /// destructor), which stalls the runtime's event loop for as long as the
+    /// operator holds it.
+    #[test]
+    fn encoded_sample_does_not_retain_the_source_payload() {
+        let allocator = SampleAllocator::heap();
+        let (array, released) = foreign_owned_array(8192);
+
+        let sample = allocator
+            .encode_arrow_data(&array)
+            .expect("encoding a UInt8 array must succeed");
+
+        assert!(
+            !released.load(Ordering::SeqCst),
+            "sanity: the source buffer is still alive while the array is"
+        );
+        drop(array);
+        assert!(
+            released.load(Ordering::SeqCst),
+            "the encoded sample must not keep the operator's payload alive; \
+             otherwise the runtime frees foreign memory (dora-rs/dora#2742)"
+        );
+        drop(sample);
+    }
+
+    /// The encode must be lossless: the sample is the same Arrow IPC stream the
+    /// node would have produced when it did the encoding itself.
+    #[test]
+    fn encoded_sample_round_trips_to_the_source_array() {
+        let allocator = SampleAllocator::heap();
+        let (array, _released) = foreign_owned_array(1024);
+
+        let encoded = allocator.encode_arrow_data(&array).expect("encode");
+        assert_eq!(encoded.type_name(), format!("{:?}", array.data_type()));
+        let decoded = crate::node::arrow_utils::decode_arrow_ipc_data(encoded.as_bytes())
+            .expect("the sample must be a well-formed Arrow IPC stream");
+
+        assert_eq!(decoded, array);
+    }
+
+    /// The allocator is handed to operator threads, so it has to cross thread
+    /// boundaries — and so does the sample it produces.
+    #[test]
+    fn allocator_and_sample_cross_thread_boundaries() {
+        const fn assert_send<T: Send>() {}
+        const fn assert_send_sync_clone<T: Send + Sync + Clone>() {}
+        assert_send::<DataSample>();
+        assert_send::<EncodedSample>();
+        assert_send_sync_clone::<SampleAllocator>();
     }
 }

@@ -1,3 +1,13 @@
+//! **Internal to dora — not a public API.**
+//!
+//! This crate is published to crates.io only because cargo requires every
+//! dependency of a published crate to be published; `dora-node-api` and
+//! `dora-cli` depend on it. It is not covered by dora's 1.0 stability
+//! guarantee and may change in any release, including a patch.
+//!
+//! Depend on it directly at your own risk. See the "Stability scope at 1.0"
+//! section of `docs/api-rust.md`.
+//!
 use dora_message::common::LogMessage;
 use eyre::{Context, Result, bail};
 
@@ -22,10 +32,24 @@ pub fn parse_log(json: &str) -> Result<LogMessage> {
 
 /// Parse a [`LogMessage`] from Arrow input data.
 ///
-/// Convenience wrapper for node event handlers. The daemon sends one log
-/// entry per Arrow message, so this extracts the first string element and
-/// parses it as JSON. Additional elements (if any) are ignored.
-pub fn parse_log_from_arrow(data: &dora_arrow_convert::ArrowData) -> Result<LogMessage> {
+/// Convenience wrapper for node event handlers: the daemon sends one log
+/// entry per Arrow message as a single-element string array, and this
+/// extracts that element and parses it as JSON via [`parse_log`].
+///
+/// The input must be a string array of **exactly one** non-null element —
+/// the underlying `&str` conversion rejects empty, multi-element, and
+/// null arrays — so a batch of several strings is an error, not a case
+/// where the extra elements are silently ignored.
+///
+/// ```
+/// use dora_arrow_convert::IntoArrow;
+/// use dora_log_utils::parse_log_from_arrow;
+///
+/// // More than one element is rejected: exactly one is required.
+/// let batched = vec!["{}".to_string(), "{}".to_string()].into_arrow();
+/// assert!(parse_log_from_arrow(&batched).is_err());
+/// ```
+pub fn parse_log_from_arrow(data: &dora_arrow_convert::DoraArray) -> Result<LogMessage> {
     let json: &str = data.try_into().context("expected string arrow data")?;
     parse_log(json)
 }

@@ -1,11 +1,13 @@
 //! Running dataflow state and associated types.
 
 use crate::{
-    DoraEvent, OutputId, coordinator, fault_tolerance::CascadingErrorCauses, pending::PendingNodes,
+    DoraEvent, OutputId, coordinator,
+    fault_tolerance::CascadingErrorCauses,
+    pending::{DataflowStatus, PendingNodes},
     send_with_timestamp,
 };
 use dora_core::{
-    config::{DataId, NodeId},
+    config::{DataId, Input, InputMapping, NodeId},
     descriptor::Descriptor,
     uhlc::HLC,
 };
@@ -40,6 +42,7 @@ use std::{
 use tokio::sync::{
     broadcast,
     mpsc::{self, Sender},
+    oneshot,
 };
 use tracing::warn;
 
@@ -80,6 +83,31 @@ impl InputDeadline {
 #[derive(Debug)]
 pub struct RunningNode {
     pub(crate) process: Option<ProcessHandle>,
+    /// Gates this node's `restart_loop` until the daemon has inserted the
+    /// entry into `running_nodes` (`mark_registered`), so the loop's first
+    /// events cannot race ahead of registration. Dropping the sender without
+    /// firing it (entry never registered) cancels the loop.
+    pub(crate) restart_loop_start: Option<oneshot::Sender<()>>,
+    /// Keeps the node's TCP listener alive; when this entry (and the
+    /// restart loop's clone) drops, the listener stops accepting — so a
+    /// replaced or removed node does not leak its listener until the whole
+    /// dataflow finishes (dora-rs/dora#2988 review, finding 3).
+    pub(crate) _listener_shutdown: Option<tokio::sync::watch::Sender<bool>>,
+    /// Monotonic identity of the process incarnation currently registered
+    /// under this node ID. Lifecycle events from older incarnations must not
+    /// mutate this entry or contribute results to it.
+    pub(crate) generation: u64,
+    /// Shared counter into which *this entry's own* restart loop publishes its
+    /// successor's generation, before spawning that successor (see
+    /// `RawSpawner::restart_loop`). Because the successor can connect and
+    /// `Subscribe` before the daemon processes the matching
+    /// `ProcessHandleReplaced` (which advances [`Self::generation`]), the event
+    /// gate must accept a generation equal to this announced successor even
+    /// though it is newer than [`Self::generation`]. Crucially it is *this*
+    /// lineage's counter: a stranger incarnation (e.g. a concurrent restart of
+    /// a node being replaced) mints a higher generation into a *different*
+    /// counter, so its events are still rejected (dora-rs/dora#2997).
+    pub(crate) generation_counter: Arc<AtomicU64>,
     pub(crate) node_config: NodeConfig,
     pub(crate) pid: Option<Arc<AtomicU32>>,
     pub(crate) restart_count: Arc<AtomicU32>,
@@ -93,7 +121,12 @@ pub struct RunningNode {
     /// the CLI help ("the daemon's restart loop re-spawns it").
     pub(crate) force_restart_next: Arc<AtomicBool>,
     pub(crate) last_activity: Arc<AtomicU64>,
+    /// Timestamp (millis since epoch) when the child process was spawned (0 if not currently running / in backoff).
+    pub(crate) spawned_at: Arc<AtomicU64>,
+    /// One-shot latch set when startup_timeout kills the process, preventing repeated kill submissions while awaiting exit.
+    pub(crate) startup_kill_sent: Arc<AtomicBool>,
     pub(crate) health_check_timeout: Option<Duration>,
+    pub(crate) startup_timeout: Option<Duration>,
     /// Per-node finish-drain grace override (from `finish_grace_secs` in the
     /// descriptor). When `Some`, overrides the global `DORA_FINISH_DRAIN_GRACE_SECS`
     /// for this node in the finish-straggler watchdog.
@@ -101,6 +134,48 @@ pub struct RunningNode {
 }
 
 impl RunningNode {
+    pub(crate) fn mark_registered(&mut self) {
+        if let Some(start) = self.restart_loop_start.take() {
+            let _ = start.send(());
+        }
+    }
+
+    pub(crate) fn matches_generation(&self, generation: u64) -> bool {
+        self.generation == generation
+    }
+
+    /// Install a respawned incarnation's process handle.
+    ///
+    /// A stale replacement is dropped here, which kills that orphan process.
+    /// A replacement rejected during teardown is returned to the caller so it
+    /// can follow the dataflow's configured stop policy instead of being
+    /// hard-killed by [`ProcessHandle::drop`].
+    pub(crate) fn replace_process_handle(
+        &mut self,
+        previous_generation: u64,
+        new_generation: u64,
+        new_handle: ProcessHandle,
+    ) -> HandleReplacement {
+        if !self.matches_generation(previous_generation) {
+            // A dead incarnation must not replace a live successor's handle
+            // (dora-rs/dora#2926). Dropping `new_handle` kills the orphan.
+            return HandleReplacement::RejectedStale;
+        }
+        if self.restarts_disabled() {
+            // Teardown won the race. Still advance the generation: the restart
+            // loop already speaks `new_generation`, and its terminal
+            // `SpawnedNodeResult` must match this entry or the node would stay
+            // registered forever and the dataflow could never finish. Return
+            // the handle so RunningDataflow can apply the active stop policy.
+            self.generation = new_generation;
+            return HandleReplacement::RejectedTeardown(new_handle);
+        }
+
+        self.process = Some(new_handle);
+        self.generation = new_generation;
+        HandleReplacement::Replaced
+    }
+
     pub fn restarts_disabled(&self) -> bool {
         self.disable_restart.load(atomic::Ordering::Acquire)
     }
@@ -108,6 +183,43 @@ impl RunningNode {
     pub fn disable_restart(&mut self) {
         self.disable_restart.store(true, atomic::Ordering::Release);
     }
+}
+
+/// Outcome of [`RunningNode::replace_process_handle`].
+#[derive(Debug)]
+pub(crate) enum HandleReplacement {
+    /// The handle was installed and the entry advanced to the new generation.
+    Replaced,
+    /// Teardown disabled restarts first. The entry's generation was advanced
+    /// so the restart loop's terminal exit event is accepted, and the handle
+    /// must be stopped according to the active dataflow stop policy.
+    RejectedTeardown(ProcessHandle),
+    /// The event belongs to a dead incarnation (generation mismatch); the
+    /// entry was left untouched.
+    RejectedStale,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum StopProcessPolicy {
+    Force,
+    Graceful(Duration),
+}
+
+static NEXT_NODE_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// Generations are unique across the whole daemon process — not per node —
+/// so a re-added node ID (or any freshly built `RunningNode`) can never
+/// reuse a predecessor's generation. Equality against the entry's stored
+/// generation is therefore collision-free proof that an event belongs to
+/// the currently registered incarnation.
+pub(crate) fn next_node_generation() -> u64 {
+    NEXT_NODE_GENERATION
+        .fetch_update(
+            atomic::Ordering::Relaxed,
+            atomic::Ordering::Relaxed,
+            |generation| generation.checked_add(1),
+        )
+        .expect("node generation counter exhausted")
 }
 
 #[derive(Debug)]
@@ -190,14 +302,25 @@ pub struct RunningDataflow {
     pub(crate) descriptor: Descriptor,
     /// Per-node zenoh listener + dial-list, so the node↔node links this dataflow
     /// needs are established deterministically rather than left to gossip.
-    /// Populated when the dataflow is spawned; see `plan_zenoh_peering`.
+    /// Populated when the dataflow is spawned; see `spawn::build_peering_plan`.
     pub(crate) zenoh_peering: Arc<BTreeMap<NodeId, crate::spawn::NodeZenohPeering>>,
+    /// Keeps this daemon answering other daemons' node-endpoint queries for as
+    /// long as the dataflow runs. Dropped with the dataflow; see
+    /// `spawn::endpoint_exchange`.
+    pub(crate) endpoint_queryable: Option<crate::spawn::endpoint_exchange::EndpointQueryable>,
     pub(crate) pending_nodes: PendingNodes,
     pub(crate) dataflow_started: bool,
     pub(crate) subscribe_channels: HashMap<NodeId, Sender<Timestamped<NodeEvent>>>,
     /// Per-node pending message counters (incremented on send, decremented on recv)
     pub(crate) pending_messages: HashMap<NodeId, Arc<AtomicU64>>,
     pub(crate) mappings: HashMap<OutputId, BTreeSet<(NodeId, DataId)>>,
+    /// Edges seen routed with the receiver missing from `subscribe_channels` —
+    /// i.e. the receiver's daemon event stream was gone (dropped or closed)
+    /// while its entry in `mappings` survived. Guards the diagnostic warning so
+    /// it fires once per (receiver, input) edge instead of on every dropped
+    /// message; cleared when the receiver (re)subscribes, so an edge that drops
+    /// again after reconnecting gets a fresh warning (dora-rs/dora#3201).
+    pub(crate) missing_channel_warned: BTreeSet<(NodeId, DataId)>,
     pub(crate) timers: BTreeMap<Duration, BTreeSet<(NodeId, DataId)>>,
     /// Nodes subscribing to `dora/logs` virtual input.
     pub(crate) log_subscribers: Vec<LogSubscriber>,
@@ -220,10 +343,42 @@ pub struct RunningDataflow {
     pub(crate) connected_nodes: BTreeSet<NodeId>,
     /// Nodes already escalated by the finish-straggler watchdog (one-shot).
     pub(crate) finish_escalated: BTreeSet<NodeId>,
+    /// Per node, the inputs that can ever close — i.e. those fed by
+    /// another node's output rather than by the daemon.
+    ///
+    /// Recorded where inputs are registered, so it sees the same
+    /// resolved view as `open_inputs` (notably `node_inputs`, which
+    /// flattens a runtime node's `operators[].config.inputs`). Timer and
+    /// Logs inputs are excluded: they have no upstream node and so never
+    /// close. Used by [`RunningDataflow::is_drained`] (#2920).
+    pub(crate) data_inputs: BTreeMap<NodeId, BTreeSet<DataId>>,
+    /// Whether timer inputs keep a node from draining.
+    ///
+    /// A timer input is registered in `open_inputs` like any other but is
+    /// never closed — there is no upstream node to finish — so a node
+    /// consuming `dora/timer/...` can never reach "all inputs closed"
+    /// and is never told to finish. Any timer anywhere therefore makes a
+    /// graph unable to terminate on its own (dora-rs/dora#2920).
+    ///
+    /// `dora run --exit-when-nodes-finish` sets this false, which treats
+    /// a timer as a clock rather than a data dependency: a node drains
+    /// once its DATA inputs have closed. Off by default because it
+    /// changes when nodes are told to stop.
+    pub(crate) timers_gate_drain: bool,
     pub(crate) stop_sent: bool,
+    /// Resolved process-stop policy for this dataflow. A respawn that races
+    /// after `stop_all` moved the previously-known handles out of
+    /// `running_nodes` must use this same policy.
+    pub(crate) stop_process_policy: Option<StopProcessPolicy>,
     pub(crate) empty_set: BTreeSet<DataId>,
     pub(crate) cascading_error_causes: CascadingErrorCauses,
-    pub(crate) grace_duration_kills: Arc<crossbeam_skiplist::SkipSet<NodeId>>,
+    /// Planned-stop kill markers keyed by `(node id, generation)`: scoped to
+    /// one process incarnation so a re-added successor never inherits its
+    /// predecessor's marker, and cleaning up a stale event cannot clear a
+    /// live incarnation's marker.
+    pub(crate) grace_duration_kills: Arc<crossbeam_skiplist::SkipSet<(NodeId, u64)>>,
+    /// Startup-timeout kill markers keyed by `(node id, generation)`.
+    pub(crate) startup_timeout_kills: Arc<crossbeam_skiplist::SkipSet<(NodeId, u64)>>,
     pub(crate) node_stderr_most_recent: BTreeMap<NodeId, Arc<ArrayQueue<String>>>,
     pub(crate) publishers: BTreeMap<OutputId, Arc<zenoh::pubsub::Publisher<'static>>>,
     /// Reverse index from output to the set of CLI subscribers watching it.
@@ -267,11 +422,13 @@ impl RunningDataflow {
         Self {
             id: dataflow_id,
             zenoh_peering: Arc::new(BTreeMap::new()),
+            endpoint_queryable: None,
             pending_nodes: PendingNodes::new(dataflow_id, daemon_id),
             dataflow_started: false,
             subscribe_channels: HashMap::new(),
             pending_messages: HashMap::new(),
             mappings: HashMap::new(),
+            missing_channel_warned: BTreeSet::new(),
             timers: BTreeMap::new(),
             log_subscribers: Vec::new(),
             open_inputs: BTreeMap::new(),
@@ -284,10 +441,14 @@ impl RunningDataflow {
             all_inputs_closed_at: HashMap::new(),
             connected_nodes: BTreeSet::new(),
             finish_escalated: BTreeSet::new(),
+            data_inputs: BTreeMap::new(),
+            timers_gate_drain: true,
             stop_sent: false,
+            stop_process_policy: None,
             empty_set: BTreeSet::new(),
             cascading_error_causes: Default::default(),
             grace_duration_kills: Default::default(),
+            startup_timeout_kills: Default::default(),
             node_stderr_most_recent: BTreeMap::new(),
             publishers: Default::default(),
             debug_topic_watchers: Default::default(),
@@ -302,6 +463,81 @@ impl RunningDataflow {
             net_messages_received: Default::default(),
             net_publish_failures: Default::default(),
         }
+    }
+
+    /// Drop per-node bookkeeping that is keyed by node id but not covered by
+    /// the routing-table cleanup in the `RemoveNode` / `ReplaceNode` handlers.
+    ///
+    /// Without this, removing a node (dynamic reconfiguration) leaves stale
+    /// `input_deadlines` / `broken_inputs` entries behind. A never-armed
+    /// `input_deadlines` entry never times out, so `check_input_timeouts`
+    /// re-scans it every tick forever; a `broken_inputs` entry can never
+    /// recover once the node is gone (recovery only happens on message
+    /// receipt, which a removed node never sees). Together with the
+    /// `node_stderr_most_recent` queue this is an unbounded accumulation
+    /// across repeated add/remove cycles.
+    ///
+    /// The recorded cascading-error cause is dropped for the same reason: a
+    /// `caused_by` entry is otherwise never removed (dora-rs/dora#2927), so a
+    /// node id reused by a later incarnation — whether re-added after a
+    /// `RemoveNode` or swapped in by `ReplaceNode` — would have a genuine
+    /// failure of the *new* incarnation misattributed to the stale cause and
+    /// classified as `NodeErrorCause::Cascading`, suppressing its real stderr
+    /// capture.
+    ///
+    /// The lazily-declared remote `publishers` — an `OutputId`-keyed
+    /// (`(node id, output)`) map that the `RemoveNode` / `ReplaceNode` routing
+    /// cleanup never touched — are dropped too. They are created on demand in
+    /// `send_to_remote_receivers`, so without this a removed node's zenoh
+    /// `Publisher` (and its retained session clone) would stay declared for the
+    /// life of the dataflow, accumulating unboundedly across repeated dynamic
+    /// add/remove cycles that use fresh node ids or output names. Dropping them
+    /// is safe on both call sites because the next remote send re-declares the
+    /// publisher.
+    ///
+    /// The sibling `debug_topic_watchers` map is deliberately *not* purged —
+    /// not here and not on any other path. A watcher is only ever (re)created
+    /// by a fresh `StartTopicDebugStream` from the coordinator, and neither the
+    /// `AddNode` re-add path nor the `ReplaceNode` restart re-sends one — only
+    /// a full daemon reconnect does, via the coordinator's
+    /// `restore_topic_debug_streams_for_daemon`. Remove + re-add of the same
+    /// node id is a supported flow (see `added_node_output_routing`) that
+    /// resumes under the same `OutputId(node_id, output)`, exactly like a
+    /// `ReplaceNode`, so purging the watcher would silently kill an active
+    /// `dora topic` stream across that cycle, never to recover. The map only
+    /// grows while a user holds a `dora topic` subscription, and
+    /// `StopTopicDebugStream` already reaps its entries on unsubscribe, so it is
+    /// bounded by live subscriptions rather than by add/remove churn.
+    pub(crate) fn forget_node_bookkeeping(&mut self, node_id: &NodeId) {
+        self.input_deadlines.retain(|(n, _), _| n != node_id);
+        self.broken_inputs.retain(|(n, _), _| n != node_id);
+        self.node_stderr_most_recent.remove(node_id);
+        self.cascading_error_causes.forget(node_id);
+        retain_other_nodes(&mut self.publishers, node_id);
+        self.missing_channel_warned.retain(|(n, _)| n != node_id);
+    }
+
+    /// Whether a startup-barrier completion (reported as
+    /// [`DataflowStatus::AllNodesReady`]) should start this dataflow.
+    ///
+    /// Every barrier-completion trigger — a node subscribing, a `RemoveNode`
+    /// dropping the last pending member, and a cohort member dying before it
+    /// subscribed (dora-rs/dora#2970) — can fire *during teardown*, so all three
+    /// share this gate (dora-rs/dora#3053). `stop_all` neither closes the node
+    /// listener nor completes the barrier for still-pending non-dynamic members:
+    /// it only drains the *existing* `subscribe_channels`, drops the pending
+    /// *dynamic* nodes, and schedules a (by default graceful) process stop. A
+    /// pending cohort member can therefore still subscribe within the grace
+    /// window — `Daemon::subscribe` has a dedicated `stop_sent` branch for
+    /// exactly that — or be killed when the window expires, and either way
+    /// completes the barrier.
+    ///
+    /// Starting a stopping dataflow spawns timer tasks that tick into a
+    /// teardown until the dataflow is dropped, and flips `dataflow_started` on,
+    /// which is the flag a racing `AddNode` reads to decide it may spawn timer
+    /// tasks of its own.
+    pub(crate) fn should_start_on_barrier_completion(&self, status: &DataflowStatus) -> bool {
+        matches!(status, DataflowStatus::AllNodesReady) && !self.dataflow_started && !self.stop_sent
     }
 
     pub(crate) async fn start(
@@ -323,38 +559,48 @@ impl RunningDataflow {
                     interval_stream.tick().await;
 
                     let span = tracing::span!(tracing::Level::TRACE, "tick");
-                    let _ = span.enter();
 
-                    // Build metadata with minimal allocations.
-                    // Use shared daemon clock (not per-timer HLC) for causality.
-                    #[cfg(feature = "telemetry")]
-                    let parameters = {
-                        let ctx = dora_tracing::telemetry::serialize_context(&span.context());
-                        if ctx.is_empty() {
-                            BTreeMap::new()
-                        } else {
-                            let mut m = BTreeMap::new();
-                            m.insert(
-                                "open_telemetry_context".to_string(),
-                                dora_node_api::Parameter::String(ctx),
-                            );
-                            m
+                    // Enter the span only for the synchronous metadata/event
+                    // build, and drop the guard (end of this block) before the
+                    // `events_tx.send(...).await` below. Holding a span guard
+                    // across an await point would keep the span entered on the
+                    // worker thread while the task is parked, misattributing
+                    // whatever the runtime polls next on that thread to this
+                    // span on a multi-threaded runtime.
+                    let event = {
+                        let _guard = span.enter();
+
+                        // Build metadata with minimal allocations.
+                        // Use shared daemon clock (not per-timer HLC) for causality.
+                        #[cfg(feature = "telemetry")]
+                        let parameters = {
+                            let ctx = dora_tracing::telemetry::serialize_context(&span.context());
+                            if ctx.is_empty() {
+                                BTreeMap::new()
+                            } else {
+                                let mut m = BTreeMap::new();
+                                m.insert(
+                                    dora_node_api::metadata::OPEN_TELEMETRY_CONTEXT.to_string(),
+                                    dora_node_api::Parameter::String(ctx),
+                                );
+                                m
+                            }
+                        };
+                        #[cfg(not(feature = "telemetry"))]
+                        let parameters = BTreeMap::new();
+
+                        let metadata =
+                            metadata::Metadata::from_parameters(clock.new_timestamp(), parameters);
+
+                        Timestamped {
+                            inner: DoraEvent::Timer {
+                                dataflow_id,
+                                interval,
+                                metadata,
+                            }
+                            .into(),
+                            timestamp: clock.new_timestamp(),
                         }
-                    };
-                    #[cfg(not(feature = "telemetry"))]
-                    let parameters = BTreeMap::new();
-
-                    let metadata =
-                        metadata::Metadata::from_parameters(clock.new_timestamp(), parameters);
-
-                    let event = Timestamped {
-                        inner: DoraEvent::Timer {
-                            dataflow_id,
-                            interval,
-                            metadata,
-                        }
-                        .into(),
-                        timestamp: clock.new_timestamp(),
                     };
                     if events_tx.send(event).await.is_err() {
                         break;
@@ -380,6 +626,36 @@ impl RunningDataflow {
         Ok(())
     }
 
+    /// Drop `node_id` from every timer subscriber set, and for any interval it
+    /// was the *last* subscriber of, cancel that interval's timer task and
+    /// forget the now-empty entry.
+    ///
+    /// Without the cancellation, the per-interval task spawned by [`start`]
+    /// keeps ticking and dispatching `DoraEvent::Timer`s to an empty subscriber
+    /// set for the remaining life of the dataflow — a bounded but pointless
+    /// stream of wakeups after the last consumer of that interval is removed
+    /// via `RemoveNode` (#2585). Dropping the [`RemoteHandle`] stored in
+    /// `_timer_handles` cancels the spawned future. A later `AddNode` that
+    /// re-subscribes to the same interval re-spawns the task through `start`,
+    /// whose `_timer_handles.contains_key` guard makes that safe.
+    ///
+    /// [`start`]: RunningDataflow::start
+    /// [`RemoteHandle`]: futures::future::RemoteHandle
+    pub(crate) fn unsubscribe_node_from_timers(&mut self, node_id: &NodeId) {
+        let mut drained_intervals = Vec::new();
+        for (interval, receivers) in self.timers.iter_mut() {
+            receivers.retain(|(nid, _)| nid != node_id);
+            if receivers.is_empty() {
+                drained_intervals.push(*interval);
+            }
+        }
+        for interval in drained_intervals {
+            self.timers.remove(&interval);
+            // Dropping the RemoteHandle cancels the spawned timer task.
+            self._timer_handles.remove(&interval);
+        }
+    }
+
     pub(crate) async fn stop_all(
         &mut self,
         coordinator_sender: &mut Option<coordinator::CoordinatorSender>,
@@ -402,6 +678,13 @@ impl RunningDataflow {
             node.disable_restart();
         }
 
+        let stop_process_policy = if force {
+            StopProcessPolicy::Force
+        } else {
+            StopProcessPolicy::Graceful(grace_duration.unwrap_or(DEFAULT_STOP_GRACE))
+        };
+        self.stop_process_policy = Some(stop_process_policy);
+
         for (node_id, channel) in self.subscribe_channels.drain() {
             if send_with_timestamp(&channel, NodeEvent::Stop, clock).ok() == Some(true)
                 && let Some(counter) = self.pending_messages.get(&node_id)
@@ -413,47 +696,67 @@ impl RunningDataflow {
         let running_processes: Vec<_> = self
             .running_nodes
             .iter_mut()
-            .map(|(id, n)| (id.clone(), n.process.take()))
+            .map(|(id, n)| (id.clone(), n.generation, n.process.take()))
             .collect();
-        if force {
-            for (_, proc) in &running_processes {
-                if let Some(proc) = proc {
-                    proc.submit(ProcessOperation::Kill);
-                }
+        for (node_id, generation, process) in running_processes {
+            if let Some(process) = process {
+                self.schedule_process_stop(node_id, generation, process, stop_process_policy);
             }
-        } else {
-            let grace_duration_kills = self.grace_duration_kills.clone();
-            tokio::spawn(async move {
-                let duration = grace_duration.unwrap_or(DEFAULT_STOP_GRACE);
-                tokio::time::sleep(duration).await;
-
-                for (node, proc) in &running_processes {
-                    if let Some(proc) = proc
-                        && proc.submit(ProcessOperation::SoftKill)
-                    {
-                        grace_duration_kills.insert(node.clone());
-                    }
-                }
-
-                let kill_duration = duration / 2;
-                tokio::time::sleep(kill_duration).await;
-
-                for (node, proc) in &running_processes {
-                    if let Some(proc) = proc
-                        && proc.submit(ProcessOperation::Kill)
-                    {
-                        grace_duration_kills.insert(node.clone());
-                        warn!(
-                            "{node} was killed due to not stopping within the {:#?} grace period",
-                            duration + kill_duration
-                        );
-                    }
-                }
-            });
         }
         self.stop_sent = true;
 
         Ok(self.should_finish_immediately())
+    }
+
+    fn schedule_process_stop(
+        &self,
+        node_id: NodeId,
+        generation: u64,
+        process: ProcessHandle,
+        policy: StopProcessPolicy,
+    ) {
+        let grace_duration_kills = self.grace_duration_kills.clone();
+        match policy {
+            StopProcessPolicy::Force => {
+                if process.submit(ProcessOperation::Kill) {
+                    grace_duration_kills.insert((node_id, generation));
+                }
+            }
+            StopProcessPolicy::Graceful(duration) => {
+                tokio::spawn(async move {
+                    tokio::time::sleep(duration).await;
+                    if process.submit(ProcessOperation::SoftKill) {
+                        grace_duration_kills.insert((node_id.clone(), generation));
+                    }
+
+                    let kill_duration = duration / 2;
+                    tokio::time::sleep(kill_duration).await;
+                    if process.submit(ProcessOperation::Kill) {
+                        grace_duration_kills.insert((node_id.clone(), generation));
+                        warn!(
+                            "{node_id} was killed due to not stopping within the {:#?} grace period",
+                            duration + kill_duration
+                        );
+                    }
+                });
+            }
+        }
+    }
+
+    pub(crate) fn stop_rejected_replacement(
+        &self,
+        node_id: &NodeId,
+        generation: u64,
+        process: ProcessHandle,
+    ) {
+        if let Some(policy) = self.stop_process_policy {
+            self.schedule_process_stop(node_id.clone(), generation, process, policy);
+        } else {
+            // Restarts can also be disabled by AllInputsClosed. That path has
+            // no operator-supplied grace policy, so retain its existing
+            // immediate orphan-reaping behavior.
+            drop(process);
+        }
     }
 
     fn should_finish_immediately(&self) -> FinishDataflowWhen {
@@ -482,15 +785,41 @@ impl RunningDataflow {
             .get_mut(node_id)
             .ok_or_else(|| eyre!("node `{node_id}` not found in running dataflow"))?;
         node.disable_restart();
+        let generation = node.generation;
         let process = node.process.take();
         self.send_stop_and_schedule_kill(
             node_id,
+            generation,
             process,
             clock,
             grace_duration,
             DEFAULT_STOP_GRACE,
         );
         Ok(())
+    }
+
+    /// Stop an already-unregistered (replaced) incarnation
+    /// (dora-rs/dora#2927): send `Stop` on the id's still-installed
+    /// subscribe channel and schedule the grace-kill escalation on the
+    /// taken process handle. Must be called BEFORE the old incarnation's
+    /// subscribe channel is removed from `subscribe_channels`, or the
+    /// `Stop` cannot reach it and only the kill escalation applies.
+    pub(crate) fn stop_replaced_incarnation(
+        &self,
+        node_id: &NodeId,
+        generation: u64,
+        process: Option<ProcessHandle>,
+        clock: &HLC,
+        grace_duration: Option<Duration>,
+    ) {
+        self.send_stop_and_schedule_kill(
+            node_id,
+            generation,
+            process,
+            clock,
+            grace_duration,
+            DEFAULT_STOP_GRACE,
+        );
     }
 
     /// Restart a single node. Re-enables restart so `restart_loop` picks it up.
@@ -524,6 +853,7 @@ impl RunningDataflow {
                  already exited terminally)"
             ));
         }
+        let generation = node.generation;
         let process = node.process.take();
         // Clear any prior disable (e.g. from an earlier stop_single_node
         // or a cascading AllInputsClosed) so the restart_loop will pick
@@ -553,6 +883,7 @@ impl RunningDataflow {
         self.finish_escalated.remove(node_id);
         self.send_stop_and_schedule_kill(
             node_id,
+            generation,
             process,
             clock,
             grace_duration,
@@ -565,6 +896,7 @@ impl RunningDataflow {
     fn send_stop_and_schedule_kill(
         &self,
         node_id: &NodeId,
+        generation: u64,
         process: Option<ProcessHandle>,
         clock: &HLC,
         grace_duration: Option<Duration>,
@@ -592,11 +924,11 @@ impl RunningDataflow {
             tokio::spawn(async move {
                 tokio::time::sleep(duration).await;
                 if proc.submit(ProcessOperation::SoftKill) {
-                    grace_duration_kills.insert(node_id.clone());
+                    grace_duration_kills.insert((node_id.clone(), generation));
                 }
                 tokio::time::sleep(duration / 2).await;
                 if proc.submit(ProcessOperation::Kill) {
-                    grace_duration_kills.insert(node_id);
+                    grace_duration_kills.insert((node_id, generation));
                 }
             });
         }
@@ -609,8 +941,160 @@ impl RunningDataflow {
         }
     }
 
+    /// Propagate a `NodeFailed` event to every downstream subscriber of the
+    /// failed node's outputs.
+    ///
+    /// Each successful enqueue is paired with `inc_pending`, mirroring every
+    /// other delivery site: the `Listener` unconditionally decrements a node's
+    /// `pending_messages` counter for every event it drains (`NodeFailed`
+    /// included), so an enqueue without the matching increment would leave the
+    /// reported count one too low — and underflow it to `u64::MAX` when the
+    /// receiver's channel was already empty (dora-rs/dora#2827).
+    pub(crate) fn propagate_node_failed(&self, failed_node: &NodeId, error_msg: &str, clock: &HLC) {
+        let mut affected_by_receiver: BTreeMap<NodeId, Vec<DataId>> = BTreeMap::new();
+        for (output_id, receivers) in &self.mappings {
+            if output_id.0 == *failed_node {
+                for (recv_id, input_id) in receivers {
+                    affected_by_receiver
+                        .entry(recv_id.clone())
+                        .or_default()
+                        .push(input_id.clone());
+                }
+            }
+        }
+        for (recv_id, affected_ids) in affected_by_receiver {
+            if let Some(channel) = self.subscribe_channels.get(&recv_id) {
+                let delivered = send_with_timestamp(
+                    channel,
+                    NodeEvent::NodeFailed {
+                        affected_input_ids: affected_ids,
+                        error: error_msg.to_string(),
+                        source_node_id: failed_node.clone(),
+                    },
+                    clock,
+                )
+                .ok()
+                    == Some(true);
+                if delivered {
+                    self.inc_pending(&recv_id);
+                }
+            }
+        }
+    }
+
     pub(crate) fn open_inputs(&self, node_id: &NodeId) -> &BTreeSet<DataId> {
         self.open_inputs.get(node_id).unwrap_or(&self.empty_set)
+    }
+
+    /// Wire up a node-to-node edge added at runtime (`dora node connect`).
+    ///
+    /// Kept here, rather than inline in the `AddMapping` handler, so the
+    /// state it has to keep in step — `mappings`, `open_inputs`,
+    /// `data_inputs` and the drain clock — can be exercised directly by a
+    /// test instead of only through the daemon event loop.
+    pub(crate) fn add_mapping(
+        &mut self,
+        source_node: NodeId,
+        source_output: DataId,
+        target_node: NodeId,
+        target_input: DataId,
+    ) {
+        self.mappings
+            .entry(OutputId(source_node, source_output))
+            .or_default()
+            .insert((target_node.clone(), target_input.clone()));
+        // Reopening an input ends any drain: clear the stale clock so
+        // the selector does not treat the node as drained-and-eligible
+        // on a timestamp from before the mapping was re-added (#2270).
+        self.all_inputs_closed_at.remove(&target_node);
+        self.open_inputs
+            .entry(target_node.clone())
+            .or_default()
+            .insert(target_input.clone());
+        // A mapping is by construction a node-to-node edge, so this is a
+        // data input and must gate the drain like any other. Without it
+        // the opt-in would not see the new input at all, and could report
+        // the node drained while an input that can still deliver is open
+        // (#2920).
+        self.data_inputs
+            .entry(target_node)
+            .or_default()
+            .insert(target_input);
+    }
+
+    /// Whether `node_id` has finished draining — i.e. whether it should
+    /// be told `AllInputsClosed`.
+    ///
+    /// With `timers_gate_drain` (the default) this is simply "no open
+    /// inputs left". With it off, only inputs that *can* close count, so
+    /// a node drains once its data inputs have closed even though its
+    /// clock keeps ticking (dora-rs/dora#2920).
+    ///
+    /// A node with no data inputs at all — timer-only, logs-only, or no
+    /// inputs — is never considered drained. It has no dependency that
+    /// could ever finish, which makes it a source, and sources are not
+    /// told to finish. Without this, enabling the opt-in would stop
+    /// every timer-driven producer the moment the dataflow started.
+    ///
+    /// This deliberately reads `data_inputs`, recorded when inputs were
+    /// registered, rather than re-deriving the answer from the
+    /// descriptor: a runtime (`operators:`) node keeps its inputs under
+    /// `operators[].config.inputs` and has an empty top-level `inputs`
+    /// map, so a descriptor-derived check reports "no data inputs" for
+    /// every operator node and hangs the dataflow it was meant to end.
+    pub(crate) fn is_drained(&self, node_id: &NodeId) -> bool {
+        let open = self.open_inputs(node_id);
+        if self.timers_gate_drain {
+            return open.is_empty();
+        }
+        let Some(data_inputs) = self.data_inputs.get(node_id) else {
+            return false;
+        };
+        !data_inputs.is_empty() && data_inputs.is_disjoint(open)
+    }
+
+    /// Whether `node_id` has finished: drained, with no circuit-broken
+    /// input that could still recover and deliver more data.
+    ///
+    /// The shared half of both drain sites (`Daemon::subscribe` and
+    /// `signal_all_inputs_closed_if_drained`), which had already drifted —
+    /// only one of them excluded broken inputs. The source check is NOT
+    /// folded in here: it belongs only at the subscribe site, where a node
+    /// that never had inputs can reach the test. Adding it to the close
+    /// path would change default-mode behavior, and the failure mode of
+    /// getting that wrong is a missed `AllInputsClosed`, i.e. the hang
+    /// this issue exists to remove.
+    pub(crate) fn is_finished(&self, node_id: &NodeId) -> bool {
+        self.is_drained(node_id) && !self.has_broken_input(node_id)
+    }
+
+    /// Whether any of this node's inputs is circuit-broken (out of
+    /// `open_inputs`, but recoverable).
+    pub(crate) fn has_broken_input(&self, node_id: &NodeId) -> bool {
+        self.broken_inputs.keys().any(|(nid, _)| nid == node_id)
+    }
+
+    /// Whether a node that has just subscribed should immediately be told
+    /// `AllInputsClosed` — i.e. it is finished AND is not a source.
+    ///
+    /// The source half only matters here. On the close path a node reached
+    /// the test by having an input close, so it necessarily had one; but a
+    /// node can subscribe having never had any input, and in the default
+    /// mode "nothing open" reads as finished.
+    ///
+    /// Deliberately one method rather than two conditions at the call site:
+    /// the descriptor-derived version of this check silently reported every
+    /// runtime (`operators:`) node as a source and hung it, and a decision
+    /// spelled out at the call site cannot be unit-tested.
+    pub(crate) fn is_finished_non_source(&self, node_id: &NodeId) -> bool {
+        self.is_finished(node_id) && self.has_data_input(node_id)
+    }
+
+    /// Whether this node declared at least one input that can ever close.
+    pub(crate) fn has_data_input(&self, node_id: &NodeId) -> bool {
+        self.data_inputs
+            .get(node_id)
+            .is_some_and(|inputs| !inputs.is_empty())
     }
 
     /// All output ids produced by `node_id`, whether they are consumed by a
@@ -621,6 +1105,62 @@ impl RunningDataflow {
     /// consumer, so their remote consumers would never receive the
     /// `OutputClosed` event when the producing node finishes (dora-rs/dora#2152
     /// region — graceful cross-daemon shutdown).
+    /// Whether `receiver`'s `input_id` declares `queue_policy: backpressure`,
+    /// judged from the live node config. Static and dynamic nodes alike have
+    /// an entry from spawn time (a dynamic node's config is served from it
+    /// when the node connects), so a consumer that has not joined yet still
+    /// counts. A receiver with no entry has exited; its edge is judged again
+    /// when it is added back.
+    pub(crate) fn input_requires_backpressure(&self, receiver: &NodeId, input_id: &DataId) -> bool {
+        self.running_nodes
+            .get(receiver)
+            .and_then(|node| node.node_config.run_config.inputs.get(input_id))
+            .is_some_and(crate::output_routing::input_is_backpressure)
+    }
+
+    /// The first `queue_policy: backpressure` input of a node entering this
+    /// running dataflow whose local producer is already running with that
+    /// output on the direct zenoh path.
+    ///
+    /// A producer learns its routing once, in its `NodeConfig`; nothing
+    /// re-pins a running producer when a consumer is added or replaced. Such
+    /// an edge would silently run over the lossy direct ingress the policy
+    /// exists to avoid, so the add/replace is refused instead. Self-loops are
+    /// the entering node's own routing (`pin_backpressure_self_loops`), a
+    /// producer without an entry runs on another daemon (its daemon owns that
+    /// call), and a producer without routing keeps every output on the
+    /// daemon path already.
+    pub(crate) fn unpinnable_backpressure_input(
+        &self,
+        node_id: &NodeId,
+        inputs: &BTreeMap<DataId, Input>,
+    ) -> Option<(DataId, OutputId)> {
+        inputs.iter().find_map(|(input_id, input)| {
+            if !crate::output_routing::input_is_backpressure(input) {
+                return None;
+            }
+            let InputMapping::User(mapping) = &input.mapping else {
+                return None;
+            };
+            if &mapping.source == node_id {
+                return None;
+            }
+            let producer = self.running_nodes.get(&mapping.source)?;
+            let pinned = match &producer.node_config.output_routing {
+                None => true,
+                Some(routing) => routing
+                    .get(&mapping.output)
+                    .is_some_and(|routing| routing.daemon_only),
+            };
+            (!pinned).then(|| {
+                (
+                    input_id.clone(),
+                    OutputId(mapping.source.clone(), mapping.output.clone()),
+                )
+            })
+        })
+    }
+
     pub(crate) fn node_output_ids(&self, node_id: &NodeId) -> BTreeSet<DataId> {
         node_output_ids(&self.mappings, &self.open_external_mappings, node_id)
     }
@@ -685,12 +1225,31 @@ impl RunningDataflow {
     /// "silent and never drained" exactly like a wedge, but is alive by design
     /// (dora-rs/dora#2270) — e.g. a long-running timer-only side-effect node.
     fn node_never_finishes(&self, node_id: &NodeId) -> bool {
-        let is_source = self
-            .descriptor
-            .nodes
-            .iter()
-            .find(|n| &n.id == node_id)
-            .is_some_and(|n| n.inputs.is_empty());
+        // A node that HAS drained under the opt-in really can finish, even
+        // though a timer or logs input keeps it fed. Treating it as
+        // never-finishing would veto the straggler watchdog for the whole
+        // dataflow (see `select_finish_stragglers`) exactly on the path
+        // where nodes newly receive `AllInputsClosed` — so a drained node
+        // that then wedges could never be escalated (#2920).
+        //
+        // Keyed on having drained, not on merely declaring data inputs: a
+        // timer-fed node whose data inputs are still open has not finished,
+        // and arming the watchdog for it would let a slow upstream plus a
+        // long timer interval read as "silent past the grace period" and
+        // get it escalated to SIGKILL while it is healthy.
+        if !self.timers_gate_drain && self.is_drained(node_id) {
+            return false;
+        }
+        // `has_data_input` reads `data_inputs`, recorded at registration
+        // time, rather than the raw descriptor: a runtime (`operators:`)
+        // node keeps its inputs under `operators[].config.inputs` and has
+        // an empty top-level `inputs` map, so a descriptor-derived check
+        // reports every operator node as a source and permanently disarms
+        // the straggler watchdog for the whole dataflow the moment one is
+        // running (`select_finish_stragglers` returns early on the first
+        // `never_finishes` node it sees). Same fix `is_finished_non_source`
+        // already applies for the same reason.
+        let is_source = !self.has_data_input(node_id);
         let has_timer = self
             .timers
             .values()
@@ -792,6 +1351,15 @@ fn select_finish_stragglers<'a>(
         .collect()
 }
 
+/// Drops every entry of an `OutputId`-keyed map whose output belongs to
+/// `node_id`, keeping all others. Extracted so the keying can be unit-tested:
+/// its one production caller purges [`RunningDataflow::publishers`], whose value
+/// type (`Arc<zenoh::pubsub::Publisher>`) can't be constructed in-process, so a
+/// direct map-shape test of that field isn't possible.
+fn retain_other_nodes<V>(map: &mut BTreeMap<OutputId, V>, node_id: &NodeId) {
+    map.retain(|output_id, _| &output_id.0 != node_id);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -804,6 +1372,29 @@ mod tests {
 
     fn data_id(name: &str) -> DataId {
         DataId::from(name.to_string())
+    }
+
+    #[test]
+    fn retain_other_nodes_drops_only_that_nodes_outputs() {
+        // Covers the `OutputId` keying of the `publishers` purge in
+        // `forget_node_bookkeeping`, whose real value type
+        // (`Arc<zenoh::pubsub::Publisher>`) can't be built in a unit test — a
+        // dummy value stands in for the map shape. Guards against the purge
+        // being keyed on the wrong `OutputId` field, which would silently
+        // reintroduce the per-dataflow publisher leak across add/remove cycles.
+        let node_a = node_id("node_a");
+        let node_b = node_id("node_b");
+        let mut map: BTreeMap<OutputId, u32> = BTreeMap::new();
+        map.insert(OutputId(node_a.clone(), data_id("x")), 1);
+        map.insert(OutputId(node_a.clone(), data_id("y")), 2);
+        map.insert(OutputId(node_b.clone(), data_id("x")), 3);
+
+        retain_other_nodes(&mut map, &node_a);
+
+        // Every output of node_a is gone, regardless of output name …
+        assert!(!map.keys().any(|OutputId(n, _)| n == &node_a));
+        // … while node_b keeps its entry untouched.
+        assert_eq!(map.get(&OutputId(node_b.clone(), data_id("x"))), Some(&3));
     }
 
     // ---- node_output_ids: remote-only outputs must be included ----
@@ -842,6 +1433,442 @@ mod tests {
 
         let outputs = node_output_ids(&mappings, &open_external_mappings, &node_id("source"));
         assert!(outputs.is_empty());
+    }
+
+    // ---- dora-rs/dora#2827: NodeFailed propagation must not underflow the
+    //      receiver's pending_messages counter ----
+
+    /// Build a descriptor with one node whose inputs are as given, via
+    /// the real YAML shape — `(input_id, is_timer)`. Parsing rather than
+    /// constructing means the `InputMapping` variants are exactly the
+    /// ones production builds.
+    fn descriptor_with_node(node_id: &str, inputs: &[(&str, bool)]) -> Descriptor {
+        let mut yaml = format!("nodes:\n  - id: {node_id}\n    path: dummy\n");
+        if !inputs.is_empty() {
+            yaml.push_str("    inputs:\n");
+            for (id, is_timer) in inputs {
+                if *is_timer {
+                    yaml.push_str(&format!("      {id}: dora/timer/millis/100\n"));
+                } else {
+                    yaml.push_str(&format!("      {id}: upstream/value\n"));
+                }
+            }
+        }
+        serde_yaml::from_str(&yaml).expect("test descriptor should parse")
+    }
+
+    /// A dataflow with `node` declared as in `descriptor_with_node`, its
+    /// inputs all currently open, timer inputs registered as timers, and
+    /// data inputs recorded in `data_inputs` — mirroring what the daemon
+    /// does when it registers a node's inputs.
+    fn dataflow_with_node(node_id: &str, inputs: &[(&str, bool)]) -> RunningDataflow {
+        let mut df = RunningDataflow::new(
+            uuid::Uuid::nil(),
+            DaemonId::new(None),
+            descriptor_with_node(node_id, inputs),
+        );
+        register_inputs(&mut df, node_id, inputs);
+        df
+    }
+
+    /// Register one node's inputs the way the daemon's spawn path does.
+    fn register_inputs(df: &mut RunningDataflow, node_id: &str, inputs: &[(&str, bool)]) {
+        let node: NodeId = node_id.to_string().into();
+        for (id, is_timer) in inputs {
+            let input: DataId = id.to_string().into();
+            df.open_inputs
+                .entry(node.clone())
+                .or_default()
+                .insert(input.clone());
+            if *is_timer {
+                df.timers
+                    .entry(Duration::from_millis(100))
+                    .or_default()
+                    .insert((node.clone(), input));
+            } else {
+                df.data_inputs
+                    .entry(node.clone())
+                    .or_default()
+                    .insert(input);
+            }
+        }
+    }
+
+    /// A node with a real data input but an empty top-level `inputs` map
+    /// (the shape of a runtime/`operators:` node — its inputs live under
+    /// `operators[].config.inputs`) must not be classified as a source.
+    /// `node_never_finishes` used to derive "is this a source" from the raw
+    /// descriptor's top-level `inputs`, so every operator node with real
+    /// inputs read as a source and permanently vetoed the finish-straggler
+    /// watchdog for the whole dataflow.
+    #[test]
+    fn operator_shaped_node_with_data_input_is_not_a_source() {
+        // Empty top-level `inputs` mirrors an `operators:` node's descriptor
+        // shape; `register_inputs` then records a real data input the way
+        // the daemon does for `operators[].config.inputs`.
+        let node = node_id("op");
+        let mut df = dataflow_with_node("op", &[]);
+        register_inputs(&mut df, "op", &[("value", false)]);
+
+        assert!(
+            !df.node_never_finishes(&node),
+            "a node with a registered data input can reach natural finish \
+             and must not be treated as a source, regardless of what its \
+             top-level descriptor `inputs` map looks like"
+        );
+    }
+
+    /// Default behavior is unchanged: every input gates the drain, so a
+    /// node with a live timer is never told its inputs closed. This is
+    /// the dora-rs/dora#2920 hang.
+    #[test]
+    fn timers_gate_drain_by_default() {
+        let node: NodeId = "consumer".to_string().into();
+        let mut df = dataflow_with_node("consumer", &[("value", false), ("tick", true)]);
+        assert!(!df.is_drained(&node), "nothing has closed yet");
+
+        // The data input closes; the timer keeps ticking.
+        df.open_inputs
+            .get_mut(&node)
+            .unwrap()
+            .remove(&DataId::from("value".to_string()));
+        assert!(
+            !df.is_drained(&node),
+            "by default a live timer must still gate the drain — that is the \
+             behavior the opt-in flag changes, and changing it silently would \
+             stop nodes that are still expected to run"
+        );
+    }
+
+    /// With the opt-in, a timer is a clock rather than a data
+    /// dependency: the node drains once its data inputs have closed.
+    #[test]
+    fn data_inputs_alone_gate_drain_when_opted_in() {
+        let node: NodeId = "consumer".to_string().into();
+        let mut df = dataflow_with_node("consumer", &[("value", false), ("tick", true)]);
+        df.timers_gate_drain = false;
+        assert!(!df.is_drained(&node), "the data input is still open");
+
+        df.open_inputs
+            .get_mut(&node)
+            .unwrap()
+            .remove(&DataId::from("value".to_string()));
+        assert!(
+            df.is_drained(&node),
+            "with the opt-in, a closed data input drains the node even though \
+             its timer is still registered"
+        );
+    }
+
+    /// A node whose inputs are ALL timers has no data dependency that
+    /// could ever finish, so it is a source. Draining it would tell every
+    /// timer-driven producer to stop the moment the dataflow started.
+    #[test]
+    fn timer_only_nodes_are_never_drained_even_when_opted_in() {
+        let node: NodeId = "ticker".to_string().into();
+        let mut df = dataflow_with_node("ticker", &[("tick", true)]);
+        df.timers_gate_drain = false;
+        assert!(
+            !df.is_drained(&node),
+            "a timer-only node is a source; draining it at startup would stop \
+             every timer-driven producer immediately"
+        );
+    }
+
+    /// And a node with no inputs at all stays a source under the opt-in.
+    #[test]
+    fn input_less_nodes_are_never_drained_even_when_opted_in() {
+        let node: NodeId = "source".to_string().into();
+        let mut df = dataflow_with_node("source", &[]);
+        df.timers_gate_drain = false;
+        assert!(!df.is_drained(&node));
+    }
+
+    /// A data input must only satisfy the node that declared it. Keying
+    /// the drain on the input id alone would drain any node sharing an
+    /// input name with another node's timer — and `tick` is the most
+    /// common input name in this repo's own dataflows.
+    #[test]
+    fn drain_does_not_confuse_inputs_that_share_a_name_across_nodes() {
+        let ticker: NodeId = "ticker".to_string().into();
+        let worker: NodeId = "worker".to_string().into();
+        let mut df = dataflow_with_node("ticker", &[("tick", true)]);
+        // `worker` also has an input called `tick`, but its is real data.
+        register_inputs(&mut df, "worker", &[("tick", false)]);
+        df.timers_gate_drain = false;
+
+        assert!(
+            !df.is_drained(&worker),
+            "worker's `tick` is a DATA input and is still open; it must not \
+             be drained just because another node has a timer named `tick`"
+        );
+        assert!(!df.is_drained(&ticker), "ticker is timer-only, so a source");
+
+        df.open_inputs
+            .get_mut(&worker)
+            .unwrap()
+            .remove(&DataId::from("tick".to_string()));
+        assert!(df.is_drained(&worker), "worker's data input has now closed");
+    }
+
+    /// An input added at runtime (`dora node connect` -> `AddMapping`)
+    /// must gate the drain like a declared one. It is recorded in
+    /// `open_inputs`, so if it were missing from `data_inputs` the
+    /// disjointness test would simply not see it, and a node could be
+    /// told all its inputs were closed while an input that can still
+    /// deliver data was open.
+    #[test]
+    fn inputs_added_at_runtime_gate_the_drain() {
+        let node: NodeId = "consumer".to_string().into();
+        let mut df = dataflow_with_node("consumer", &[("value", false), ("tick", true)]);
+        df.timers_gate_drain = false;
+
+        // `dora node connect` wires up a second data input. This must go
+        // through the real handler helper: routing it via the test's own
+        // `register_inputs` would assert against a re-implementation of
+        // the very bookkeeping under test, and would still pass if
+        // `add_mapping` stopped recording the input.
+        df.add_mapping(
+            "producer".to_string().into(),
+            "late_out".to_string().into(),
+            node.clone(),
+            "late".to_string().into(),
+        );
+        assert!(
+            df.data_inputs
+                .get(&node)
+                .is_some_and(|inputs| inputs.contains(&DataId::from("late".to_string()))),
+            "add_mapping must record the new edge as a data input"
+        );
+
+        // The originally-declared input closes; `late` is still open.
+        df.open_inputs
+            .get_mut(&node)
+            .unwrap()
+            .remove(&DataId::from("value".to_string()));
+        assert!(
+            !df.is_drained(&node),
+            "a runtime-added input is still open, so the node has not finished \
+             — draining here would drop data that input can still deliver"
+        );
+
+        df.open_inputs
+            .get_mut(&node)
+            .unwrap()
+            .remove(&DataId::from("late".to_string()));
+        assert!(df.is_drained(&node), "now every data input has closed");
+    }
+
+    /// A runtime (`operators:`) node keeps its inputs under
+    /// `operators[].config.inputs`, leaving the node's own `inputs` map
+    /// empty. Deriving "has data inputs" from the descriptor therefore
+    /// reported false for every operator node and hung the dataflow the
+    /// opt-in was meant to end. Recording the inputs at registration time
+    /// is what makes this work.
+    #[test]
+    fn operator_nodes_drain_under_the_opt_in() {
+        let yaml = "nodes:\n  \
+                    - id: sink\n    \
+                      operators:\n      \
+                        - id: op\n        \
+                          shared-library: dummy\n        \
+                          inputs:\n          \
+                            data: source/op/data\n";
+        let descriptor: Descriptor = serde_yaml::from_str(yaml).expect("parse");
+        let node: NodeId = "sink".to_string().into();
+        assert!(
+            descriptor.nodes[0].inputs.is_empty(),
+            "precondition: an operator node's top-level `inputs` map is empty, \
+             which is exactly why the descriptor cannot answer this question"
+        );
+
+        let mut df = RunningDataflow::new(uuid::Uuid::nil(), DaemonId::new(None), descriptor);
+        // The daemon registers the flattened `op/data` input.
+        register_inputs(&mut df, "sink", &[("op/data", false)]);
+        df.timers_gate_drain = false;
+
+        assert!(!df.is_drained(&node), "the operator's data input is open");
+        df.open_inputs
+            .get_mut(&node)
+            .unwrap()
+            .remove(&DataId::from("op/data".to_string()));
+        assert!(
+            df.is_drained(&node),
+            "an operator node must drain once its data inputs close, exactly \
+             like a custom node"
+        );
+    }
+
+    /// The send decision, not just the drain predicate. An operator node
+    /// must be told `AllInputsClosed`: deciding "is this a source" from
+    /// the descriptor calls every runtime node a source (its top-level
+    /// `inputs` map is empty) and skips the event, which is the hang this
+    /// issue is about.
+    #[test]
+    fn operator_nodes_are_told_all_inputs_closed() {
+        let yaml = "nodes:\n  \
+                    - id: sink\n    \
+                      operators:\n      \
+                        - id: op\n        \
+                          shared-library: dummy\n        \
+                          inputs:\n          \
+                            data: source/op/data\n";
+        let descriptor: Descriptor = serde_yaml::from_str(yaml).expect("parse");
+        let node: NodeId = "sink".to_string().into();
+        let mut df = RunningDataflow::new(uuid::Uuid::nil(), DaemonId::new(None), descriptor);
+        register_inputs(&mut df, "sink", &[("op/data", false)]);
+        df.timers_gate_drain = false;
+
+        assert!(!df.is_finished(&node), "input still open");
+        df.open_inputs
+            .get_mut(&node)
+            .unwrap()
+            .remove(&DataId::from("op/data".to_string()));
+        assert!(
+            df.is_finished_non_source(&node),
+            "an operator node must not read as a source, or subscribe skips \
+             `AllInputsClosed` and it hangs forever — the failure this issue \
+             exists to fix. Deriving this from the descriptor gets it wrong, \
+             because a runtime node's top-level `inputs` map is empty."
+        );
+    }
+
+    /// Sources are never told to finish, in either mode.
+    #[test]
+    fn sources_are_not_told_all_inputs_closed() {
+        let source: NodeId = "source".to_string().into();
+        let mut df = dataflow_with_node("source", &[]);
+        // In the default mode a source looks drained (nothing is open), so
+        // the source check is what stops the event being sent.
+        assert!(df.is_finished(&source), "nothing is open");
+        assert!(
+            !df.is_finished_non_source(&source),
+            "but it is a source, so it must not be told to finish"
+        );
+        df.timers_gate_drain = false;
+        // Under the opt-in `is_drained` already excludes it.
+        assert!(!df.is_finished_non_source(&source));
+    }
+
+    /// A circuit-broken input is recoverable, so the node is not finished.
+    /// It leaves `open_inputs`, which would otherwise read as drained.
+    #[test]
+    fn circuit_broken_inputs_do_not_count_as_finished() {
+        let node: NodeId = "consumer".to_string().into();
+        let value = DataId::from("value".to_string());
+        let mut df = dataflow_with_node("consumer", &[("value", false), ("tick", true)]);
+        df.timers_gate_drain = false;
+
+        // break_input moves the input out of `open_inputs` but keeps it
+        // recoverable in `broken_inputs`.
+        df.open_inputs.get_mut(&node).unwrap().remove(&value);
+        df.broken_inputs
+            .insert((node.clone(), value.clone()), Default::default());
+
+        assert!(
+            df.is_drained(&node),
+            "precondition: with the input out of `open_inputs`, the drain \
+             predicate alone cannot tell this from a finished node"
+        );
+        assert!(
+            !df.is_finished(&node),
+            "a recoverable input must not end the node; it would exit for good \
+             and never see the data that arrives after recovery"
+        );
+    }
+
+    /// The straggler watchdog must stay armed for nodes the opt-in drains.
+    /// `node_never_finishes` vetoes escalation for the whole dataflow, so
+    /// leaving timer-fed nodes marked never-finishing would disable the
+    /// safety net precisely where nodes newly get `AllInputsClosed`.
+    #[test]
+    fn opt_in_keeps_the_straggler_watchdog_armed_for_drainable_nodes() {
+        let node: NodeId = "consumer".to_string().into();
+        let mut df = dataflow_with_node("consumer", &[("value", false), ("tick", true)]);
+
+        assert!(
+            df.node_never_finishes(&node),
+            "by default a timer-fed node genuinely never finishes"
+        );
+
+        df.timers_gate_drain = false;
+        assert!(
+            df.node_never_finishes(&node),
+            "the opt-in alone is not enough: this node's data input is still \
+             open, so it has NOT finished. Arming the watchdog here would let \
+             a slow upstream plus a long timer interval look like a wedge and \
+             get a healthy node SIGKILLed"
+        );
+
+        // Now it actually drains.
+        df.open_inputs
+            .get_mut(&node)
+            .unwrap()
+            .remove(&DataId::from("value".to_string()));
+        assert!(
+            !df.node_never_finishes(&node),
+            "having drained, this node CAN finish, so the watchdog must be \
+             able to escalate it if it then wedges"
+        );
+    }
+
+    /// Timer-only nodes stay exempt from the watchdog even under the
+    /// opt-in — they really never finish.
+    #[test]
+    fn opt_in_leaves_timer_only_nodes_exempt_from_the_watchdog() {
+        let node: NodeId = "ticker".to_string().into();
+        let mut df = dataflow_with_node("ticker", &[("tick", true)]);
+        df.timers_gate_drain = false;
+        assert!(df.node_never_finishes(&node));
+    }
+
+    fn empty_descriptor() -> Descriptor {
+        Descriptor::new(vec![])
+    }
+
+    #[test]
+    fn propagate_node_failed_keeps_idle_receiver_counter_consistent() {
+        let mut df =
+            RunningDataflow::new(uuid::Uuid::nil(), DaemonId::new(None), empty_descriptor());
+        let failed = node_id("source");
+        let receiver = node_id("sink");
+
+        // `source/out` is consumed by `sink/in`.
+        df.mappings.insert(
+            OutputId(failed.clone(), data_id("out")),
+            BTreeSet::from([(receiver.clone(), data_id("in"))]),
+        );
+
+        // The receiver is subscribed and idle: its pending counter starts at 0.
+        let (tx, mut rx) = mpsc::channel(16);
+        df.subscribe_channels.insert(receiver.clone(), tx);
+        let counter = Arc::new(AtomicU64::new(0));
+        df.pending_messages
+            .insert(receiver.clone(), counter.clone());
+
+        let clock = HLC::default();
+        df.propagate_node_failed(&failed, "boom", &clock);
+
+        // The successful enqueue must have incremented the counter to match the
+        // in-flight event.
+        assert_eq!(counter.load(atomic::Ordering::Relaxed), 1);
+
+        // Drain the event exactly as the Listener does: one unconditional
+        // decrement per drained event. With the matching increment in place the
+        // counter returns to 0; without it, this decrement would wrap to
+        // `u64::MAX`.
+        let mut drained = 0;
+        while let Ok(event) = rx.try_recv() {
+            counter.fetch_sub(1, atomic::Ordering::Relaxed);
+            assert!(matches!(event.inner, NodeEvent::NodeFailed { .. }));
+            drained += 1;
+        }
+        assert_eq!(drained, 1, "receiver should get exactly one NodeFailed");
+        assert_eq!(
+            counter.load(atomic::Ordering::Relaxed),
+            0,
+            "pending counter must stay consistent (no u64::MAX underflow)"
+        );
     }
 
     const TEST_GRACE: Duration = Duration::from_millis(100);

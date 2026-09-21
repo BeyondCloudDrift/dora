@@ -41,7 +41,8 @@ use arrow::ipc::{Buffer as IpcBuffer, FieldNode, MessageHeader, MetadataVersion}
 use arrow_schema::{DataType, Field, Schema};
 use eyre::{Context, bail, eyre};
 
-use super::ARROW_BUFFER_ALIGNMENT as ALIGN;
+use super::{ARROW_BUFFER_ALIGNMENT as ALIGN, IpcPayload};
+use dora_arrow_convert::{DoraArray, internal::array_ref};
 
 /// IPC stream continuation marker (precedes every message length prefix).
 const CONTINUATION_MARKER: [u8; 4] = [0xff, 0xff, 0xff, 0xff];
@@ -309,6 +310,15 @@ fn prepare(array: &ArrayData) -> Option<Prepared> {
     let record_batch_block = round_up(PREFIX_LEN + record_batch_message.len(), ALIGN);
     // schema block + record-batch header block + body + end-of-stream (8 bytes).
     let total = schema_block + record_batch_block + layout.body_len + PREFIX_LEN;
+    // `push_buffer` only bounds the running body length; the schema and
+    // record-batch header blocks push `total` slightly higher, so a body just
+    // under MAX_IPC_BYTES can still yield a stream over it. Bound the whole
+    // stream here so the fast path declines (routing to the fallback encoder,
+    // which bails loudly) rather than emitting a stream every receiver rejects
+    // — matching the whole-stream limit the decoders enforce (#2586).
+    if total > super::MAX_IPC_BYTES {
+        return None;
+    }
     Some(Prepared {
         layout,
         schema_message,
@@ -323,8 +333,74 @@ fn prepare(array: &ArrayData) -> Option<Prepared> {
 /// `None` if `array` is not fast-path eligible (use [`encode_ipc_to_vec`]).
 ///
 /// Lets a caller size the (shared-memory) sample before encoding into it.
-pub fn ipc_fast_path_len(array: &ArrayData) -> Option<usize> {
+///
+/// Sizing and encoding both call [`prepare`] internally, so a caller that does
+/// `ipc_fast_path_len(a)` then `encode_ipc_into(a, dst)` builds the layout and
+/// both flatbuffer headers twice. On the hot send path prefer [`PreparedIpc`],
+/// which prepares once and reuses the result for both steps.
+pub(crate) fn ipc_fast_path_len_data(array: &ArrayData) -> Option<usize> {
     prepare(array).map(|p| p.total)
+}
+
+/// A prepared Arrow IPC fast-path encode.
+///
+/// Holds the computed layout and both framed message headers so the byte
+/// length ([`byte_len`](Self::byte_len)) and the encode
+/// ([`encode_into`](Self::encode_into)) share the work. A separate
+/// [`ipc_fast_path_len`] + [`encode_ipc_into`] pair, by contrast, runs the
+/// whole layout + flatbuffer build twice — once to size the sample and once to
+/// fill it. On the per-output send path that redundant work is independent of
+/// payload size, so it is a real fraction of the cost for high-frequency
+/// small/medium messages.
+///
+/// The emitted bytes are identical to [`encode_ipc_into`].
+///
+/// # Example
+///
+/// ```
+/// # fn main() -> eyre::Result<()> {
+/// use dora_node_api::arrow_utils::decode_arrow_ipc;
+/// use dora_node_api::arrow_utils::ipc_encode::PreparedIpc;
+/// use dora_node_api::{IntoArrow, into_vec};
+///
+/// let data = vec![1u64, 2, 3].into_arrow();
+///
+/// // Prepare once, size the destination from `byte_len()`, then encode into it.
+/// let prepared = PreparedIpc::new(&data).expect("primitive array is fast-path eligible");
+/// let mut buffer = vec![0u8; prepared.byte_len()];
+/// prepared.encode_into(&mut buffer)?;
+///
+/// // The buffer is a self-describing IPC stream, identical to `encode_ipc_into`.
+/// let decoded = decode_arrow_ipc(&buffer)?;
+/// assert_eq!(into_vec::<u64>(&decoded)?, vec![1, 2, 3]);
+/// # Ok(())
+/// # }
+/// ```
+pub struct PreparedIpc(Prepared);
+
+impl PreparedIpc {
+    /// Prepare the fast-path encode for `array`, or `None` if `array` is not
+    /// fast-path eligible (fall back to [`encode_ipc_to_vec`]).
+    pub fn new(array: &DoraArray) -> Option<Self> {
+        Self::from_data(&array_ref(array).to_data())
+    }
+
+    /// Same, for dora-internal callers that already hold an [`ArrayData`].
+    pub(crate) fn from_data(array: &ArrayData) -> Option<Self> {
+        prepare(array).map(Self)
+    }
+
+    /// Exact byte length of the IPC stream [`encode_into`](Self::encode_into)
+    /// writes. Use it to size the (shared-memory) destination sample.
+    pub fn byte_len(&self) -> usize {
+        self.0.total
+    }
+
+    /// Encode the complete IPC stream into `dst`, which must be exactly
+    /// [`byte_len`](Self::byte_len) bytes. Copies each array buffer once.
+    pub fn encode_into(&self, dst: &mut [u8]) -> eyre::Result<()> {
+        encode_prepared_into(&self.0, dst)
+    }
 }
 
 /// Frame one IPC message into `dst[at..]`: continuation marker, i32-LE metadata
@@ -348,9 +424,15 @@ fn write_framed_message(dst: &mut [u8], at: usize, flatbuffer: &[u8]) -> usize {
 /// `dst.len()` must equal [`ipc_fast_path_len(array)`](ipc_fast_path_len);
 /// `array` must be fast-path eligible (it is when `ipc_fast_path_len` returned
 /// `Some`).
-pub fn encode_ipc_into(array: &ArrayData, dst: &mut [u8]) -> eyre::Result<()> {
+pub(crate) fn encode_ipc_into_data(array: &ArrayData, dst: &mut [u8]) -> eyre::Result<()> {
     let prepared =
         prepare(array).ok_or_else(|| eyre!("array is not Arrow IPC fast-path eligible"))?;
+    encode_prepared_into(&prepared, dst)
+}
+
+/// Write an already-[`prepare`]d IPC stream into `dst`. Shared by the one-shot
+/// [`encode_ipc_into`] and the prepare-once [`PreparedIpc::encode_into`].
+fn encode_prepared_into(prepared: &Prepared, dst: &mut [u8]) -> eyre::Result<()> {
     if dst.len() != prepared.total {
         bail!(
             "destination size {} does not match required IPC length {}",
@@ -402,7 +484,12 @@ fn write_body(dst: &mut [u8], body_start: usize, layout: &Layout) {
 /// persistent [`StreamDecoder`](arrow::ipc::reader::StreamDecoder) to prime it,
 /// then decodes a sequence of schema-less batch messages from
 /// [`encode_batch_into`] against the same decoder (the W3 schema-once path).
-pub fn encode_schema_message(data_type: &DataType) -> eyre::Result<Vec<u8>> {
+pub fn encode_schema_message(array: &DoraArray) -> eyre::Result<Vec<u8>> {
+    encode_schema_message_for(array_ref(array).data_type())
+}
+
+/// Same, for dora-internal callers that already hold an Arrow `DataType`.
+pub(crate) fn encode_schema_message_for(data_type: &DataType) -> eyre::Result<Vec<u8>> {
     let schema_message = build_schema_message(data_type)?;
     let block = round_up(PREFIX_LEN + schema_message.len(), ALIGN);
     let mut dst = vec![0u8; block];
@@ -413,7 +500,7 @@ pub fn encode_schema_message(data_type: &DataType) -> eyre::Result<Vec<u8>> {
 /// Exact byte length of the schema-less batch message [`encode_batch_into`]
 /// would write (record-batch header block + body + 8-byte end-of-stream marker,
 /// **no** schema prefix), or `None` if `array` is not fast-path eligible.
-pub fn batch_fast_path_len(array: &ArrayData) -> Option<usize> {
+pub(crate) fn batch_fast_path_len_data(array: &ArrayData) -> Option<usize> {
     let prepared = prepare(array)?;
     Some(prepared.record_batch_block + prepared.layout.body_len + PREFIX_LEN)
 }
@@ -424,7 +511,7 @@ pub fn batch_fast_path_len(array: &ArrayData) -> Option<usize> {
 /// the matching [`encode_schema_message`]. The trailing marker lets the decoder
 /// flush a 0-row batch (empty body); a non-empty batch never reads it. `dst.len()`
 /// must equal [`batch_fast_path_len(array)`](batch_fast_path_len).
-pub fn encode_batch_into(array: &ArrayData, dst: &mut [u8]) -> eyre::Result<()> {
+pub(crate) fn encode_batch_into_data(array: &ArrayData, dst: &mut [u8]) -> eyre::Result<()> {
     let prepared =
         prepare(array).ok_or_else(|| eyre!("array is not Arrow IPC fast-path eligible"))?;
     let expected = prepared.record_batch_block + prepared.layout.body_len + PREFIX_LEN;
@@ -448,8 +535,47 @@ pub fn encode_batch_into(array: &ArrayData, dst: &mut [u8]) -> eyre::Result<()> 
 /// Fallback encoder for any array (including non-fast-path types): produce a
 /// full Arrow IPC stream `Vec` via the official writer. The caller copies this
 /// into the sample, so this path costs two payload copies.
-pub fn encode_ipc_to_vec(array: &ArrayData) -> eyre::Result<Vec<u8>> {
-    super::encode_arrow_ipc(array).context("Arrow IPC fallback encode")
+pub(crate) fn encode_ipc_to_vec_data(array: &ArrayData) -> eyre::Result<Vec<u8>> {
+    super::encode_arrow_ipc_data(array).context("Arrow IPC fallback encode")
+}
+
+/// Exact byte length of the Arrow IPC stream [`encode_ipc_into`] would write
+/// for `array`, or `None` if `array` is not fast-path eligible.
+///
+/// Sizing and encoding both build the layout internally, so a caller that does
+/// `ipc_fast_path_len(a)` then `encode_ipc_into(a, dst)` does the work twice.
+/// On the hot send path prefer [`PreparedIpc`], which prepares once.
+pub fn ipc_fast_path_len(array: &DoraArray) -> Option<usize> {
+    ipc_fast_path_len_data(&array_ref(array).to_data())
+}
+
+/// Encode `array` as a complete Arrow IPC stream directly into `dst`, copying
+/// each array buffer exactly once.
+///
+/// `dst.len()` must equal [`ipc_fast_path_len(array)`](ipc_fast_path_len);
+/// `array` must be fast-path eligible (it is when `ipc_fast_path_len` returned
+/// `Some`).
+pub fn encode_ipc_into(array: &DoraArray, dst: &mut [u8]) -> eyre::Result<()> {
+    encode_ipc_into_data(&array_ref(array).to_data(), dst)
+}
+
+/// Exact byte length of the schema-less batch message [`encode_batch_into`]
+/// would write, or `None` if `array` is not fast-path eligible.
+pub fn batch_fast_path_len(array: &DoraArray) -> Option<usize> {
+    batch_fast_path_len_data(&array_ref(array).to_data())
+}
+
+/// Encode `array` as a schema-less Arrow IPC **batch message** into `dst`.
+/// `dst.len()` must equal [`batch_fast_path_len(array)`](batch_fast_path_len).
+pub fn encode_batch_into(array: &DoraArray, dst: &mut [u8]) -> eyre::Result<()> {
+    encode_batch_into_data(&array_ref(array).to_data(), dst)
+}
+
+/// Fallback encoder for any array (including non-fast-path types): produce a
+/// full Arrow IPC stream `Vec` via the official writer. The caller copies this
+/// into the sample, so this path costs two payload copies.
+pub fn encode_ipc_to_vec(array: &DoraArray) -> eyre::Result<Vec<u8>> {
+    encode_ipc_to_vec_data(&array_ref(array).to_data())
 }
 
 /// IPC layout of a `UInt8` array of `data_len` elements (no nulls): the byte
@@ -466,6 +592,10 @@ struct Uint8Layout {
 }
 
 fn uint8_layout(data_len: usize) -> eyre::Result<Uint8Layout> {
+    // Cheap pre-filter: the emitted stream is always >= `data_len`, so anything
+    // over the limit is rejected below regardless, and bounding `data_len` here
+    // keeps the round_up/add arithmetic that computes `total` well within
+    // `usize` range.
     if data_len > super::MAX_IPC_BYTES {
         bail!(
             "UInt8 payload too large: {data_len} bytes (max {})",
@@ -487,6 +617,19 @@ fn uint8_layout(data_len: usize) -> eyre::Result<Uint8Layout> {
     let schema_block = round_up(PREFIX_LEN + schema_message.len(), ALIGN);
     let record_batch_block = round_up(PREFIX_LEN + record_batch_message.len(), ALIGN);
     let total = schema_block + record_batch_block + body_len + PREFIX_LEN;
+    // Bound the *resulting stream* rather than just `data_len`: the emitted IPC
+    // stream is ~1.125x larger (validity bitmap, 64-byte alignment padding,
+    // schema + record-batch message blocks). Every receiver guards the whole
+    // stream against MAX_IPC_BYTES, so a band of `data_len` just under the limit
+    // would otherwise encode and send here yet be rejected — silently dropped on
+    // the zenoh path — by every receiver. Reject at the producer instead (#2586).
+    if total > super::MAX_IPC_BYTES {
+        bail!(
+            "UInt8 payload too large: {data_len} bytes encodes to a {total}-byte \
+             Arrow IPC stream (max {})",
+            super::MAX_IPC_BYTES
+        );
+    }
     let data_offset = schema_block + record_batch_block + validity_padded;
     Ok(Uint8Layout {
         schema_message,
@@ -502,8 +645,49 @@ fn uint8_layout(data_len: usize) -> eyre::Result<Uint8Layout> {
 /// Total IPC stream length for a no-null `UInt8` array of `data_len` elements.
 /// Lets a caller size the sample before constructing the message in place via
 /// [`encode_uint8_ipc_header`].
+///
+/// Both this and [`encode_uint8_ipc_header`] call [`uint8_layout`] (which builds
+/// two flatbuffer headers) internally; a caller that does both prefers
+/// [`PreparedUint8Ipc`], which computes the layout once.
 pub fn uint8_ipc_len(data_len: usize) -> eyre::Result<usize> {
     Ok(uint8_layout(data_len)?.total)
+}
+
+/// A prepared no-null `UInt8` IPC fast-path encode.
+///
+/// The `UInt8` construct-in-place path (used by `send_output_raw` and the
+/// Python buffer-protocol send) sizes the sample from the layout and then
+/// writes the header into it. Both steps need [`uint8_layout`], which builds
+/// the schema + record-batch flatbuffer headers. This handle computes the
+/// layout once and reuses it for both, instead of the double build a separate
+/// [`uint8_ipc_len`] + [`encode_uint8_ipc_header`] pair incurs.
+pub struct PreparedUint8Ipc {
+    layout: Uint8Layout,
+    data_len: usize,
+}
+
+impl PreparedUint8Ipc {
+    /// Prepare the header for a no-null `UInt8` array of `data_len` elements.
+    /// Fails if the resulting stream would exceed the IPC size limit.
+    pub fn new(data_len: usize) -> eyre::Result<Self> {
+        Ok(Self {
+            layout: uint8_layout(data_len)?,
+            data_len,
+        })
+    }
+
+    /// Total IPC stream length. Use it to size the destination sample.
+    pub fn byte_len(&self) -> usize {
+        self.layout.total
+    }
+
+    /// Write the IPC header into `dst` (which must be exactly
+    /// [`byte_len`](Self::byte_len) bytes) and return the offset at which the
+    /// caller must write the `data_len` data bytes. Same contract as
+    /// [`encode_uint8_ipc_header`].
+    pub fn encode_header_into(&self, dst: &mut [u8]) -> eyre::Result<usize> {
+        encode_uint8_prepared_into(&self.layout, self.data_len, dst)
+    }
 }
 
 /// Write a complete no-null `UInt8` IPC stream into `dst` **except the data
@@ -516,6 +700,17 @@ pub fn uint8_ipc_len(data_len: usize) -> eyre::Result<usize> {
 /// copies.
 pub fn encode_uint8_ipc_header(dst: &mut [u8], data_len: usize) -> eyre::Result<usize> {
     let layout = uint8_layout(data_len)?;
+    encode_uint8_prepared_into(&layout, data_len, dst)
+}
+
+/// Write an already-[`uint8_layout`]-computed `UInt8` IPC header into `dst`.
+/// Shared by the one-shot [`encode_uint8_ipc_header`] and the prepare-once
+/// [`PreparedUint8Ipc::encode_header_into`].
+fn encode_uint8_prepared_into(
+    layout: &Uint8Layout,
+    data_len: usize,
+    dst: &mut [u8],
+) -> eyre::Result<usize> {
     if dst.len() != layout.total {
         bail!(
             "destination size {} does not match required UInt8 IPC length {}",
@@ -650,7 +845,12 @@ impl InputDecoder {
     /// full stream received in-band): prime a fresh decoder with it and retain
     /// the bytes for later local re-priming. A no-op when the live decoder is
     /// already primed with `hash`.
-    pub fn set_schema(&mut self, hash: u64, schema: ArrowBuffer) -> eyre::Result<()> {
+    pub fn set_schema(&mut self, hash: u64, schema: IpcPayload) -> eyre::Result<()> {
+        self.set_schema_raw(hash, schema.into_arrow())
+    }
+
+    /// Same, for dora-internal callers that already hold an Arrow buffer.
+    pub(crate) fn set_schema_raw(&mut self, hash: u64, schema: ArrowBuffer) -> eyre::Result<()> {
         check_ipc_size(schema.len())?;
         if self.schema_hash == Some(hash) {
             return Ok(());
@@ -687,6 +887,17 @@ impl InputDecoder {
     /// which primes in-band — will prime it).
     pub fn decode_batch(
         &mut self,
+        buffer: IpcPayload,
+        hash: u64,
+    ) -> eyre::Result<Option<DoraArray>> {
+        Ok(self
+            .decode_batch_raw(buffer.into_arrow(), hash)?
+            .map(dora_arrow_convert::internal::from_array_data))
+    }
+
+    /// Same, for dora-internal callers that already hold an Arrow buffer.
+    pub(crate) fn decode_batch_raw(
+        &mut self,
         buffer: ArrowBuffer,
         hash: u64,
     ) -> eyre::Result<Option<arrow::array::ArrayData>> {
@@ -703,13 +914,15 @@ impl InputDecoder {
         }
         match decode_one_batch(&mut self.decoder, buffer) {
             Ok(array) => {
-                // Arrow 59+ reaches a terminal state after decoding each message's
-                // EOS marker, rejecting further input. Reset the decoder so the next
-                // batch (another independent IPC stream) can be decoded against the
-                // same schema. Clearing schema_hash forces the next batch to re-prime
-                // from the retained schemas (instant lookup, no network round-trip).
-                self.decoder = arrow::ipc::reader::StreamDecoder::new();
-                self.schema_hash = None;
+                // `decode_one_batch` yields a non-empty batch *before* the
+                // trailing end-of-stream marker is consumed, and a 0-row batch
+                // only when the decoder is polled *with* that marker — but in
+                // neither case does the persistent decoder reach Arrow 59's
+                // terminal state (verified at runtime), so it stays usable for
+                // the next schema-less batch. Reusing the same primed decoder is
+                // the schema-once fast path: no per-batch re-prime on the hot
+                // data plane. A genuinely poisoned decoder (truncated/corrupt
+                // input) is recovered by the error arm below.
                 Ok(Some(array))
             }
             Err(e) => {
@@ -772,9 +985,14 @@ fn prime_with_schema(
 /// flush it on their own; the marker matters for a **0-row** batch, whose
 /// zero-length body arrow's `StreamDecoder` only emits when polled with more
 /// input — without the trailing marker an empty array is silently dropped
-/// (PR #2366). The decoder yields the pending batch *before* consuming the
-/// marker's zero length, so it never reaches its terminal state and stays
-/// usable for the next batch.
+/// (PR #2366).
+///
+/// The decoder yields a non-empty batch *before* the marker is consumed, and a
+/// 0-row batch only when polled *with* it, but in neither case does it reach
+/// Arrow 59's terminal state (verified at runtime) — so [`InputDecoder`] reuses
+/// one primed decoder across batches (the schema-once fast path) rather than
+/// resetting after each. A poisoned decoder is instead recovered on the error
+/// path of [`InputDecoder::decode_batch`].
 fn decode_one_batch(
     decoder: &mut arrow::ipc::reader::StreamDecoder,
     mut buffer: ArrowBuffer,
@@ -805,7 +1023,7 @@ fn decode_one_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arrow_utils::decode_arrow_ipc_zero_copy;
+    use crate::arrow_utils::decode_arrow_ipc_zero_copy_raw;
     use arrow::array::{
         Array, ArrayRef, BooleanArray, FixedSizeBinaryArray, Float32Array, Int32Array,
         LargeStringArray, ListArray, NullArray, StringArray, StructArray, UInt8Array, UInt64Array,
@@ -818,9 +1036,9 @@ mod tests {
 
     /// Encode via the fast path into a fresh `Vec` sized by `ipc_fast_path_len`.
     fn fast_encode(array: &ArrayData) -> Vec<u8> {
-        let len = ipc_fast_path_len(array).expect("array should be fast-path eligible");
+        let len = ipc_fast_path_len_data(array).expect("array should be fast-path eligible");
         let mut buf = vec![0u8; len];
-        encode_ipc_into(array, &mut buf).expect("fast-path encode");
+        encode_ipc_into_data(array, &mut buf).expect("fast-path encode");
         buf
     }
 
@@ -861,16 +1079,16 @@ mod tests {
         assert_eq!(array, &decoded, "fast-path stream must decode to the input");
         // Our own zero-copy decoder must agree too.
         let (buffer, _, _) = aligned_buffer(&encoded);
-        let zc = decode_arrow_ipc_zero_copy(buffer).expect("zero-copy decode");
+        let zc = decode_arrow_ipc_zero_copy_raw(buffer).expect("zero-copy decode");
         assert_eq!(array, &zc, "zero-copy decode must equal the input");
     }
 
     /// Encode `array` as a schema-less batch message (the fast path's
     /// `batch_slice` equivalent), as shipped on the schema-once data plane.
     fn batch_bytes(array: &ArrayData) -> Vec<u8> {
-        let len = batch_fast_path_len(array).unwrap();
+        let len = batch_fast_path_len_data(array).unwrap();
         let mut buf = vec![0u8; len];
-        encode_batch_into(array, &mut buf).unwrap();
+        encode_batch_into_data(array, &mut buf).unwrap();
         buf
     }
 
@@ -884,33 +1102,44 @@ mod tests {
     /// primed for.
     #[test]
     fn input_decoder_schema_then_batches() {
-        let f32_schema = || Buffer::from_vec(encode_schema_message(&DataType::Float32).unwrap());
+        let f32_schema =
+            || Buffer::from_vec(encode_schema_message_for(&DataType::Float32).unwrap());
 
         let mut dec = InputDecoder::new();
 
         // A batch arriving before any schema is dropped (not primed).
         let early = Float32Array::from(vec![9.0]).into_data();
-        assert!(dec.decode_batch(batch_buf(&early), 7).unwrap().is_none());
+        assert!(
+            dec.decode_batch_raw(batch_buf(&early), 7)
+                .unwrap()
+                .is_none()
+        );
 
         // Installing the schema primes the decoder; following batches decode.
-        dec.set_schema(7, f32_schema()).unwrap();
+        dec.set_schema_raw(7, f32_schema()).unwrap();
         for vals in [vec![1.0f32, 2.0, 3.0], vec![4.0], vec![5.0, 6.0, 7.0]] {
             let array = Float32Array::from(vals).into_data();
             assert_eq!(
-                dec.decode_batch(batch_buf(&array), 7).unwrap().unwrap(),
+                dec.decode_batch_raw(batch_buf(&array), 7).unwrap().unwrap(),
                 array
             );
         }
 
         // A batch tagged with a hash the decoder isn't primed for is dropped.
         let other = Float32Array::from(vec![8.0]).into_data();
-        assert!(dec.decode_batch(batch_buf(&other), 99).unwrap().is_none());
+        assert!(
+            dec.decode_batch_raw(batch_buf(&other), 99)
+                .unwrap()
+                .is_none()
+        );
 
         // Installing a schema under the new hash primes it; its batches decode.
-        dec.set_schema(99, f32_schema()).unwrap();
+        dec.set_schema_raw(99, f32_schema()).unwrap();
         let after = Float32Array::from(vec![10.0, 11.0]).into_data();
         assert_eq!(
-            dec.decode_batch(batch_buf(&after), 99).unwrap().unwrap(),
+            dec.decode_batch_raw(batch_buf(&after), 99)
+                .unwrap()
+                .unwrap(),
             after
         );
     }
@@ -923,23 +1152,26 @@ mod tests {
     /// schema that later schema-less batches reference, silently dropping them.
     #[test]
     fn input_decoder_retains_multiple_schemas() {
-        let schema_msg = |dt: &DataType| Buffer::from_vec(encode_schema_message(dt).unwrap());
+        let schema_msg = |dt: &DataType| Buffer::from_vec(encode_schema_message_for(dt).unwrap());
 
         let mut dec = InputDecoder::new();
-        dec.set_schema(1, schema_msg(&DataType::Float32)).unwrap();
-        dec.set_schema(2, schema_msg(&DataType::Int32)).unwrap();
+        dec.set_schema_raw(1, schema_msg(&DataType::Float32))
+            .unwrap();
+        dec.set_schema_raw(2, schema_msg(&DataType::Int32)).unwrap();
 
         // Live decoder is primed for hash 2 …
         let ints = Int32Array::from(vec![1, 2, 3]).into_data();
         assert_eq!(
-            dec.decode_batch(batch_buf(&ints), 2).unwrap().unwrap(),
+            dec.decode_batch_raw(batch_buf(&ints), 2).unwrap().unwrap(),
             ints
         );
 
         // … but a batch for hash 1 must still decode (retained schema).
         let floats = Float32Array::from(vec![4.0, 5.0]).into_data();
         assert_eq!(
-            dec.decode_batch(batch_buf(&floats), 1).unwrap().unwrap(),
+            dec.decode_batch_raw(batch_buf(&floats), 1)
+                .unwrap()
+                .unwrap(),
             floats,
             "a schema installed earlier must be retained across later primes"
         );
@@ -947,27 +1179,29 @@ mod tests {
         // And switching back again also works.
         let more_ints = Int32Array::from(vec![6]).into_data();
         assert_eq!(
-            dec.decode_batch(batch_buf(&more_ints), 2).unwrap().unwrap(),
+            dec.decode_batch_raw(batch_buf(&more_ints), 2)
+                .unwrap()
+                .unwrap(),
             more_ints
         );
     }
 
-    /// The retained-schema set is bounded: schemas beyond the cap evict the
-    /// oldest, whose batches then drop until it is re-installed.
-    /// Test that schema-less batches can be decoded repeatedly after the
-    /// decoder is soft-reset between batches (Arrow 59+ terminal state fix).
-    /// This is the regression test for PR #2445/#2366 interaction with Arrow 59.
+    /// Sequential schema-less batches decode correctly against a single primed
+    /// decoder (Arrow 59+ terminal-state handling, PR #2445/#2366). Non-empty
+    /// batches reuse the live decoder without a per-batch re-prime — the
+    /// schema-once fast path — which this exercises across five batches.
     #[test]
     fn input_decoder_handles_sequential_batches_arrow_59_terminal_state() {
-        let f32_schema = || Buffer::from_vec(encode_schema_message(&DataType::Float32).unwrap());
+        let f32_schema =
+            || Buffer::from_vec(encode_schema_message_for(&DataType::Float32).unwrap());
 
         let mut dec = InputDecoder::new();
         // Prime with a schema.
-        dec.set_schema(7, f32_schema()).unwrap();
+        dec.set_schema_raw(7, f32_schema()).unwrap();
 
         // Decode 5 schema-less batches sequentially. Each one should decode
-        // correctly despite the decoder being reset between batches (soft-reset
-        // for Arrow 59 terminal state handling).
+        // correctly; because they are non-empty, the decoder is reused across
+        // them (no reset/re-prime between batches).
         let batches = [
             Float32Array::from(vec![1.0, 2.0]).into_data(),
             Float32Array::from(vec![3.0]).into_data(),
@@ -977,7 +1211,7 @@ mod tests {
         ];
 
         for (i, batch) in batches.iter().enumerate() {
-            let result = dec.decode_batch(batch_buf(batch), 7);
+            let result = dec.decode_batch_raw(batch_buf(batch), 7);
             assert!(
                 result.is_ok(),
                 "batch {} decode failed: {:?}",
@@ -991,25 +1225,74 @@ mod tests {
                 i, batch, decoded
             );
         }
+
+        // The decoder is reused across all five non-empty batches — no reset
+        // clears the prime (schema_hash would be `None` if any batch reset it).
+        assert_eq!(dec.schema_hash, Some(7));
     }
 
+    /// Empty (0-row) batches interleaved with non-empty ones all decode. The
+    /// empty path polls the decoder *with* the EOS marker, but (per the runtime
+    /// check) that does not leave it terminal, so one primed decoder is reused
+    /// across the whole sequence with no reset — pinned below by `schema_hash`
+    /// staying primed throughout.
+    #[test]
+    fn input_decoder_handles_empty_and_nonempty_batches() {
+        let f32_schema =
+            || Buffer::from_vec(encode_schema_message_for(&DataType::Float32).unwrap());
+
+        let mut dec = InputDecoder::new();
+        dec.set_schema_raw(7, f32_schema()).unwrap();
+
+        let empty = Float32Array::from(Vec::<f32>::new()).into_data();
+        let batches = [
+            empty.clone(),                                  // 0-row
+            Float32Array::from(vec![1.0, 2.0]).into_data(), // non-empty, decoder reused
+            empty.clone(),
+            empty.clone(), // back-to-back 0-row
+            Float32Array::from(vec![3.0]).into_data(),
+        ];
+
+        for (i, batch) in batches.iter().enumerate() {
+            let decoded = dec
+                .decode_batch_raw(batch_buf(batch), 7)
+                .unwrap_or_else(|e| panic!("batch {i} decode failed: {e:?}"))
+                .unwrap_or_else(|| panic!("batch {i} was dropped"));
+            assert_eq!(&decoded, batch, "batch {i} mismatch");
+            // No success-path reset: the decoder stays primed for hash 7 after
+            // every batch, including the 0-row ones. Checked in-loop (not just at
+            // the end) so a reset that only fires on empty batches is caught —
+            // the trailing non-empty batch would otherwise re-prime and hide it.
+            assert_eq!(
+                dec.schema_hash,
+                Some(7),
+                "batch {i} must not reset the decoder"
+            );
+        }
+    }
+
+    /// The retained-schema set is bounded: schemas beyond the cap evict the
+    /// oldest, whose batches then drop until it is re-installed.
     #[test]
     fn input_decoder_evicts_oldest_schema_beyond_cap() {
-        let f32_schema = || Buffer::from_vec(encode_schema_message(&DataType::Float32).unwrap());
+        let f32_schema =
+            || Buffer::from_vec(encode_schema_message_for(&DataType::Float32).unwrap());
 
         let mut dec = InputDecoder::new();
         // Install cap + 1 distinct hashes (same schema bytes — only the hash
         // keys retention); hash 0 must be evicted, the rest retained.
         for hash in 0..=(MAX_RETAINED_SCHEMAS as u64) {
-            dec.set_schema(hash, f32_schema()).unwrap();
+            dec.set_schema_raw(hash, f32_schema()).unwrap();
         }
         let array = Float32Array::from(vec![1.0]).into_data();
         assert!(
-            dec.decode_batch(batch_buf(&array), 0).unwrap().is_none(),
+            dec.decode_batch_raw(batch_buf(&array), 0)
+                .unwrap()
+                .is_none(),
             "the oldest schema must be evicted beyond the cap"
         );
         assert_eq!(
-            dec.decode_batch(batch_buf(&array), 1).unwrap().unwrap(),
+            dec.decode_batch_raw(batch_buf(&array), 1).unwrap().unwrap(),
             array,
             "schemas within the cap must be retained"
         );
@@ -1022,16 +1305,16 @@ mod tests {
     #[test]
     fn decode_batch_resets_on_error_then_reprimes() {
         let mut dec = InputDecoder::new();
-        dec.set_schema(
+        dec.set_schema_raw(
             7,
-            Buffer::from_vec(encode_schema_message(&DataType::Float32).unwrap()),
+            Buffer::from_vec(encode_schema_message_for(&DataType::Float32).unwrap()),
         )
         .unwrap();
 
         // A valid batch decodes.
         let good = Float32Array::from(vec![4.0, 5.0]).into_data();
         assert_eq!(
-            dec.decode_batch(batch_buf(&good), 7).unwrap().unwrap(),
+            dec.decode_batch_raw(batch_buf(&good), 7).unwrap().unwrap(),
             good
         );
 
@@ -1042,13 +1325,16 @@ mod tests {
         let dropped = Float32Array::from(vec![6.0, 7.0, 8.0, 9.0]).into_data();
         let mut truncated = batch_bytes(&dropped);
         truncated.truncate(truncated.len() / 2);
-        assert!(dec.decode_batch(Buffer::from_vec(truncated), 7).is_err());
+        assert!(
+            dec.decode_batch_raw(Buffer::from_vec(truncated), 7)
+                .is_err()
+        );
 
         // The next valid batch (same hash) re-primes from the retained schema and
         // decodes correctly — not dropped, not corrupted.
         let after = Float32Array::from(vec![10.0, 11.0]).into_data();
         assert_eq!(
-            dec.decode_batch(batch_buf(&after), 7).unwrap().unwrap(),
+            dec.decode_batch_raw(batch_buf(&after), 7).unwrap().unwrap(),
             after,
             "after a failed batch the decoder must re-prime from the retained schema"
         );
@@ -1057,7 +1343,7 @@ mod tests {
         dec.reset();
         let final_batch = Float32Array::from(vec![12.0]).into_data();
         assert!(
-            dec.decode_batch(batch_buf(&final_batch), 7)
+            dec.decode_batch_raw(batch_buf(&final_batch), 7)
                 .unwrap()
                 .is_none(),
             "after a full reset the decoder must drop until a schema is re-installed"
@@ -1101,16 +1387,17 @@ mod tests {
         let first = dict(&["a", "b", "a", "c", "b"]);
         // Confirm this really exercises the fallback (not the fast path).
         assert!(
-            ipc_fast_path_len(&first).is_none(),
+            ipc_fast_path_len_data(&first).is_none(),
             "dictionary must route to the official-writer fallback"
         );
 
         // Prime from the schema block of the dictionary stream — exactly the
         // bytes the producer publishes on the `@schema` subtopic.
         let mut dec = InputDecoder::new();
-        let full0 = encode_ipc_to_vec(&first).unwrap();
+        let full0 = encode_ipc_to_vec_data(&first).unwrap();
         let block = schema_block_len(&full0).unwrap();
-        dec.set_schema(1, Buffer::from(&full0[..block])).unwrap();
+        dec.set_schema_raw(1, Buffer::from(&full0[..block]))
+            .unwrap();
 
         // Every message (including the first) ships only the schema-less batch
         // slice (which for a dictionary type carries a replacement dictionary
@@ -1118,7 +1405,7 @@ mod tests {
         // its own input.
         let slice0 = batch_slice(&full0).expect("fallback stream is a valid IPC stream");
         assert_eq!(
-            dec.decode_batch(Buffer::from(slice0), 1)
+            dec.decode_batch_raw(Buffer::from(slice0), 1)
                 .unwrap()
                 .expect("first batch decodes against the primed decoder"),
             first
@@ -1129,10 +1416,10 @@ mod tests {
             ["new", "values", "entirely"].as_slice(),
         ] {
             let arr = dict(words);
-            let full = encode_ipc_to_vec(&arr).unwrap();
+            let full = encode_ipc_to_vec_data(&arr).unwrap();
             let slice = batch_slice(&full).expect("fallback stream is a valid IPC stream");
             let got = dec
-                .decode_batch(Buffer::from(slice), 1)
+                .decode_batch_raw(Buffer::from(slice), 1)
                 .unwrap()
                 .expect("batch must decode against the primed decoder");
             assert_eq!(
@@ -1148,7 +1435,7 @@ mod tests {
     /// EOS terminates the decoder.)
     #[test]
     fn schema_primed_decoder_decodes_batch_sequence() {
-        let schema = encode_schema_message(&DataType::Float32).unwrap();
+        let schema = encode_schema_message_for(&DataType::Float32).unwrap();
         let mut decoder = StreamDecoder::new();
 
         // Prime: feeding the schema message yields no batch.
@@ -1162,9 +1449,9 @@ mod tests {
 
         for vals in [vec![1.0f32, 2.0, 3.0], vec![4.0, 5.0], vec![6.0]] {
             let array = Float32Array::from(vals).into_data();
-            let len = batch_fast_path_len(&array).unwrap();
+            let len = batch_fast_path_len_data(&array).unwrap();
             let mut buf = vec![0u8; len];
-            encode_batch_into(&array, &mut buf).unwrap();
+            encode_batch_into_data(&array, &mut buf).unwrap();
 
             let mut bbuf = Buffer::from_vec(buf);
             let mut got = None;
@@ -1208,6 +1495,49 @@ mod tests {
         }
     }
 
+    /// The UInt8 encode guard must bound the *resulting stream*, not the input
+    /// `data_len`: since receivers reject any stream over `MAX_IPC_BYTES`,
+    /// anything the producer accepts here must decode there. Regression for
+    /// #2586 (a band of `data_len` just under the limit used to encode/send yet
+    /// be rejected — silently dropped on zenoh — by every receiver).
+    #[test]
+    fn uint8_ipc_len_bounds_resulting_stream_not_input() {
+        let max = super::super::MAX_IPC_BYTES;
+
+        // Exactly at the input limit: the stream is ~1.125x larger, so it must
+        // be rejected rather than produce an undecodable stream.
+        let err = uint8_ipc_len(max).unwrap_err().to_string();
+        assert!(
+            err.contains("too large"),
+            "data_len == MAX_IPC_BYTES should be rejected, got: {err}"
+        );
+
+        // The largest accepted payload must encode to a stream within the limit.
+        // Binary-search the boundary so the test tracks the exact layout.
+        let mut lo = 0usize;
+        let mut hi = max;
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            match uint8_ipc_len(mid) {
+                Ok(_) => lo = mid,
+                Err(_) => hi = mid - 1,
+            }
+        }
+        let largest_ok = lo;
+        let total = uint8_ipc_len(largest_ok).unwrap();
+        assert!(
+            total <= max,
+            "accepted payload of {largest_ok} bytes encodes to {total} > {max}"
+        );
+        // One byte more must be rejected, and its (hypothetical) stream exceeds
+        // the limit — i.e. the boundary is set by the stream size, not data_len.
+        assert!(uint8_ipc_len(largest_ok + 1).is_err());
+        assert!(
+            largest_ok < max,
+            "boundary should sit below the input limit"
+        );
+    }
+
     #[test]
     fn roundtrip_primitive_no_nulls() {
         let array = Float32Array::from((0..1000).map(|i| i as f32).collect::<Vec<_>>()).into_data();
@@ -1240,7 +1570,7 @@ mod tests {
         assert_eq!(off, len - PREFIX_LEN);
         assert_eq!(read_official(&buf).len(), 0);
         let (buffer, _, _) = aligned_buffer(&buf);
-        let decoded = decode_arrow_ipc_zero_copy(buffer).unwrap();
+        let decoded = decode_arrow_ipc_zero_copy_raw(buffer).unwrap();
         assert_eq!(decoded.data_type(), &DataType::UInt8);
         assert_eq!(decoded.len(), 0);
     }
@@ -1252,21 +1582,21 @@ mod tests {
     /// drains. Regression guard for the empty-array drop reported on PR #2366.
     #[test]
     fn schema_once_zero_len_batch_roundtrip() {
-        let schema = || Buffer::from_vec(encode_schema_message(&DataType::UInt8).unwrap());
+        let schema = || Buffer::from_vec(encode_schema_message_for(&DataType::UInt8).unwrap());
         let batch = |vals: &[u8]| {
             let a = UInt8Array::from(vals.to_vec()).into_data();
-            let len = batch_fast_path_len(&a).unwrap();
+            let len = batch_fast_path_len_data(&a).unwrap();
             let mut b = vec![0u8; len];
-            encode_batch_into(&a, &mut b).unwrap();
+            encode_batch_into_data(&a, &mut b).unwrap();
             Buffer::from_vec(b)
         };
 
         let mut dec = InputDecoder::new();
-        dec.set_schema(1, schema()).unwrap();
+        dec.set_schema_raw(1, schema()).unwrap();
 
         // The empty batch decodes to a 0-row UInt8 array, not `Ok(None)`/error.
         let decoded = dec
-            .decode_batch(batch(&[]), 1)
+            .decode_batch_raw(batch(&[]), 1)
             .unwrap()
             .expect("0-row batch must decode, not drop");
         assert_eq!(decoded.data_type(), &DataType::UInt8);
@@ -1275,7 +1605,7 @@ mod tests {
         // The persistent decoder stays usable across mixed empty/non-empty
         // batches (flushing the empty body must not wedge or terminate it).
         for vals in [vec![1u8, 2, 3], vec![], vec![9u8], vec![]] {
-            let d = dec.decode_batch(batch(&vals), 1).unwrap().unwrap();
+            let d = dec.decode_batch_raw(batch(&vals), 1).unwrap().unwrap();
             assert_eq!(d.len(), vals.len());
             assert_eq!(d.data_type(), &DataType::UInt8);
         }
@@ -1296,9 +1626,9 @@ mod tests {
         let batch = batch_slice(&full).expect("batch slice of a valid stream");
 
         let mut dec = InputDecoder::new();
-        dec.set_schema(7, schema).unwrap();
+        dec.set_schema_raw(7, schema).unwrap();
         let decoded = dec
-            .decode_batch(Buffer::from(batch), 7)
+            .decode_batch_raw(Buffer::from(batch), 7)
             .unwrap()
             .expect("0-row batch via batch_slice must decode, not drop");
         assert_eq!(decoded.data_type(), &DataType::UInt8);
@@ -1436,7 +1766,7 @@ mod tests {
             .unwrap();
 
         assert!(
-            ipc_fast_path_len(&struct_data).is_some(),
+            ipc_fast_path_len_data(&struct_data).is_some(),
             "struct with an oversized child should stay on the fast path"
         );
         let decoded = read_official(&fast_encode(&struct_data));
@@ -1498,7 +1828,7 @@ mod tests {
         // (2) pointer aliasing: the decoded data buffer lies inside the input.
         {
             let (buffer, base, len) = aligned_buffer(&encoded);
-            let decoded = decode_arrow_ipc_zero_copy(buffer).unwrap();
+            let decoded = decode_arrow_ipc_zero_copy_raw(buffer).unwrap();
             let ptr = decoded.buffers()[0].as_ptr() as usize;
             assert!(
                 ptr >= base && ptr < base + len,
@@ -1527,9 +1857,9 @@ mod tests {
             .into_data()
             .slice(2, 2); // offset 2 -> not fast-path
         assert_eq!(array.offset(), 2);
-        assert!(ipc_fast_path_len(&array).is_none());
+        assert!(ipc_fast_path_len_data(&array).is_none());
 
-        let encoded = encode_ipc_to_vec(&array).unwrap();
+        let encoded = encode_ipc_to_vec_data(&array).unwrap();
         let decoded = read_official(&encoded);
         assert_eq!(array.len(), decoded.len());
         let dec = arrow::array::make_array(decoded);
@@ -1543,10 +1873,10 @@ mod tests {
         use arrow::array::StringViewArray;
         let array = StringViewArray::from(vec!["a", "bb", "ccc"]).into_data();
         assert!(
-            ipc_fast_path_len(&array).is_none(),
+            ipc_fast_path_len_data(&array).is_none(),
             "Utf8View is not fast-path eligible"
         );
-        let encoded = encode_ipc_to_vec(&array).unwrap();
+        let encoded = encode_ipc_to_vec_data(&array).unwrap();
         let decoded = read_official(&encoded);
         assert_eq!(array, decoded);
     }

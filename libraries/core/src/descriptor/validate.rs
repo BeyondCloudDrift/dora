@@ -26,12 +26,17 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// reference points to a declared output on the source node.
 pub fn check_wiring(dataflow: &Descriptor) -> eyre::Result<()> {
     let nodes = dataflow.resolve_aliases_and_set_defaults()?;
+    check_wiring_resolved(&nodes)
+}
 
+/// [`check_wiring`] on an already-resolved node map, so callers that have
+/// resolved the descriptor can avoid re-resolving it.
+fn check_wiring_resolved(nodes: &BTreeMap<NodeId, ResolvedNode>) -> eyre::Result<()> {
     for node in nodes.values() {
         match &node.kind {
             descriptor::CoreNodeKind::Custom(custom_node) => {
                 for (input_id, input) in &custom_node.run_config.inputs {
-                    check_input(input, &nodes, &format!("{}/{input_id}", node.id))?;
+                    check_input(input, nodes, &format!("{}/{input_id}", node.id))?;
                 }
             }
             descriptor::CoreNodeKind::Runtime(runtime_node) => {
@@ -39,7 +44,7 @@ pub fn check_wiring(dataflow: &Descriptor) -> eyre::Result<()> {
                     for (input_id, input) in &operator_definition.config.inputs {
                         check_input(
                             input,
-                            &nodes,
+                            nodes,
                             &format!("{}/{}/{input_id}", node.id, operator_definition.id),
                         )?;
                     }
@@ -59,19 +64,42 @@ pub fn check_wiring(dataflow: &Descriptor) -> eyre::Result<()> {
 /// step and adds source-path existence and Python runtime checks on top.
 pub fn check_dataflow_static(dataflow: &Descriptor) -> eyre::Result<()> {
     // validate ROS2 bridge configs before resolution
+    validate_ros2_configs(dataflow)?;
+
+    let nodes = dataflow.resolve_aliases_and_set_defaults()?;
+    check_dataflow_static_resolved(dataflow, &nodes)
+}
+
+/// Validate all ROS2 bridge configs on the *unresolved* descriptor.
+///
+/// Run before [`Descriptor::resolve_aliases_and_set_defaults`] so a ROS2
+/// misconfiguration is reported ahead of any alias-resolution error.
+fn validate_ros2_configs(dataflow: &Descriptor) -> eyre::Result<()> {
     for node in &dataflow.nodes {
         if let Some(ros2) = &node.ros2 {
             validate_ros2_config(&node.id, ros2, &node.inputs, &node.outputs)?;
         }
     }
+    Ok(())
+}
 
-    let nodes = dataflow.resolve_aliases_and_set_defaults()?;
-
+/// The resolution-dependent part of [`check_dataflow_static`], operating on an
+/// already-resolved node map so callers don't re-resolve the descriptor.
+fn check_dataflow_static_resolved(
+    dataflow: &Descriptor,
+    nodes: &BTreeMap<NodeId, ResolvedNode>,
+) -> eyre::Result<()> {
     // reject negative / non-finite / overflowing timing values before they
     // reach the daemon, where `Duration::from_secs_f64` would panic on spawn.
     for node in nodes.values() {
         if let descriptor::CoreNodeKind::Custom(custom) = &node.kind {
             check_timing_fields(&node.id, custom)?;
+            if custom.path.as_str() == DYNAMIC_SOURCE && custom.startup_timeout.is_some() {
+                bail!(
+                    "dynamic node `{}` cannot specify `startup_timeout` (dynamic nodes connect out-of-band and are not managed by the startup watchdog)",
+                    node.id
+                );
+            }
         }
         // `input_timeout` is a second-valued `f64` that the daemon also feeds
         // to `Duration::from_secs_f64`, on both the initial-spawn and the
@@ -81,19 +109,23 @@ pub fn check_dataflow_static(dataflow: &Descriptor) -> eyre::Result<()> {
                 &format!("input `{input_id}` of node `{}`", node.id),
                 "input_timeout",
                 input.input_timeout,
+                true,
             )?;
         }
     }
     // dataflow-level `health_check_interval` reaches `Duration::from_secs_f64`
-    // in the same way (`binaries/daemon/src/lib.rs`).
+    // in the same way (`binaries/daemon/src/lib.rs`). A zero interval must also
+    // be rejected: it is fed to `tokio::time::interval`, which panics on a zero
+    // period.
     check_seconds_field(
         "dataflow",
         "health_check_interval",
         dataflow.health_check_interval,
+        false,
     )?;
 
     // check that all inputs mappings point to an existing output
-    check_wiring(dataflow)?;
+    check_wiring_resolved(nodes)?;
 
     // Check that nodes can resolve `send_stdout_as`, `send_logs_as`, `min_log_level`
     for node in nodes.values() {
@@ -113,9 +145,13 @@ pub fn check_dataflow_static(dataflow: &Descriptor) -> eyre::Result<()> {
 }
 
 pub fn check_dataflow(dataflow: &Descriptor, working_dir: &Path) -> eyre::Result<()> {
-    check_dataflow_static(dataflow)?;
-
+    // Resolve the descriptor once and share the result across every check
+    // (static validation + path/runtime existence) instead of re-resolving it
+    // for each, which clones the whole node topology on every call.
+    validate_ros2_configs(dataflow)?;
     let nodes = dataflow.resolve_aliases_and_set_defaults()?;
+    check_dataflow_static_resolved(dataflow, &nodes)?;
+
     let mut has_python_operator = false;
 
     // check that nodes and operators exist
@@ -204,11 +240,12 @@ fn check_timing_fields(
     for (field, value) in [
         ("finish_grace_secs", custom.finish_grace_secs),
         ("health_check_timeout", custom.health_check_timeout),
+        ("startup_timeout", custom.startup_timeout),
         ("restart_delay", custom.restart_delay),
         ("max_restart_delay", custom.max_restart_delay),
         ("restart_window", custom.restart_window),
     ] {
-        check_seconds_field(&owner, field, value)?;
+        check_seconds_field(&owner, field, value, true)?;
     }
     Ok(())
 }
@@ -221,15 +258,49 @@ fn check_timing_fields(
 /// values too large to fit in a `Duration` (> `Duration::MAX`, ≈ 1.8e19 s). We
 /// probe the exact same boundary with its non-panicking twin
 /// `try_from_secs_f64`, so a value accepted here can never panic the daemon.
-fn check_seconds_field(owner: &str, field: &str, value: Option<f64>) -> eyre::Result<()> {
-    if let Some(value) = value
-        && std::time::Duration::try_from_secs_f64(value).is_err()
-    {
-        bail!(
-            "{owner} has invalid `{field}`: {value} \
-             (must be a finite, non-negative number of seconds smaller than {})",
-            std::time::Duration::MAX.as_secs_f64()
-        );
+///
+/// When `allow_zero` is `false`, any value that produces a zero-length
+/// `Duration` is also rejected. This is required for fields that reach
+/// `tokio::time::interval` (e.g. `health_check_interval`), which panics on a
+/// zero period. Checking the resulting `Duration` -- not just the literal
+/// `0.0` -- also rejects a tiny-but-positive value such as `1e-10`, which
+/// `Duration::from_secs_f64` rounds down to `Duration::ZERO`. This mirrors the
+/// timer parser's `interval.is_zero()` guard in `dora-message`.
+fn check_seconds_field(
+    owner: &str,
+    field: &str,
+    value: Option<f64>,
+    allow_zero: bool,
+) -> eyre::Result<()> {
+    if let Some(value) = value {
+        // A negative / non-finite / overflowing value fails to convert; a
+        // tiny-but-positive value (e.g. `1e-10`) converts to `Duration::ZERO`,
+        // which must also be rejected for interval fields (`allow_zero ==
+        // false`). Inspect the resulting `Duration`, not the literal `0.0`.
+        let duration = std::time::Duration::try_from_secs_f64(value);
+        let is_zero = duration.as_ref().is_ok_and(|d| d.is_zero());
+        if !allow_zero && is_zero {
+            // Distinct message: a value like `1e-10` *is* positive, so calling it
+            // "not positive" would misdirect the user -- the real reason is that
+            // it rounds down to a zero-length duration.
+            bail!(
+                "{owner} has invalid `{field}`: {value} \
+                 (must be a positive number of seconds; this value is zero or \
+                 rounds down to a zero-length duration)"
+            );
+        }
+        if duration.is_err() {
+            let requirement = if allow_zero {
+                "non-negative"
+            } else {
+                "positive"
+            };
+            bail!(
+                "{owner} has invalid `{field}`: {value} \
+                 (must be a finite, {requirement} number of seconds smaller than {})",
+                std::time::Duration::MAX.as_secs_f64()
+            );
+        }
     }
     Ok(())
 }
@@ -380,9 +451,10 @@ impl ResolvedNodeExt for ResolvedNode {
             CoreNodeKind::Custom(n) => n.max_rotated_files,
         };
         if let Some(n) = value {
-            if n == 0 {
-                bail!("`max_rotated_files` must be at least 1");
-            }
+            // 0 is meaningful: keep the active log only, rotating the previous
+            // one away rather than retaining it. That matches the documented
+            // disk bound `max_log_size * (1 + max_rotated_files)`, which at 0
+            // is one active file.
             if n > 100 {
                 bail!("`max_rotated_files` must not exceed 100");
             }
@@ -468,7 +540,12 @@ fn check_input(
     match &input.mapping {
         InputMapping::Timer { interval: _ } | InputMapping::Logs(_) => {}
         InputMapping::User(UserInputMapping { source, output }) => {
-            let source_node = nodes.values().find(|n| &n.id == source).ok_or_else(|| {
+            // `nodes` is keyed by each node's own id (see
+            // `resolve_aliases_and_set_defaults`), so look the source up
+            // directly instead of scanning every node — this runs once per
+            // input of every node, so a linear scan makes wiring validation
+            // quadratic in the node count.
+            let source_node = nodes.get(source).ok_or_else(|| {
                 eyre!("source node `{source}` mapped to input `{input_id_str}` does not exist",)
             })?;
             match &source_node.kind {
@@ -554,7 +631,16 @@ fn validate_ros2_config(
     node_inputs: &BTreeMap<DataId, Input>,
     node_outputs: &BTreeSet<DataId>,
 ) -> eyre::Result<()> {
-    use dora_message::descriptor::{Ros2Direction, Ros2Role};
+    use dora_message::descriptor::{Ros2Role, Ros2TransportConfig};
+
+    if let Ros2TransportConfig::Zenoh {
+        config_uri: Some(uri),
+        ..
+    } = &config.transport
+        && uri.as_os_str().is_empty()
+    {
+        bail!("node `{node_id}`: ros2 Zenoh config_uri must not be empty");
+    }
 
     // Exactly one of topic, topics, service, action must be set
     let mode_count = [
@@ -586,18 +672,12 @@ fn validate_ros2_config(
         })?;
         validate_ros2_type_format(node_id, topic, message_type)?;
 
-        match &config.direction {
-            Ros2Direction::Subscribe => {
-                if node_outputs.is_empty() {
-                    bail!("node `{node_id}`: ros2 subscribe bridge requires at least one output");
-                }
-            }
-            Ros2Direction::Publish => {
-                if node_inputs.is_empty() {
-                    bail!("node `{node_id}`: ros2 publish bridge requires at least one input");
-                }
-            }
-        }
+        // Single-topic mode has no explicit `output:`/`input:` field, so the
+        // bridge binds to the node's declared port. Resolution is what picks
+        // that port and what rejects a node whose declarations leave the choice
+        // ambiguous, so call it here rather than restating the rule: the two
+        // must not be able to disagree.
+        super::resolve_ros2_single_topic(node_id, config, node_inputs, node_outputs)?;
     } else if let Some(topics) = &config.topics {
         if topics.is_empty() {
             bail!("node `{node_id}`: ros2 `topics` list must not be empty");
@@ -608,28 +688,16 @@ fn validate_ros2_config(
                 topics.len()
             );
         }
-        let mut has_subscribe = false;
-        let mut has_publish = false;
         for t in topics {
             validate_ros2_name(node_id, "topic", &t.topic)?;
             validate_ros2_type_format(node_id, &t.topic, &t.message_type)?;
-            match &t.direction {
-                Ros2Direction::Subscribe => has_subscribe = true,
-                Ros2Direction::Publish => has_publish = true,
-            }
         }
-        if has_subscribe && node_outputs.is_empty() {
-            bail!(
-                "node `{node_id}`: ros2 multi-topic bridge with subscribe topics \
-                 requires at least one output"
-            );
-        }
-        if has_publish && node_inputs.is_empty() {
-            bail!(
-                "node `{node_id}`: ros2 multi-topic bridge with publish topics \
-                 requires at least one input"
-            );
-        }
+        // The per-topic port-existence check lives on the resolution path
+        // (`validate_ros2_topic_ports`) so the coordinator's `dora start` path,
+        // which resolves without validating, enforces it too. Delegate here
+        // rather than restating the rule, keeping validation and `dora start` in
+        // lockstep by construction (dora-rs/dora#3484).
+        super::validate_ros2_topic_ports(node_id, topics, node_inputs, node_outputs)?;
     } else if let Some(service) = &config.service {
         validate_ros2_name(node_id, "service", service)?;
         let service_type = config.service_type.as_ref().ok_or_else(|| {
@@ -748,16 +816,16 @@ fn validate_ros2_qos(
                  must be between 1 and 10000"
         );
     }
-    if let Some(t) = qos.max_blocking_time
-        && (!t.is_finite() || t < 0.0)
-    {
-        bail!("node `{node_id}`: QoS max_blocking_time must be a finite non-negative number");
-    }
-    if let Some(t) = qos.lease_duration
-        && (!t.is_finite() || t < 0.0)
-    {
-        bail!("node `{node_id}`: QoS lease_duration must be a finite non-negative number");
-    }
+    // Both fields reach `Duration::from_secs_f64` in the ROS2 bridge QoS
+    // conversion and panic on a finite-but-overflowing value (e.g. `1e300`),
+    // not just on NaN/infinite/negative. `check_seconds_field` probes that
+    // exact boundary with `try_from_secs_f64`, matching every other
+    // second-valued field here, and keeps validating both fields whenever set
+    // (as the prior check did). `allow_zero = true`: `max_blocking_time`
+    // defaults to `0.0` and a zero lease is harmless.
+    let owner = format!("node `{node_id}`");
+    check_seconds_field(&owner, "QoS max_blocking_time", qos.max_blocking_time, true)?;
+    check_seconds_field(&owner, "QoS lease_duration", qos.lease_duration, true)?;
     Ok(())
 }
 
@@ -862,6 +930,26 @@ pub struct TypeCheckResult {
 /// Timer nodes auto-inject this type.
 const TIMER_TYPE: &str = "std/core/v1/UInt64";
 
+/// Register one declared output type under `key` (a `(node_id, output_ref)`
+/// pair). The port is *always* recorded in `annotated` so a typo'd or
+/// otherwise unresolvable URN still suppresses the strict-mode "upstream has
+/// no type annotation" warning; it is additionally recorded in
+/// `output_type_map` (the map used for cross-edge type matching) only when its
+/// URN resolves. Keeping both writes behind one call makes the two structures
+/// impossible to desync — the invariant the strict-mode check relies on.
+fn register_output_type(
+    output_type_map: &mut BTreeMap<(String, String), String>,
+    annotated: &mut BTreeSet<(String, String)>,
+    key: (String, String),
+    urn: &str,
+    registry: &crate::types::TypeRegistry,
+) {
+    annotated.insert(key.clone());
+    if registry.resolve(urn).is_some() {
+        output_type_map.insert(key, urn.to_string());
+    }
+}
+
 /// Check type annotations in a dataflow, with strict mode support.
 ///
 /// Returns the collected warnings plus any inferred edge types.
@@ -897,7 +985,16 @@ pub fn check_type_annotations_full(
     let compat = CompatibilityGraph::new(&user_rules);
 
     // Map of (source_node_id, output_ref) -> type_urn for cross-edge checking.
+    // Only outputs whose declared URN *resolves* are registered here.
     let mut output_type_map: BTreeMap<(String, String), String> = BTreeMap::new();
+
+    // Every (source_node_id, output_ref) that carries *some* output-type
+    // annotation, including one whose URN does not resolve (a typo). Used to
+    // suppress the strict-mode "upstream has no type annotation" warning on a
+    // port that *is* annotated but with an unknown URN — that URN is already
+    // reported by `check_port_types`, so the extra "no annotation" warning
+    // would be factually wrong and misdirect the user.
+    let mut annotated_output_ports: BTreeSet<(String, String)> = BTreeSet::new();
 
     for node in &dataflow.nodes {
         let nid = node.id.to_string();
@@ -913,9 +1010,13 @@ pub fn check_type_annotations_full(
         );
         // Register node outputs for cross-edge checking
         for (output_id, urn) in &node.output_types {
-            if registry.resolve(urn).is_some() {
-                output_type_map.insert((nid.clone(), output_id.to_string()), urn.clone());
-            }
+            register_output_type(
+                &mut output_type_map,
+                &mut annotated_output_ports,
+                (nid.clone(), output_id.to_string()),
+                urn,
+                registry,
+            );
         }
 
         // Check node-level input_types
@@ -953,20 +1054,29 @@ pub fn check_type_annotations_full(
                 &mut warnings,
             );
             for (output_id, urn) in &op.config.output_types {
-                if registry.resolve(urn).is_some() {
-                    // A consumer of a single-`operator:` node references its
-                    // output in short form (`node/output`) in the source YAML;
-                    // the `op/` prefix is only injected later by
-                    // `resolve_aliases_and_set_defaults`, which this pre-build
-                    // check never runs. Register both the prefixed key and the
-                    // bare `output_id` so short-form edges resolve here too —
-                    // otherwise the upstream type is invisible, silently
-                    // dropping genuine mismatches and, under `strict`, emitting
-                    // a false "upstream has no type annotation" warning.
-                    output_type_map
-                        .insert((nid.clone(), format!("{op_id}/{output_id}")), urn.clone());
-                    output_type_map.insert((nid.clone(), output_id.to_string()), urn.clone());
-                }
+                // A consumer of a single-`operator:` node references its output
+                // in short form (`node/output`) in the source YAML; the `op/`
+                // prefix is only injected later by
+                // `resolve_aliases_and_set_defaults`, which this pre-build check
+                // never runs. Register both the prefixed key and the bare
+                // `output_id` so short-form edges resolve here too — otherwise
+                // the upstream type is invisible, silently dropping genuine
+                // mismatches and, under `strict`, emitting a false "upstream has
+                // no type annotation" warning.
+                register_output_type(
+                    &mut output_type_map,
+                    &mut annotated_output_ports,
+                    (nid.clone(), format!("{op_id}/{output_id}")),
+                    urn,
+                    registry,
+                );
+                register_output_type(
+                    &mut output_type_map,
+                    &mut annotated_output_ports,
+                    (nid.clone(), output_id.to_string()),
+                    urn,
+                    registry,
+                );
             }
             check_port_types(
                 &nid,
@@ -996,10 +1106,13 @@ pub fn check_type_annotations_full(
                     &mut warnings,
                 );
                 for (output_id, urn) in &op.config.output_types {
-                    if registry.resolve(urn).is_some() {
-                        output_type_map
-                            .insert((nid.clone(), format!("{}/{output_id}", op.id)), urn.clone());
-                    }
+                    register_output_type(
+                        &mut output_type_map,
+                        &mut annotated_output_ports,
+                        (nid.clone(), format!("{}/{output_id}", op.id)),
+                        urn,
+                        registry,
+                    );
                 }
                 check_port_types(
                     &label,
@@ -1030,6 +1143,7 @@ pub fn check_type_annotations_full(
             &node.input_types,
             &node.inputs,
             &output_type_map,
+            &annotated_output_ports,
             &timer_types,
             &compat,
             registry,
@@ -1045,6 +1159,7 @@ pub fn check_type_annotations_full(
                 &op.config.input_types,
                 &op.config.inputs,
                 &output_type_map,
+                &annotated_output_ports,
                 &op_timer,
                 &compat,
                 registry,
@@ -1062,6 +1177,7 @@ pub fn check_type_annotations_full(
                     &op.config.input_types,
                     &op.config.inputs,
                     &output_type_map,
+                    &annotated_output_ports,
                     &op_timer,
                     &compat,
                     registry,
@@ -1170,6 +1286,7 @@ fn check_edge_mismatches_with_compat(
     input_types: &BTreeMap<DataId, String>,
     inputs: &BTreeMap<DataId, Input>,
     output_type_map: &BTreeMap<(String, String), String>,
+    annotated_output_ports: &BTreeSet<(String, String)>,
     timer_types: &BTreeMap<DataId, String>,
     compat: &crate::types::CompatibilityGraph,
     registry: &crate::types::TypeRegistry,
@@ -1206,7 +1323,16 @@ fn check_edge_mismatches_with_compat(
                             source: format!("{}/{}", mapping.source, mapping.output),
                         });
                     }
-                    (None, Some(in_urn)) if strict => {
+                    // Strict mode, and the upstream has no *resolvable* type.
+                    // The guard also excludes an upstream that *is* annotated
+                    // but with an unresolvable URN (a typo): such a port is
+                    // absent from `output_type_map` yet present in
+                    // `annotated_output_ports`, so it falls through to `_` with
+                    // no warning here. `check_port_types` already reports the
+                    // unknown URN, so a second "has no type annotation" warning
+                    // would be factually wrong and send the user chasing a
+                    // missing annotation instead of the typo.
+                    (None, Some(in_urn)) if strict && !annotated_output_ports.contains(&key) => {
                         warnings.push(TypeWarning {
                             node_id: node_id.to_string(),
                             message: format!(
@@ -1287,8 +1413,11 @@ mod tests {
     use super::*;
     use crate::types::TypeRegistry;
     use dora_message::config::{Input, InputMapping};
-    use dora_message::descriptor::{Descriptor, Ros2BridgeConfig, Ros2Role};
-    use std::time::Duration;
+    use dora_message::descriptor::{
+        Descriptor, RmwZenohCompatibility, Ros2BridgeConfig, Ros2Direction, Ros2Role,
+        Ros2TopicConfig, Ros2TransportConfig,
+    };
+    use std::{path::PathBuf, time::Duration};
 
     fn dummy_input() -> Input {
         Input {
@@ -1334,27 +1463,7 @@ operators:
     }
 
     fn custom_node() -> dora_message::descriptor::CustomNode {
-        dora_message::descriptor::CustomNode {
-            path: "node".to_string(),
-            source: dora_message::descriptor::NodeSource::Local,
-            path_sha256: None,
-            args: None,
-            envs: None,
-            build: None,
-            send_stdout_as: None,
-            send_logs_as: None,
-            min_log_level: None,
-            max_log_size: None,
-            max_rotated_files: None,
-            restart_policy: Default::default(),
-            max_restarts: 0,
-            restart_delay: None,
-            max_restart_delay: None,
-            restart_window: None,
-            health_check_timeout: None,
-            finish_grace_secs: None,
-            run_config: serde_yaml::from_str("{}").unwrap(),
-        }
+        dora_message::descriptor::CustomNode::new("node".to_string())
     }
 
     #[test]
@@ -1366,6 +1475,7 @@ operators:
         // a large finite grace is fine
         node.finish_grace_secs = Some(3600.0);
         node.health_check_timeout = Some(0.0);
+        node.startup_timeout = Some(5.0);
         check_timing_fields(&id, &node).unwrap();
     }
 
@@ -1378,6 +1488,36 @@ operators:
         assert!(
             err.contains("finish_grace_secs") && err.contains("non-negative"),
             "error should name the field and the constraint, got: {err}"
+        );
+    }
+
+    #[test]
+    fn timing_fields_reject_negative_startup_timeout() {
+        let id = NodeId::from("n".to_owned());
+        let mut node = custom_node();
+        node.startup_timeout = Some(-0.5);
+        let err = check_timing_fields(&id, &node).unwrap_err().to_string();
+        assert!(
+            err.contains("startup_timeout") && err.contains("non-negative"),
+            "error should name the field and the constraint, got: {err}"
+        );
+    }
+
+    #[test]
+    fn dynamic_node_rejects_startup_timeout() {
+        let descriptor: Descriptor = serde_yaml::from_str(
+            r#"
+nodes:
+  - id: dyn
+    path: dynamic
+    startup_timeout: 5.0
+"#,
+        )
+        .unwrap();
+        let err = check_dataflow_static(&descriptor).unwrap_err().to_string();
+        assert!(
+            err.contains("dynamic node `dyn` cannot specify `startup_timeout`"),
+            "error should explain dynamic node startup_timeout rejection, got: {err}"
         );
     }
 
@@ -1397,15 +1537,15 @@ operators:
 
     #[test]
     fn seconds_field_accepts_none_zero_and_positive() {
-        check_seconds_field("owner", "field", None).unwrap();
-        check_seconds_field("owner", "field", Some(0.0)).unwrap();
-        check_seconds_field("owner", "field", Some(3600.0)).unwrap();
+        check_seconds_field("owner", "field", None, true).unwrap();
+        check_seconds_field("owner", "field", Some(0.0), true).unwrap();
+        check_seconds_field("owner", "field", Some(3600.0), true).unwrap();
     }
 
     #[test]
     fn seconds_field_rejects_negative_and_non_finite() {
         for bad in [-1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            let err = check_seconds_field("owner", "field", Some(bad))
+            let err = check_seconds_field("owner", "field", Some(bad), true)
                 .unwrap_err()
                 .to_string();
             assert!(
@@ -1425,7 +1565,7 @@ operators:
         for bad in [1e20, Duration::MAX.as_secs_f64()] {
             // Confirms the value genuinely trips the daemon's conversion.
             assert!(Duration::try_from_secs_f64(bad).is_err());
-            let err = check_seconds_field("owner", "field", Some(bad))
+            let err = check_seconds_field("owner", "field", Some(bad), true)
                 .unwrap_err()
                 .to_string();
             assert!(
@@ -1439,12 +1579,38 @@ operators:
     #[test]
     fn seconds_field_accepts_large_representable_value() {
         assert!(Duration::try_from_secs_f64(1e18).is_ok());
-        check_seconds_field("owner", "field", Some(1e18)).unwrap();
+        check_seconds_field("owner", "field", Some(1e18), true).unwrap();
+    }
+
+    // With `allow_zero: false`, `0.0` must be rejected (in addition to the
+    // negative / non-finite cases) because such a field reaches
+    // `tokio::time::interval`, which panics on a zero period.
+    #[test]
+    fn seconds_field_rejects_zero_when_positive_required() {
+        check_seconds_field("owner", "field", None, false).unwrap();
+        check_seconds_field("owner", "field", Some(3600.0), false).unwrap();
+        // `1e-10` is finite and positive but `Duration::from_secs_f64` rounds
+        // it down to `Duration::ZERO`, which would panic `tokio::time::interval`
+        // just like a literal `0.0`, so it must be rejected too.
+        for bad in [0.0, 1e-10, -1.0, f64::NAN, f64::INFINITY] {
+            let err = check_seconds_field("owner", "field", Some(bad), false)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("field") && err.contains("positive"),
+                "{bad} should be rejected with a field/constraint message, got: {err}"
+            );
+        }
+        // A tiny-but-positive value is fine when zero is allowed (it does not
+        // reach `tokio::time::interval`).
+        check_seconds_field("owner", "field", Some(1e-10), true).unwrap();
     }
 
     // `health_check_interval` (dataflow-level) reaches `Duration::from_secs_f64`
-    // in the daemon just like the per-node timing fields, so `check_dataflow`
-    // must reject a non-finite / negative value rather than let the daemon panic.
+    // and then `tokio::time::interval` in the daemon, so `check_dataflow` must
+    // reject a non-finite / negative / zero value rather than let the daemon
+    // panic. A zero interval additionally panics `tokio::time::interval`, so it
+    // is rejected with a `positive` constraint.
     #[test]
     fn check_dataflow_rejects_negative_health_check_interval() {
         let dataflow = parse_dataflow(
@@ -1462,7 +1628,59 @@ nodes:
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("health_check_interval") && err.contains("non-negative"),
+            err.contains("health_check_interval") && err.contains("positive"),
+            "error should name the field and constraint, got: {err}"
+        );
+    }
+
+    // A zero `health_check_interval` passes `Duration::from_secs_f64` (yielding
+    // `Duration::ZERO`) but then panics `tokio::time::interval`, so it must be
+    // rejected up front (regression test for #2752).
+    #[test]
+    fn check_dataflow_rejects_zero_health_check_interval() {
+        let dataflow = parse_dataflow(
+            "\
+health_check_interval: 0.0
+nodes:
+  - id: a
+    path: node_a
+    build: cargo build
+    outputs:
+      - out
+",
+        );
+        let err = check_dataflow(&dataflow, Path::new("/nonexistent-dora-validate-test"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("health_check_interval") && err.contains("positive"),
+            "error should name the field and constraint, got: {err}"
+        );
+    }
+
+    // A tiny-but-positive `health_check_interval` (e.g. `1e-10`) is finite and
+    // non-zero as an `f64`, so a literal `value == 0.0` check would let it
+    // through -- but `Duration::from_secs_f64` rounds it down to
+    // `Duration::ZERO`, which panics `tokio::time::interval`. It must be
+    // rejected up front just like `0.0`.
+    #[test]
+    fn check_dataflow_rejects_subnanosecond_health_check_interval() {
+        let dataflow = parse_dataflow(
+            "\
+health_check_interval: 0.0000000001
+nodes:
+  - id: a
+    path: node_a
+    build: cargo build
+    outputs:
+      - out
+",
+        );
+        let err = check_dataflow(&dataflow, Path::new("/nonexistent-dora-validate-test"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("health_check_interval") && err.contains("positive"),
             "error should name the field and constraint, got: {err}"
         );
     }
@@ -1640,6 +1858,217 @@ nodes:
         )
         .unwrap_err();
         assert!(err.to_string().contains("requires one of"));
+    }
+
+    #[test]
+    fn validate_rejects_empty_ros2_zenoh_config_uri() {
+        let config = Ros2BridgeConfig {
+            transport: Ros2TransportConfig::Zenoh {
+                compatibility: RmwZenohCompatibility::Humble,
+                config_uri: Some(PathBuf::new()),
+            },
+            topic: Some("/t".into()),
+            message_type: Some("a/B".into()),
+            ..Default::default()
+        };
+        let err = validate_ros2_config(
+            &NodeId::from("n".to_owned()),
+            &config,
+            &BTreeMap::new(),
+            &BTreeSet::from([DataId::from("out".to_owned())]),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("config_uri must not be empty"));
+    }
+
+    fn single_topic_config(topic: &str, direction: Ros2Direction) -> Ros2BridgeConfig {
+        Ros2BridgeConfig {
+            topic: Some(topic.into()),
+            message_type: Some("turtlesim/Pose".into()),
+            direction,
+            ..Default::default()
+        }
+    }
+
+    /// Single-topic mode binds to the node's declared port, so a name that has
+    /// nothing to do with the topic is correct and must be accepted.
+    #[test]
+    fn validate_single_topic_accepts_the_sole_declared_port() {
+        let config = single_topic_config("/turtle1/pose", Ros2Direction::Subscribe);
+        validate_ros2_config(
+            &NodeId::from("n".to_owned()),
+            &config,
+            &BTreeMap::new(),
+            &BTreeSet::from([DataId::from("pose".to_owned())]),
+        )
+        .unwrap();
+    }
+
+    /// Several declared outputs leave the binding ambiguous, which the bridge
+    /// would resolve by silently dropping every message.
+    #[test]
+    fn validate_single_topic_rejects_ambiguous_subscribe_output() {
+        let config = single_topic_config("/turtle1/pose", Ros2Direction::Subscribe);
+        let err = validate_ros2_config(
+            &NodeId::from("n".to_owned()),
+            &config,
+            &BTreeMap::new(),
+            &BTreeSet::from([
+                DataId::from("pose".to_owned()),
+                DataId::from("log".to_owned()),
+            ]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("no unambiguous output")
+                && err.contains("`pose`")
+                && err.contains("`log`")
+                && err.contains("turtle1_pose"),
+            "error should list the candidates and the topic-derived id, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_multi_topic_rejects_undeclared_subscribe_output() {
+        // A subscribe topic mapped to an output the node never declares would
+        // pass validation and then silently drop every message at runtime
+        // (`DoraNode::send_output` ignores unknown output ids).
+        let config = Ros2BridgeConfig {
+            topics: Some(vec![Ros2TopicConfig {
+                topic: "/scan".into(),
+                message_type: "sensor_msgs/LaserScan".into(),
+                direction: Ros2Direction::Subscribe,
+                output: Some("typo_out".into()),
+                input: None,
+                qos: None,
+            }]),
+            ..Default::default()
+        };
+        let err = validate_ros2_config(
+            &NodeId::from("n".to_owned()),
+            &config,
+            &BTreeMap::new(),
+            &BTreeSet::from([DataId::from("scan".to_owned())]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("typo_out") && err.contains("not declared"),
+            "error should name the undeclared output, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_multi_topic_rejects_undeclared_publish_input() {
+        let config = Ros2BridgeConfig {
+            topics: Some(vec![Ros2TopicConfig {
+                topic: "/cmd_vel".into(),
+                message_type: "geometry_msgs/Twist".into(),
+                direction: Ros2Direction::Publish,
+                output: None,
+                input: Some("typo_in".into()),
+                qos: None,
+            }]),
+            ..Default::default()
+        };
+        let err = validate_ros2_config(
+            &NodeId::from("n".to_owned()),
+            &config,
+            &BTreeMap::from([(DataId::from("cmd".to_owned()), dummy_input())]),
+            &BTreeSet::new(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("typo_in") && err.contains("not declared"),
+            "error should name the undeclared input, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_multi_topic_rejects_undeclared_derived_output() {
+        // No explicit `output:` — the bridge derives the output id from the
+        // topic name (`/scan` -> `scan`). A derived id that is not a declared
+        // output silently drops every message, so validation must reject it.
+        let config = Ros2BridgeConfig {
+            topics: Some(vec![Ros2TopicConfig {
+                topic: "/scan".into(),
+                message_type: "sensor_msgs/LaserScan".into(),
+                direction: Ros2Direction::Subscribe,
+                output: None,
+                input: None,
+                qos: None,
+            }]),
+            ..Default::default()
+        };
+        let err = validate_ros2_config(
+            &NodeId::from("n".to_owned()),
+            &config,
+            &BTreeMap::new(),
+            &BTreeSet::from([DataId::from("laser".to_owned())]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("scan") && err.contains("not declared"),
+            "error should name the derived output, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_multi_topic_accepts_derived_output() {
+        // The topic-derived id (`/scan` -> `scan`) matches a declared output.
+        let config = Ros2BridgeConfig {
+            topics: Some(vec![Ros2TopicConfig {
+                topic: "/scan".into(),
+                message_type: "sensor_msgs/LaserScan".into(),
+                direction: Ros2Direction::Subscribe,
+                output: None,
+                input: None,
+                qos: None,
+            }]),
+            ..Default::default()
+        };
+        validate_ros2_config(
+            &NodeId::from("n".to_owned()),
+            &config,
+            &BTreeMap::new(),
+            &BTreeSet::from([DataId::from("scan".to_owned())]),
+        )
+        .expect("a topic-derived output matching a declared output should validate");
+    }
+
+    #[test]
+    fn validate_multi_topic_accepts_declared_ports() {
+        let config = Ros2BridgeConfig {
+            topics: Some(vec![
+                Ros2TopicConfig {
+                    topic: "/scan".into(),
+                    message_type: "sensor_msgs/LaserScan".into(),
+                    direction: Ros2Direction::Subscribe,
+                    output: Some("scan".into()),
+                    input: None,
+                    qos: None,
+                },
+                Ros2TopicConfig {
+                    topic: "/cmd_vel".into(),
+                    message_type: "geometry_msgs/Twist".into(),
+                    direction: Ros2Direction::Publish,
+                    output: None,
+                    input: Some("cmd".into()),
+                    qos: None,
+                },
+            ]),
+            ..Default::default()
+        };
+        validate_ros2_config(
+            &NodeId::from("n".to_owned()),
+            &config,
+            &BTreeMap::from([(DataId::from("cmd".to_owned()), dummy_input())]),
+            &BTreeSet::from([DataId::from("scan".to_owned())]),
+        )
+        .expect("multi-topic config mapping declared ports should validate");
     }
 
     #[test]
@@ -2133,6 +2562,52 @@ nodes:
         assert!(result.warnings[0].message.contains("no type annotation"));
     }
 
+    /// Regression: an upstream output that *is* annotated but with an
+    /// unresolvable URN (a typo) must not trigger the strict-mode "upstream
+    /// has no type annotation" warning. The unknown URN is already reported by
+    /// the port-type check; a second "no annotation" warning would be
+    /// factually wrong and send the user chasing a missing annotation instead
+    /// of the typo.
+    #[test]
+    fn strict_mode_no_missing_annotation_warning_for_typoed_upstream() {
+        let dataflow = parse_dataflow(
+            "\
+nodes:
+  - id: sender
+    outputs:
+      - image
+    output_types:
+      image: std/media/v1/Imag
+  - id: receiver
+    inputs:
+      image: sender/image
+    input_types:
+      image: std/media/v1/Image
+",
+        );
+        let reg = TypeRegistry::new();
+        let result = check_type_annotations_full(&dataflow, &reg, true);
+        // The typo itself is still reported...
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("unknown type")),
+            "expected an unknown-type warning for the typo, got: {:?}",
+            result.warnings
+        );
+        // ...but the misleading "no type annotation" warning must not appear:
+        // the upstream *is* annotated, just misspelled.
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("no type annotation")),
+            "must not claim the annotated-but-typoed upstream has no annotation, got: {:?}",
+            result.warnings
+        );
+    }
+
     #[test]
     fn non_strict_no_warning_on_unannotated_upstream() {
         let dataflow = parse_dataflow(
@@ -2389,6 +2864,55 @@ nodes:
         assert!(err.to_string().contains("lease_duration"));
     }
 
+    /// A finite but enormous QoS duration passes the old
+    /// `is_finite()` / `>= 0` check yet overflows `Duration`, which panics
+    /// `Duration::from_secs_f64` in the ROS2 bridge QoS conversion. Both
+    /// fields must be rejected at descriptor validation instead.
+    #[test]
+    fn validate_qos_overflowing_durations_are_rejected() {
+        let base = Ros2BridgeConfig {
+            service: Some("/svc".into()),
+            service_type: Some("a/B".into()),
+            role: Some(Ros2Role::Client),
+            ..Default::default()
+        };
+        let mut inputs = BTreeMap::new();
+        inputs.insert(DataId::from("request".to_owned()), dummy_input());
+        let mut outputs = BTreeSet::new();
+        outputs.insert(DataId::from("response".to_owned()));
+
+        // `1e300` seconds is finite and positive but far beyond `Duration::MAX`.
+        for (field, qos) in [
+            (
+                "lease_duration",
+                dora_message::descriptor::Ros2QosConfig {
+                    lease_duration: Some(1e300),
+                    ..Default::default()
+                },
+            ),
+            (
+                "max_blocking_time",
+                dora_message::descriptor::Ros2QosConfig {
+                    reliable: true,
+                    max_blocking_time: Some(1e300),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let config = Ros2BridgeConfig {
+                qos,
+                ..base.clone()
+            };
+            let err =
+                validate_ros2_config(&NodeId::from("n".to_owned()), &config, &inputs, &outputs)
+                    .unwrap_err();
+            assert!(
+                err.to_string().contains(field),
+                "expected error naming `{field}`, got: {err}"
+            );
+        }
+    }
+
     // --- Wiring validation tests ---
 
     #[test]
@@ -2406,6 +2930,92 @@ nodes:
 "#;
         let descriptor: Descriptor = serde_yaml::from_str(yaml).unwrap();
         check_wiring(&descriptor).unwrap();
+    }
+
+    /// Every shipped `ros2:` example must satisfy the port-mapping rule the
+    /// bridge binds by. The docs present these as working dataflows, and a
+    /// mismatch is silent data loss at runtime rather than a startup error, so
+    /// parsing them is not enough — they have to be validated.
+    #[test]
+    fn ros2_example_dataflows_have_valid_port_mappings() {
+        let examples = [
+            "examples/ros2-bridge/yaml-bridge/dataflow.yml",
+            "examples/ros2-bridge/yaml-bridge/dataflow-zenoh.yml",
+            "examples/ros2-bridge/yaml-bridge-service/dataflow-client.yml",
+            "examples/ros2-bridge/yaml-bridge-service/dataflow-client-zenoh.yml",
+            "examples/ros2-bridge/yaml-bridge-service/dataflow-server.yml",
+            "examples/ros2-bridge/yaml-bridge-service/dataflow-server-zenoh.yml",
+            "examples/ros2-bridge/yaml-bridge-action/dataflow.yml",
+            "examples/ros2-bridge/yaml-bridge-action/dataflow-zenoh.yml",
+            "examples/ros2-bridge/yaml-bridge-action-server/dataflow.yml",
+        ];
+        for relative in examples {
+            let Some(yaml) = repo_fixture(relative) else {
+                continue; // packaged crate: the examples tree is not shipped
+            };
+            let descriptor: Descriptor = serde_yaml::from_str(&yaml).unwrap();
+            if let Err(err) = validate_ros2_configs(&descriptor) {
+                panic!("shipped example `{relative}` has an invalid ros2 config: {err}");
+            }
+        }
+    }
+
+    /// Reads a fixture that lives outside this crate, or `None` when this is
+    /// not a repository checkout. `include_str!` would be the obvious choice,
+    /// but a path that leaves the crate directory is not in the published
+    /// `.crate`, so the crate would fail to *compile* its tests for anyone
+    /// building from crates.io (#3400).
+    ///
+    /// The workspace manifest is the marker for "we are in the repo". Only
+    /// its absence skips: inside a checkout a missing fixture is a stale
+    /// path and panics, so this keeps the one property `include_str!` had
+    /// that a plain `.ok()` would throw away.
+    fn repo_fixture(relative: &str) -> Option<String> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        if !root.join("Cargo.toml").is_file() {
+            return None;
+        }
+        let path = root.join(relative);
+        Some(
+            std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("fixture {} is missing: {e}", path.display())),
+        )
+    }
+
+    #[test]
+    fn ros2_zenoh_documentation_examples_parse_with_explicit_profiles() {
+        let examples = [
+            "examples/ros2-bridge/yaml-bridge/dataflow-zenoh.yml",
+            "examples/ros2-bridge/yaml-bridge-service/dataflow-client-zenoh.yml",
+            "examples/ros2-bridge/yaml-bridge-action/dataflow-zenoh.yml",
+        ];
+        for relative in examples {
+            let Some(yaml) = repo_fixture(relative) else {
+                continue; // packaged crate: the examples tree is not shipped
+            };
+            let descriptor: Descriptor = serde_yaml::from_str(&yaml).unwrap();
+            let ros2 = descriptor
+                .nodes
+                .iter()
+                .find_map(|node| node.ros2.as_ref())
+                .unwrap();
+            assert!(matches!(
+                ros2.transport,
+                Ros2TransportConfig::Zenoh {
+                    compatibility: RmwZenohCompatibility::Humble,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn ros2_zenoh_documentation_links_upstream_wire_contract() {
+        let Some(guide) = repo_fixture("guide/src/advanced/ros2-bridge.md") else {
+            return; // packaged crate: the guide is not shipped
+        };
+        assert!(guide.contains("https://github.com/ros2/rmw_zenoh/blob/rolling/docs/design.md"));
+        assert!(guide.contains("https://www.ros.org/reps/rep-2016.html"));
     }
 
     #[test]
@@ -2797,6 +3407,23 @@ nodes:
                 "expected '{expected}' to be mentioned in error, got: {err}"
             );
         }
+    }
+
+    #[test]
+    fn max_rotated_files_accepts_zero_and_still_caps_at_100() {
+        let node = |n: u32| -> ResolvedNode {
+            let mut custom = custom_node();
+            custom.max_rotated_files = Some(n);
+            ResolvedNode::new(NodeId::from("n".to_owned()), CoreNodeKind::Custom(custom))
+        };
+
+        // 0 is a real configuration: keep the active log only, rotating the
+        // previous one away. The documented disk bound
+        // `max_log_size * (1 + max_rotated_files)` is one file at 0.
+        assert_eq!(node(0).max_rotated_files().unwrap(), Some(0));
+        // The upper bound is unchanged.
+        assert_eq!(node(100).max_rotated_files().unwrap(), Some(100));
+        assert!(node(101).max_rotated_files().is_err());
     }
 }
 
